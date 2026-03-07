@@ -1,0 +1,10 @@
+from google.colab import userdata
+GITHUB_TOKEN = userdata.get('GITHUB_TOKEN')
+!git clone https://{GITHUB_TOKEN}@github.com/duytran2525/CARLA-Funny-Moments.git
+!cd CARLA-Funny-Moments
+%cd CARLA-Funny-Moments/
+from google.colab import drive
+drive.mount('/content/drive')
+!cp /content/drive/MyDrive/Colab\ Notebooks/data.zip .
+!unzip -q /content/drive/MyDrive/data.zip -d .
+!python scripts/train_cnn.py

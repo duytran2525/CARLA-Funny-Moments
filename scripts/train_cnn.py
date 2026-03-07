@@ -19,8 +19,8 @@ def load_config(config_path):
 def main():
     ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     config = load_config(os.path.join(ROOT_DIR, 'configs', 'train_params.yaml'))
-    
-    CSV_PATH = os.path.join(ROOT_DIR, 'data', 'raw_driving', 'driving_log.csv')
+    DATA_DIR = os.path.join(ROOT_DIR, 'data', 'raw_driving')
+    CSV_PATH = os.path.join(DATA_DIR, 'driving_log.csv')
     MODEL_SAVE_PATH = os.path.join(ROOT_DIR, 'models', 'cnn_steering.pth')
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -32,8 +32,8 @@ def main():
     ])
 
     # 1. KHỞI TẠO 2 DATASET RIÊNG BIỆT ĐỂ BẢO VỆ TẬP VAL
-    full_train_dataset = CarlaDataset(csv_file=CSV_PATH, root_dir=ROOT_DIR, transform=transform, steering_correction=config['steering_correction'], is_training=True)
-    full_val_dataset = CarlaDataset(csv_file=CSV_PATH, root_dir=ROOT_DIR, transform=transform, steering_correction=config['steering_correction'], is_training=False)
+    full_train_dataset = CarlaDataset(csv_file=CSV_PATH, root_dir=DATA_DIR, transform=transform, steering_correction=config['steering_correction'], is_training=True)
+    full_val_dataset = CarlaDataset(csv_file=CSV_PATH, root_dir=DATA_DIR, transform=transform, steering_correction=config['steering_correction'], is_training=False)
     
     # Tạo danh sách index và xáo trộn
     dataset_size = len(full_train_dataset)

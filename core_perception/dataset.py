@@ -8,11 +8,11 @@ import numpy as np
 
 class CarlaDataset(Dataset):
     def __init__(self, csv_file, root_dir, transform=None, steering_correction=0.2, is_training = True):
-        self.data_df = pd.read_csv(csv_file, names=['img_id', 'steering', 'throttle', 'brake', 'speed'])
+        self.data_df = pd.read_csv(csv_file, header=0, names=['img_id', 'steering', 'throttle', 'brake', 'speed'])
         self.root_dir = root_dir
         self.transform = transform
         self.steering_correction = steering_correction
-        
+        self.is_training = is_training
         self.samples = []
         self._prepare_data()
 
@@ -20,13 +20,15 @@ class CarlaDataset(Dataset):
         print("Đang rà soát file ảnh từ 3 camera...")
         for _, row in self.data_df.iterrows():
             steering = float(row['steering'])
-            img_id = str(row['img_id']).strip()
-            if not img_id.endswith('.png'): img_id += '.png'
+            img_id_str = str(row['img_id']).strip()
+            if '.' in img_id_str: 
+                img_id_str = img_id_str.split('.')[0] # Bỏ phần thập phân nếu có
+            img_id = img_id_str.zfill(8) + '.png'
 
             configs = [
-                ('img_center', 0),
-                ('img_left', self.steering_correction),
-                ('img_right', -self.steering_correction)
+                ('images_center', 0),
+                ('images_left', self.steering_correction),
+                ('images_right', -self.steering_correction)
             ]
 
             for sub_dir, correction in configs:
