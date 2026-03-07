@@ -1,16 +1,18 @@
 # Dữ liệu huấn luyện
 data/
 outputs/
+!data/.gitkeep
+!outputs/.gitkeep
 
 # Trọng số mô hình
 models/*.pth
 models/*.pt
 models/*.onnx
-
+!models/.gitkeep
 # Log và kết quả chạy
 *.log
-tensorboard_logs/
-demo_videos/
+# tensorboard_logs/
+# demo_videos/
 
 # Môi trường ảo & Python rác
 venv/
