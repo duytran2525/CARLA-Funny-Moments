@@ -6,5 +6,5 @@ GITHUB_TOKEN = userdata.get('GITHUB_TOKEN')
 from google.colab import drive
 drive.mount('/content/drive')
 !cp /content/drive/MyDrive/Colab\ Notebooks/data.zip .
-!unzip -q /content/drive/MyDrive/data.zip -d .
+!unzip -qo data.zip -d .
 !python scripts/train_cnn.py
