@@ -1,6 +1,6 @@
 # Dữ liệu huấn luyện
-data/
-outputs/
+data/*
+outputs/*
 !data/.gitkeep
 !outputs/.gitkeep
 
