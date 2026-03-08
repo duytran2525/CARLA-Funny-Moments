@@ -36,7 +36,7 @@ class CarlaDataset(Dataset):
                 if os.path.exists(img_path):
                     self.samples.append((img_path, steering + correction))
         
-        print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
+        print(f"Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
 
     def __len__(self):
         return len(self.samples)
