@@ -32,11 +32,40 @@ class CarlaDataset(Dataset):
             ]
 
             for sub_dir, correction in configs:
+                if not self.is_training and sub_dir != 'images_center':
+                    continue
                 img_path = os.path.join(self.root_dir, sub_dir, img_id)
                 if os.path.exists(img_path):
                     self.samples.append((img_path, steering + correction))
         
         print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
+        if self.is_training:
+            self._balance_steering_distribution()
+
+    def _balance_steering_distribution(self, bins=25, max_per_bin=None):
+        """
+        Giảm số lượng mẫu đi thẳng (steering ≈ 0) để cân bằng dữ liệu.
+        Ý tưởng: chia steering thành các bin, giới hạn mỗi bin tối đa = trung bình.
+        """
+        steerings = [s for _, s in self.samples]
+        hist, bin_edges = np.histogram(steerings, bins=bins)
+
+        if max_per_bin is None:
+            max_per_bin = int(np.mean(hist))
+
+        balanced_samples = []
+        bin_counts = {i: 0 for i in range(bins)}
+
+        random.shuffle(self.samples)
+
+        for img_path, steering in self.samples:
+            bin_idx = min(np.digitize(steering, bin_edges[1:-1]), bins - 1)
+            if bin_counts[bin_idx] < max_per_bin:
+                balanced_samples.append((img_path, steering))
+                bin_counts[bin_idx] += 1
+
+        print(f"Cân bằng dữ liệu: {len(self.samples)} → {len(balanced_samples)} mẫu")
+        self.samples = balanced_samples
 
     def __len__(self):
         return len(self.samples)
@@ -82,8 +111,45 @@ class CarlaDataset(Dataset):
         trans_m = np.float32([[1, 0, trans_x], [0, 1, trans_y]])
         image = cv2.warpAffine(image, trans_m, (w, h))
         return image, steering
+    # GAUSSIAN BLUR
+    def _random_blur(self, image):
+        """Thêm Gaussian blur ngẫu nhiên để mô phỏng mờ camera"""
+        kernel_size = random.choice([3, 5])
+        image = cv2.GaussianBlur(image, (kernel_size, kernel_size), 0)
+        return image
 
+    # =====================================================
+    # [MỚI #2] GAUSSIAN NOISE — robust với nhiễu sensor
+    # =====================================================
+    def _random_noise(self, image):
+        """Thêm nhiễu Gaussian ngẫu nhiên"""
+        sigma = random.uniform(5, 15)
+        noise = np.random.normal(0, sigma, image.shape).astype(np.float32)
+        image = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+        return image
 
+    # =====================================================
+    # [MỚI #5] RANDOM ROTATION — robust với mặt đường nghiêng
+    # =====================================================
+    def _random_rotation(self, image, steering, max_angle=5):
+        """Xoay ảnh nhẹ ngẫu nhiên và bù steering tương ứng"""
+        angle = random.uniform(-max_angle, max_angle)
+        h, w = image.shape[:2]
+        M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+        image = cv2.warpAffine(image, M, (w, h))
+        # Xoay ảnh theo chiều kim đồng hồ (angle âm) ≈ xe nghiêng phải → cần lái trái
+        steering -= angle * 0.01
+        return image, steering
+
+    # =====================================================
+    # [MỚI #8] RANDOM CONTRAST — robust với điều kiện thời tiết
+    # =====================================================
+    def _random_contrast(self, image, low=0.7, high=1.3):
+        """Thay đổi contrast ngẫu nhiên"""
+        factor = random.uniform(low, high)
+        mean = np.mean(image, axis=(0, 1), keepdims=True)
+        image = np.clip((image - mean) * factor + mean, 0, 255).astype(np.uint8)
+        return image
     def __getitem__(self, idx):
         img_path, steering = self.samples[idx]
         
@@ -104,12 +170,23 @@ class CarlaDataset(Dataset):
             if random.random() > 0.5:
                 image = cv2.flip(image, 1)
                 steering = -steering
+            # --- Augmentation MỚI ---
+            if random.random() > 0.5:                                  # [MỚI #2]
+                image = self._random_blur(image)
+            if random.random() > 0.7:                                  # [MỚI #2] xác suất thấp hơn
+                image = self._random_noise(image)
+            if random.random() > 0.5:                                  # [MỚI #5]
+                image, steering = self._random_rotation(image, steering)
+            if random.random() > 0.5:                                  # [MỚI #8]
+                image = self._random_contrast(image)
 
         image = cv2.resize(image, (200, 66))
-        
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2YUV)
         if self.transform:
             image = self.transform(image)
         
         steering = torch.tensor(steering, dtype=torch.float32)
         
         return image, steering
+
+

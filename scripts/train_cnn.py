@@ -7,6 +7,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 import torchvision.transforms as transforms
 import numpy as np
+import pandas as pd
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from core_perception.dataset import CarlaDataset
@@ -28,27 +29,46 @@ def main():
 
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) 
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
 
-    # 1. KHỞI TẠO 2 DATASET RIÊNG BIỆT ĐỂ BẢO VỆ TẬP VAL
-    full_train_dataset = CarlaDataset(csv_file=CSV_PATH, root_dir=DATA_DIR, transform=transform, steering_correction=config['steering_correction'], is_training=True)
-    full_val_dataset = CarlaDataset(csv_file=CSV_PATH, root_dir=DATA_DIR, transform=transform, steering_correction=config['steering_correction'], is_training=False)
+    print("Đang phân chia tập Train và Validation từ file CSV...")
+    df = pd.read_csv(CSV_PATH, header=0, names=['img_id', 'steering', 'throttle', 'brake', 'speed'])
     
-    # Tạo danh sách index và xáo trộn
-    dataset_size = len(full_train_dataset)
-    indices = list(range(dataset_size))
-    np.random.shuffle(indices)
+    # Xáo trộn dataframe gốc
+    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
     
-    # Chia 80/20
-    train_split = int(np.floor(config['train_split'] * dataset_size))
-    train_indices, val_indices = indices[:train_split], indices[train_split:]
+    # Tính toán chỉ số chia (vd: 80% train, 20% val)
+    train_split_ratio = config.get('train_split', 0.8)
+    split_idx = int(train_split_ratio * len(df))
     
-    # Áp dụng index vào đúng Dataset tương ứng
-    train_dataset = Subset(full_train_dataset, train_indices)
-    val_dataset = Subset(full_val_dataset, val_indices)
+    train_df = df.iloc[:split_idx]
+    val_df = df.iloc[split_idx:]
     
-    # 2. BẬT PIN_MEMORY ĐỂ TĂNG TỐC ĐẨY DỮ LIỆU LÊN GPU
+    # Lưu ra 2 file CSV tạm thời
+    train_csv_path = os.path.join(DATA_DIR, 'train_split_log.csv')
+    val_csv_path = os.path.join(DATA_DIR, 'val_split_log.csv')
+    train_df.to_csv(train_csv_path, index=False)
+    val_df.to_csv(val_csv_path, index=False)
+
+    # Khởi tạo Dataset từ 2 file CSV riêng biệt
+    train_dataset = CarlaDataset(
+        csv_file=train_csv_path, 
+        root_dir=DATA_DIR, 
+        transform=transform, 
+        steering_correction=config['steering_correction'], 
+        is_training=True  # Sẽ gọi hàm balance và augmentation
+    )
+    
+    val_dataset = CarlaDataset(
+        csv_file=val_csv_path, 
+        root_dir=DATA_DIR, 
+        transform=transform, 
+        steering_correction=config['steering_correction'], 
+        is_training=False # Không augmentation, giữ nguyên data thực tế để đánh giá
+    )
+    
+    # Đưa vào DataLoader (Đã gỡ bỏ lớp Subset gây lỗi)
     train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
 
