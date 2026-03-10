@@ -66,6 +66,8 @@ class CarlaDataset(Dataset):
 
         print(f"Cân bằng dữ liệu: {len(self.samples)} → {len(balanced_samples)} mẫu")
         self.samples = balanced_samples
+        
+        print(f"Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
 
     def __len__(self):
         return len(self.samples)
@@ -188,5 +190,4 @@ class CarlaDataset(Dataset):
         steering = torch.tensor(steering, dtype=torch.float32)
         
         return image, steering
-
 
