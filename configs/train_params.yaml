@@ -6,6 +6,13 @@ learning_rate: 0.001
 
 steering_correction: 0.2
 
-augmentation_prob: 0.5  
+augmentation_prob: 0.5
 
-train_split: 0.8        
+train_split: 0.8
+
+# Learning rate scheduler (ReduceLROnPlateau)
+lr_patience: 3
+lr_factor: 0.5
+
+# Early stopping
+early_stopping_patience: 5        

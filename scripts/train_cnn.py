@@ -4,14 +4,14 @@ import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
 import numpy as np
 import pandas as pd
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from core_perception.dataset import CarlaDataset
-from core_perception.cnn_model import NvidiaCNN
+from core_perception.cnn_model import NvidiaCNNV2
 
 def load_config(config_path):
     with open(config_path, 'r') as file:
@@ -72,15 +72,25 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
 
-    model = NvidiaCNN().to(device)
+    model = NvidiaCNNV2().to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=float(config['learning_rate']))
 
-    # 3. KHỞI TẠO SCALER CHO MIXED PRECISION (AMP)
-    scaler = torch.cuda.amp.GradScaler()
+    # Learning rate scheduler: halve LR when val loss plateaus
+    lr_patience = config.get('lr_patience', 3)
+    lr_factor = config.get('lr_factor', 0.5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=lr_factor, patience=lr_patience
+    )
+
+    # Mixed-precision scaler (disabled automatically on CPU)
+    use_amp = torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     epochs = config['epochs']
+    early_stopping_patience = config.get('early_stopping_patience', 5)
     best_val_loss = float('inf')
+    epochs_no_improve = 0
 
     for epoch in range(epochs):
         model.train()
@@ -92,7 +102,7 @@ def main():
             optimizer.zero_grad()
             
             # TÍNH TOÁN BẰNG MIXED PRECISION
-            with torch.cuda.amp.autocast():
+            with torch.cuda.amp.autocast(enabled=use_amp):
                 outputs = model(images)
                 loss = criterion(outputs, steerings)
                 
@@ -111,7 +121,7 @@ def main():
             for images, steerings in val_loader:
                 images, steerings = images.to(device, non_blocking=True), steerings.to(device, non_blocking=True)
                 # Validation cũng có thể dùng autocast để đánh giá nhanh hơn
-                with torch.cuda.amp.autocast():
+                with torch.cuda.amp.autocast(enabled=use_amp):
                     outputs = model(images)
                     loss = criterion(outputs, steerings)
                 val_loss += loss.item()
@@ -120,10 +130,19 @@ def main():
         
         print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
         
+        # Step the learning rate scheduler
+        scheduler.step(val_loss)
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_no_improve = 0
             torch.save(model.state_dict(), MODEL_SAVE_PATH)
             print(f"Đã lưu trọng số mới tốt nhất tại epoch {epoch+1}")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= early_stopping_patience:
+                print(f"Early stopping sau {epoch+1} epochs (không cải thiện trong {early_stopping_patience} epochs liên tiếp).")
+                break
 
     print("Hoàn tất quá trình huấn luyện!")
 
