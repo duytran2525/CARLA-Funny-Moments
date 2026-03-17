@@ -86,7 +86,7 @@ class CarlaDataset(Dataset):
         """
         self.data_df = pd.read_csv(
             csv_file, header=0,
-            names=['img_id', 'steering', 'throttle', 'brake', 'speed']
+            names=['img_id', 'steering', 'throttle', 'brake', 'speed', 'command']
         )
         self.root_dir = root_dir
         self.transform = transform

@@ -20,7 +20,7 @@ def load_config(config_path):
 def main():
     ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     config = load_config(os.path.join(ROOT_DIR, 'configs', 'train_params.yaml'))
-    DATA_DIR = os.path.join(ROOT_DIR, 'data', 'raw_driving')
+    DATA_DIR = os.path.join(ROOT_DIR, 'data')
     CSV_PATH = os.path.join(DATA_DIR, 'driving_log.csv')
     MODEL_SAVE_PATH = os.path.join(ROOT_DIR, 'models', 'cnn_steering.pth')
     
@@ -33,7 +33,7 @@ def main():
     ])
 
     print("Đang phân chia tập Train và Validation từ file CSV...")
-    df = pd.read_csv(CSV_PATH, header=0, names=['img_id', 'steering', 'throttle', 'brake', 'speed'])
+    df = pd.read_csv(CSV_PATH, header=0, names=['img_id', 'steering', 'throttle', 'brake', 'speed', 'command'])
     
     
     # Tính toán chỉ số chia (vd: 80% train, 20% val)
