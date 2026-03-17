@@ -22,7 +22,7 @@ class CarlaDataset(Dataset):
         │
     Lấy mẫu (``__getitem__``)
         │
-        ├─► đọc ảnh PNG bằng OpenCV (BGR → RGB)
+        ├─► đọc ảnh jpg bằng OpenCV (BGR → RGB)
         ├─► crop phần trời (~45 % trên)
         ├─► nếu ``is_training=True`` → áp dụng ngẫu nhiên các phép augmentation:
         │       translate, brightness, shadow, flip, blur, noise, rotation, contrast
@@ -100,7 +100,7 @@ class CarlaDataset(Dataset):
         Xây dựng ``self.samples`` bằng cách khớp CSV với file ảnh trên đĩa.
 
         Với mỗi dòng trong CSV:
-        * Chuẩn hoá ``img_id`` thành tên file 8 chữ số + ``.png``.
+        * Chuẩn hoá ``img_id`` thành tên file 8 chữ số + ``.jpg``.
         * Thử khớp với **3 thư mục camera** (center / left / right):
           - Camera trái:  ``steering + steering_correction``
           - Camera phải: ``steering - steering_correction``
@@ -117,7 +117,7 @@ class CarlaDataset(Dataset):
             img_id_str = str(row['img_id']).strip()
             if '.' in img_id_str:
                 img_id_str = img_id_str.split('.')[0]  # Bỏ phần thập phân nếu có
-            img_id = img_id_str.zfill(8) + '.png'
+            img_id = img_id_str.zfill(8) + '.jpg'
 
             configs = [
                 ('images_center', 0),
@@ -675,7 +675,7 @@ class CILCarlaDataset(CarlaDataset):
             img_id_str = str(row['img_id']).strip()
             if '.' in img_id_str:
                 img_id_str = img_id_str.split('.')[0]
-            img_id = img_id_str.zfill(8) + '.png'
+            img_id = img_id_str.zfill(8) + '.jpg'
 
             configs = [
                 ('images_center', 0),
