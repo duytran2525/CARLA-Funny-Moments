@@ -1133,12 +1133,41 @@ class YoloDetectAgent(BaseAgent):
                 self._waiting_frame_logged = True
             return
 
-        annotated_frame, detections = self._detector.detect(frame)
+        # 1. Gọi hàm YOLO mới để nhận diện và đánh giá khoảng cách
+        detections, is_emergency = self._detector.detect_and_evaluate(frame, area_threshold=0.3)
+
+        # 2. LOGIC PHANH GẤP (Ghi đè Autopilot)
+        if is_emergency and self.session is not None and self.session.ego_vehicle is not None:
+            # Tạo lệnh dừng xe kịch sàn
+            control = carla.VehicleControl()
+            control.throttle = 0.0
+            control.steer = 0.0  # Giữ thẳng lái
+            control.brake = 1.0  # Đạp phanh 100%
+            control.hand_brake = False
+            
+            # Gửi lệnh trực tiếp xuống CARLA (lệnh này sẽ ghi đè Autopilot trong tick hiện tại)
+            self.session.ego_vehicle.apply_control(control)
+            logging.warning(f"[TICK {step_idx}] 🛑 PHANH KHẨN CẤP! Phát hiện đối tượng quá gần!")
+
+        # 3. Vẽ Bounding Box và hiển thị camera (Không làm mất tính năng cũ)
+        # Chuyển từ RGB sang BGR để OpenCV hiển thị đúng màu
+        annotated_frame = cv2.cvtColor(frame.copy(), cv2.COLOR_RGB2BGR)
+        
+        for det in detections:
+            x1, y1, x2, y2 = det['box']
+            label = f"{det['class_name']} {det['confidence']:.2f}"
+            
+            # Đổi viền sang màu ĐỎ nếu đang phanh khẩn cấp, XANH LÁ nếu an toàn
+            color = (0, 0, 255) if is_emergency else (0, 255, 0)
+            
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(annotated_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
         cv2.imshow(self._window_name, annotated_frame)
         cv2.waitKey(1)
 
         if step_idx % 20 == 0:
-            logging.info("yolo_detect tick=%d detections=%d", step_idx, len(detections))
+            logging.info("yolo_detect tick=%d detections=%d | Emergency: %s", step_idx, len(detections), is_emergency)
 
     def teardown(self) -> None:
         if self._tm_autopilot_enabled and self.session is not None and self.session.ego_vehicle is not None:
