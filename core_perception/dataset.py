@@ -451,7 +451,7 @@ class CarlaDataset(Dataset):
         image[y1:y2, x1:x2, :] = 0
 
         return image
-    def __getitem__(self, idx):
+    def _process_image_and_steering(self, img_path, steering):
         """
         Trả về một mẫu dữ liệu đã qua toàn bộ pipeline xử lý.
 
@@ -502,7 +502,6 @@ class CarlaDataset(Dataset):
         steering : torch.Tensor
             Góc lái scalar, dtype ``float32``, trong [-1, 1].
         """
-        img_path, steering = self.samples[idx]
 
         image = cv2.imread(img_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -541,6 +540,10 @@ class CarlaDataset(Dataset):
         steering = torch.tensor(np.clip(steering, -1.0, 1.0), dtype=torch.float32)
 
         return image, steering
+    
+    def __getitem__(self, idx):
+        img_path, steering = self.samples[idx]
+        return self._process_image_and_steering(img_path, steering)
 
 
 class CILCarlaDataset(CarlaDataset):
@@ -764,42 +767,14 @@ class CILCarlaDataset(CarlaDataset):
             Giá trị hợp lệ: 0 (Follow Lane), 1 (Turn Left),
             2 (Turn Right), 3 (Go Straight).
         """
+        # 1. Lấy thông tin từ tuple 4 phần tử
         img_path, steering, speed_norm, command = self.samples[idx]
 
-        image = cv2.imread(img_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # 2. Nhờ hàm của lớp cha xử lý giùm phần Ảnh và Vô lăng
+        image, steering_tensor = self._process_image_and_steering(img_path, steering)
 
-        height, width, _ = image.shape
-        image = image[int(height * 0.45):, :, :]
-
-        if self.is_training:
-            if random.random() > 0.5:
-                image, steering = self._random_translate(image, steering)
-            if random.random() > 0.5:
-                image = self._random_brightness(image)
-            if random.random() > 0.5:
-                image = self._random_shadow(image)
-            if random.random() > 0.5:
-                image = cv2.flip(image, 1)
-                steering = -steering
-            if random.random() > 0.5:
-                image = self._random_blur(image)
-            if random.random() > 0.7:
-                image = self._random_noise(image)
-            if random.random() > 0.5:
-                image, steering = self._random_rotation(image, steering)
-            if random.random() > 0.5:
-                image = self._random_contrast(image)
-            if random.random() > 0.5: 
-                image = self._random_cutout(image)
-
-        image = cv2.resize(image, (200, 66))
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2YUV)
-        if self.transform:
-            image = self.transform(image)
-
-        steering = torch.tensor(np.clip(steering, -1.0, 1.0), dtype=torch.float32)
+        # 3. Chỉ tập trung xử lý phần mở rộng (Speed và Command)
         speed = torch.tensor(speed_norm, dtype=torch.float32)
         command = torch.tensor(command, dtype=torch.long)
 
-        return image, steering, speed, command
+        return image, steering_tensor, speed, command

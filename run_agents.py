@@ -920,6 +920,11 @@ class LaneFollowAgent(BaseAgent):
         height = rgb_frame.shape[0]
         cropped = rgb_frame[int(height * 0.45) :, :, :]
         resized = cv2.resize(cropped, (200, 66), interpolation=cv2.INTER_AREA)
+
+        # [MỚI THÊM] ĐỔI SANG YUV ĐỂ KHỚP VỚI DATASET LÚC TRAIN!
+        # yuv_image = cv2.cvtColor(resized, cv2.COLOR_RGB2YUV)
+        # tensor = torch.from_numpy(yuv_image).permute(2, 0, 1).float().div_(255.0)
+
         tensor = torch.from_numpy(resized).permute(2, 0, 1).float().div_(255.0)
         tensor.sub_(0.5).div_(0.5)
         tensor.unsqueeze_(0)
