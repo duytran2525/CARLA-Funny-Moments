@@ -54,6 +54,11 @@ except Exception:
     NvidiaCNN = None
     NvidiaCNNV2 = None
 
+try:
+    from core_perception.yolo_detector import YoloDetector
+except Exception:
+    YoloDetector = None
+
 from core_control.carla_manager import CarlaManager, SpectatorConfig
 from core_control.collect_data import DataCollector
 
@@ -226,6 +231,14 @@ def resolve_model_path(model_path: str) -> Path:
     return (models_dir / "cnn_steering.pth").resolve()
 
 
+def resolve_yolo_model_path(model_path: str) -> Path:
+    project_root = Path(__file__).resolve().parent
+    candidate = Path(model_path)
+    if not candidate.is_absolute():
+        candidate = project_root / candidate
+    return candidate.resolve()
+
+
 @dataclass
 class RunConfig:
     env_config_path: str  # Path to environment config file (.env, .json, .yaml)
@@ -244,6 +257,7 @@ class RunConfig:
     dry_run: bool  # Run without connecting to CARLA
     seed: Optional[int]  # Random seed for reproducibility
     model_path: str  # Path to model weights (.pth, .pt)
+    yolo_model_path: str  # Path to YOLO weights (.pt)
     model_device: str  # Inference device (cpu or cuda)
     target_speed_kmh: float  # Target ego speed in km/h
     max_throttle: float  # Max throttle command in range [0.0, 1.0]
@@ -921,11 +935,9 @@ class LaneFollowAgent(BaseAgent):
         cropped = rgb_frame[int(height * 0.45) :, :, :]
         resized = cv2.resize(cropped, (200, 66), interpolation=cv2.INTER_AREA)
 
-        # [MỚI THÊM] ĐỔI SANG YUV ĐỂ KHỚP VỚI DATASET LÚC TRAIN!
-        # yuv_image = cv2.cvtColor(resized, cv2.COLOR_RGB2YUV)
-        # tensor = torch.from_numpy(yuv_image).permute(2, 0, 1).float().div_(255.0)
-
-        tensor = torch.from_numpy(resized).permute(2, 0, 1).float().div_(255.0)
+        # Keep inference color space identical to training (RGB -> YUV).
+        yuv_image = cv2.cvtColor(resized, cv2.COLOR_RGB2YUV)
+        tensor = torch.from_numpy(yuv_image).permute(2, 0, 1).float().div_(255.0)
         tensor.sub_(0.5).div_(0.5)
         tensor.unsqueeze_(0)
         tensor = tensor.to(self._device, non_blocking=True)
@@ -1035,6 +1047,120 @@ class LaneFollowAgent(BaseAgent):
         return self._stop_requested
 
 
+class YoloDetectAgent(BaseAgent):
+    name = "yolo_detect"
+
+    def __init__(self, config: RunConfig) -> None:
+        super().__init__(config)
+        self._enabled = False
+        self._camera = None
+        self._latest_rgb = None
+        self._frame_lock = threading.Lock()
+        self._waiting_frame_logged = False
+        self._detector = None
+        self._window_name = "CARLA YOLO Detections"
+        self._tm_autopilot_enabled = False
+
+    def setup(self, session: BaseSession) -> None:
+        super().setup(session)
+        vehicle = session.ego_vehicle
+        world = session.world
+        if vehicle is None or world is None:
+            logging.info("No CARLA vehicle/world available; yolo_detect runs as noop.")
+            return
+
+        if cv2 is None or np is None:
+            raise RuntimeError("opencv-python and numpy are required for yolo_detect agent.")
+        if YoloDetector is None:
+            raise RuntimeError(
+                "Cannot import YoloDetector. Install ultralytics and verify core_perception/yolo_detector.py."
+            )
+
+        model_path = resolve_yolo_model_path(self.config.yolo_model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"YOLO model file not found: {model_path}")
+
+        self._detector = YoloDetector(str(model_path))
+        self._camera = self._spawn_camera(world, vehicle)
+        self._camera.listen(self._on_camera_frame)
+        try:
+            vehicle.set_autopilot(True, self.config.tm_port)
+        except TypeError:
+            vehicle.set_autopilot(True)
+        self._tm_autopilot_enabled = True
+        self._enabled = True
+        logging.info("YOLO detection enabled with model: %s", model_path)
+
+    def _spawn_camera(self, world, vehicle):
+        bp_lib = world.get_blueprint_library()
+        camera_bp = bp_lib.find("sensor.camera.rgb")
+        camera_bp.set_attribute("image_size_x", str(self.config.camera_width))
+        camera_bp.set_attribute("image_size_y", str(self.config.camera_height))
+        camera_bp.set_attribute("fov", str(self.config.camera_fov))
+        if camera_bp.has_attribute("sensor_tick") and self.config.sync:
+            camera_bp.set_attribute("sensor_tick", str(self.config.fixed_delta))
+
+        camera_transform = carla.Transform(
+            carla.Location(x=1.5, z=2.2), carla.Rotation(pitch=-8.0)
+        )
+        camera = world.spawn_actor(camera_bp, camera_transform, attach_to=vehicle)
+        logging.info("Attached RGB camera for YOLO detection.")
+        return camera
+
+    def _on_camera_frame(self, image) -> None:
+        array = np.frombuffer(image.raw_data, dtype=np.uint8)
+        bgra = array.reshape((image.height, image.width, 4))
+        rgb = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGB)
+        with self._frame_lock:
+            self._latest_rgb = rgb
+
+    def _read_latest_frame(self):
+        with self._frame_lock:
+            frame = self._latest_rgb
+            self._latest_rgb = None
+        return frame
+
+    def run_step(self, step_idx: int) -> None:
+        if not self._enabled:
+            if step_idx % 50 == 0:
+                logging.info("YOLO agent waiting for CARLA runtime.")
+            return
+
+        frame = self._read_latest_frame()
+        if frame is None:
+            if not self._waiting_frame_logged:
+                logging.info("YOLO waiting for first camera frame...")
+                self._waiting_frame_logged = True
+            return
+
+        annotated_frame, detections = self._detector.detect(frame)
+        cv2.imshow(self._window_name, annotated_frame)
+        cv2.waitKey(1)
+
+        if step_idx % 20 == 0:
+            logging.info("yolo_detect tick=%d detections=%d", step_idx, len(detections))
+
+    def teardown(self) -> None:
+        if self._tm_autopilot_enabled and self.session is not None and self.session.ego_vehicle is not None:
+            try:
+                self.session.ego_vehicle.set_autopilot(False, self.config.tm_port)
+            except TypeError:
+                self.session.ego_vehicle.set_autopilot(False)
+            self._tm_autopilot_enabled = False
+
+        if self._camera is not None:
+            self._camera.stop()
+            self._camera.destroy()
+            self._camera = None
+            logging.info("Destroyed YOLO camera.")
+
+        if cv2 is not None:
+            try:
+                cv2.destroyWindow(self._window_name)
+            except Exception:
+                pass
+
+
 class NoopAgent(BaseAgent):
     name = "noop"
 
@@ -1046,6 +1172,7 @@ class NoopAgent(BaseAgent):
 AGENT_REGISTRY: Dict[str, Type[BaseAgent]] = {
     AutopilotAgent.name: AutopilotAgent,
     LaneFollowAgent.name: LaneFollowAgent,
+    YoloDetectAgent.name: YoloDetectAgent,
     NoopAgent.name: NoopAgent,
 }
 
@@ -1086,7 +1213,7 @@ def parse_args() -> argparse.Namespace:
         "--agent",
         choices=sorted(AGENT_REGISTRY),
         default="lane_follow",
-        help="Choose lane_follow for .pth steering inference, or autopilot.",
+        help="Choose lane_follow/autopilot/yolo_detect agent mode.",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=2000)
@@ -1140,6 +1267,11 @@ def parse_args() -> argparse.Namespace:
         "--model-path",
         default="auto",
         help="Path to .pth model for lane_follow agent (or 'auto').",
+    )
+    parser.add_argument(
+        "--yolo-model-path",
+        default="best.pt",
+        help="Path to YOLO .pt model used by yolo_detect agent.",
     )
     parser.add_argument(
         "--device",
@@ -1310,6 +1442,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         dry_run=args.dry_run,
         seed=args.seed,
         model_path=args.model_path,
+        yolo_model_path=args.yolo_model_path,
         model_device=args.device,
         target_speed_kmh=args.target_speed_kmh,
         max_throttle=args.max_throttle,
