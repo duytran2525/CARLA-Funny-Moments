@@ -10,8 +10,8 @@ import numpy as np
 import pandas as pd
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from core_perception.dataset import CarlaDataset
-from core_perception.cnn_model import NvidiaCNNV2 as NvidiaCNN
+from core_perception.dataset import CarlaDataset, CILCarlaDataset
+from core_perception.cnn_model import NvidiaCNNV2 as NvidiaCNN      
 
 def load_config(config_path):
     with open(config_path, 'r') as file:
