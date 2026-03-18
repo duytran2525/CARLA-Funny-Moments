@@ -20,6 +20,7 @@ class DataRecord:
     throttle: float
     brake: float
     speed_kmh: float
+    command: int = 0  # Phase 2 CIL: 0=Follow Lane, 1=Left, 2=Right, 3=Straight
 
 
 class DataCollector:
@@ -54,7 +55,7 @@ class DataCollector:
         self._csv_file = self.csv_path.open("w", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(
             self._csv_file,
-            fieldnames=["tick", "image", "steer", "throttle", "brake", "speed_kmh"],
+            fieldnames=["tick", "image", "steer", "throttle", "brake", "speed_kmh", "command"],
         )
         self._writer.writeheader()
         self._rows_since_flush = 0
@@ -69,6 +70,7 @@ class DataCollector:
         throttle: float,
         brake: float,
         speed_kmh: float,
+        command: int = 0,
     ) -> None:
         if not self.enabled:
             return
@@ -90,6 +92,7 @@ class DataCollector:
                 "throttle": round(throttle, 4),
                 "brake": round(brake, 4),
                 "speed_kmh": round(speed_kmh, 2),
+                "command": int(command),
             }
         )
         self._rows_since_flush += 1
