@@ -5,21 +5,19 @@ from ultralytics import YOLO
 import os
 
 class YoloDetector:
-    def __init__(self, conf_threshold=0.5):
+    def __init__(self, model_path, conf_threshold=0.5):
         self.conf_threshold = conf_threshold
 
-        # Tìm đường dẫn đến best.pt
-        current_dir = os.path.dirname(os.path.abspath(__file__)) 
-        model_path = os.path.join(current_dir, '..', 'best.pt') 
+        # XÓA BỎ đoạn tự tìm current_dir đi vì run_agents.py đã làm giúp rồi
         
-        # 1. Kiểm tra sự tồn tại của file model
+        # 1. Kiểm tra sự tồn tại của file model TRƯỚC TIÊN
         if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Không tìm thấy file model YOLO tại đường dẫn: {model_path}. Vui lòng kiểm tra lại vị trí file best.pt")
+            raise FileNotFoundError(f"Không tìm thấy file model YOLO: {model_path}")
 
         # 2. Thiết lập thiết bị chạy (Ưu tiên GPU CUDA cho RTX 3050)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # 3. Load model YOLO 1 lần duy nhất
+        # 3. Load model YOLO
         print(f"[YOLO DETECTOR] Đang load model từ {model_path} lên thiết bị {self.device}...")
         self.model = YOLO(model_path).to(self.device)
         
