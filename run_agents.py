@@ -37,10 +37,32 @@ except ImportError:
     yaml = None
 
 try:
-    from core_perception.cnn_model import NvidiaCNN, NvidiaCNNV2
+    from core_perception.cnn_model import NvidiaCNN, NvidiaCNNV2, CIL_NvidiaCNN
 except Exception:
     NvidiaCNN = None
     NvidiaCNNV2 = None
+    CIL_NvidiaCNN = None
+
+try:
+    from core_perception.ipm import InversePerspectiveMapping
+except Exception:
+    InversePerspectiveMapping = None
+
+try:
+    from core_perception.adas import SimpleTracker, ADASModule
+except Exception:
+    SimpleTracker = None
+    ADASModule = None
+
+try:
+    from core_perception.yolo_detector import YoloDetector
+except Exception:
+    YoloDetector = None
+
+try:
+    from agents.navigation.global_route_planner import GlobalRoutePlanner as _GRP
+except Exception:
+    _GRP = None
 
 from core_control.carla_manager import CarlaManager, SpectatorConfig
 from core_control.collect_data import DataCollector
@@ -128,6 +150,9 @@ class RunConfig:
     video_fps: float
     video_duration_sec: int
     video_codec: str
+    # Phase 2 CIL fields
+    yolo_model_path: str = "best.pt"
+    destination_spawn_point: int = -1
 
 class BaseSession:
     """Shared interface for CARLA and dry-run sessions."""
@@ -713,9 +738,400 @@ class NoopAgent(BaseAgent):
             logging.info("Noop agent alive at tick %d", step_idx)
 
 
+# ---------------------------------------------------------------------------
+# CILLaneFollowAgent – Phase 2
+# ---------------------------------------------------------------------------
+
+class CILLaneFollowAgent(LaneFollowAgent):
+    """
+    Agent tự lái Phase 2: CIL + GlobalRoutePlanner + IPM + ADAS.
+
+    Luồng xử lý mỗi bước (run_step)
+    ---------------------------------
+    1. Nhận frame RGB từ camera.
+    2. Lấy lệnh điều hướng từ ``GlobalRoutePlanner`` (Follow/Left/Right/Straight).
+    3. Đo vận tốc hiện tại của xe.
+    4. Chạy YOLO để phát hiện vật thể (nếu model YOLO có sẵn).
+    5. Dùng IPM chuyển pixel → mét, cập nhật tracker.
+    6. Tính TTC và lệnh ga/phanh (ADAS / ACC).
+    7. Đưa ảnh + vận tốc + lệnh GPS vào CIL CNN → lấy góc lái.
+    8. Áp dụng điều khiển (steer từ CIL, throttle/brake từ ADAS).
+    9. Thu thập dữ liệu kèm cột ``command`` cho Phase 2 training.
+
+    Sự khác biệt so với ``LaneFollowAgent``
+    ----------------------------------------
+    * Nạp ``CIL_NvidiaCNN`` thay vì ``NvidiaCNNV2``.
+    * Dự đoán steering với 3 đầu vào: ảnh, vận tốc chuẩn hoá, lệnh GPS.
+    * Tích hợp ``GlobalRoutePlanner`` để theo dõi route và trích xuất lệnh.
+    * Tích hợp ``InversePerspectiveMapping`` + ``SimpleTracker`` + ``ADASModule``
+      cho ADAS với TTC chính xác (mét).
+    """
+
+    name = "cil_lane_follow"
+
+    # CIL command mapping từ CARLA RoadOption
+    _ROAD_OPTION_TO_CMD = {
+        "RoadOption.LANEFOLLOW": 0,
+        "RoadOption.LEFT": 1,
+        "RoadOption.RIGHT": 2,
+        "RoadOption.STRAIGHT": 3,
+        "RoadOption.CHANGELANELEFT": 1,
+        "RoadOption.CHANGELANERIGHT": 2,
+        "RoadOption.VOID": 0,
+    }
+    # Tốc độ tối đa để chuẩn hoá (km/h → [0, 1])
+    MAX_SPEED_KMH = 120.0
+    _SPEED_NORM_FACTOR = 1.0 / MAX_SPEED_KMH
+    # Camera mount params (khớp với CARLA camera transform trong LaneFollowAgent)
+    _CAM_HEIGHT_M = 2.2    # z offset của camera (mét)
+    _CAM_PITCH_DEG = 8.0   # |pitch| của camera (CARLA pitch=-8 → looking down 8°)
+    # Bán kính tìm waypoint gần nhất trên route (mét)
+    WAYPOINT_SEARCH_RADIUS = 10.0
+
+    def __init__(self, config: RunConfig) -> None:
+        super().__init__(config)
+        self._ipm = None
+        self._tracker = None
+        self._adas = None
+        self._yolo = None
+        self._route = []          # list of (waypoint, RoadOption)
+        self._current_cmd = 0     # lệnh điều hướng hiện tại (0–3)
+        self._route_idx = 0       # chỉ số waypoint hiện tại trên route
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def setup(self, session: BaseSession) -> None:
+        super().setup(session)
+        if session.ego_vehicle is None or session.world is None:
+            return
+
+        self._ipm = self._init_ipm()
+        self._tracker = SimpleTracker() if SimpleTracker is not None else None
+        self._adas = ADASModule() if ADASModule is not None else None
+        self._yolo = self._init_yolo()
+        self._route = self._plan_route(session)
+        self._route_idx = 0
+        logging.info("CIL agent ready. Route length: %d waypoints.", len(self._route))
+
+    def _init_ipm(self):
+        if InversePerspectiveMapping is None:
+            logging.warning("IPM module not available.")
+            return None
+        return InversePerspectiveMapping(
+            image_width=self.config.camera_width,
+            image_height=self.config.camera_height,
+            fov_deg=self.config.camera_fov,
+            cam_height=self._CAM_HEIGHT_M,
+            cam_pitch_deg=self._CAM_PITCH_DEG,
+        )
+
+    def _init_yolo(self):
+        if YoloDetector is None:
+            return None
+        model_path = self.config.yolo_model_path
+        try:
+            yolo = YoloDetector(model_path=model_path)
+            logging.info("YOLO detector loaded from %s.", model_path)
+            return yolo
+        except Exception as exc:
+            logging.warning("Could not load YOLO detector (%s): %s", model_path, exc)
+            return None
+
+    def _plan_route(self, session: BaseSession):
+        """
+        Lên kế hoạch route từ vị trí spawn hiện tại đến điểm đích.
+
+        Điểm đích được lấy từ ``config.destination_spawn_point``:
+        * ≥ 0 → spawn point theo index đó.
+        * -1 → chọn ngẫu nhiên một spawn point khác.
+        """
+        if _GRP is None or carla is None:
+            logging.warning("GlobalRoutePlanner unavailable; no route planned.")
+            return []
+
+        world = session.world
+        vehicle = session.ego_vehicle
+        carla_map = world.get_map()
+        spawn_points = carla_map.get_spawn_points()
+
+        if len(spawn_points) < 2:
+            logging.warning("Not enough spawn points to plan a route.")
+            return []
+
+        start_loc = vehicle.get_location()
+        dest_idx = self.config.destination_spawn_point
+        if dest_idx < 0 or dest_idx >= len(spawn_points):
+            dest_idx = random.randint(0, len(spawn_points) - 1)
+        dest_loc = spawn_points[dest_idx].location
+
+        try:
+            grp = _GRP(carla_map, sampling_resolution=2.0)
+            route = grp.trace_route(start_loc, dest_loc)
+            logging.info(
+                "Route planned: %d waypoints → spawn[%d] at (%.1f, %.1f)",
+                len(route), dest_idx, dest_loc.x, dest_loc.y,
+            )
+            return route
+        except Exception as exc:
+            logging.warning("Route planning failed: %s", exc)
+            return []
+
+    # ------------------------------------------------------------------
+    # Model loading (override)
+    # ------------------------------------------------------------------
+
+    def _load_model(self):
+        if torch is None:
+            raise RuntimeError("PyTorch is required for cil_lane_follow agent.")
+        if CIL_NvidiaCNN is None:
+            raise RuntimeError("Cannot import CIL_NvidiaCNN from core_perception.cnn_model.")
+
+        model_path = resolve_model_path(self.config.model_path)
+        if self.config.model_path.lower() == "auto":
+            logging.info("Auto-selected model path: %s", model_path)
+        if not model_path.exists():
+            raise RuntimeError(f"CIL model file not found: {model_path}")
+
+        device_name = self.config.model_device.lower()
+        if device_name == "auto":
+            device_name = "cuda" if torch.cuda.is_available() else "cpu"
+        if device_name == "cuda" and not torch.cuda.is_available():
+            logging.warning("CUDA requested but unavailable. Falling back to CPU.")
+            device_name = "cpu"
+
+        self._device = torch.device(device_name)
+
+        checkpoint = torch.load(model_path, map_location=self._device)
+        state_dict = checkpoint
+        if isinstance(checkpoint, dict):
+            state_dict = checkpoint.get(
+                "state_dict",
+                checkpoint.get("model_state_dict", checkpoint)
+            )
+        if not isinstance(state_dict, dict):
+            raise RuntimeError("Unsupported checkpoint format.")
+
+        if any(k.startswith("module.") for k in state_dict.keys()):
+            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+        model = CIL_NvidiaCNN().to(self._device)
+        model.load_state_dict(state_dict, strict=True)
+        model.eval()
+        logging.info("Loaded CIL model from %s on %s", model_path, self._device)
+        return model
+
+    # ------------------------------------------------------------------
+    # Navigation command extraction
+    # ------------------------------------------------------------------
+
+    def _get_navigation_command(self) -> int:
+        """
+        Lấy lệnh điều hướng tại vị trí hiện tại từ route đã lên kế hoạch.
+
+        Tìm waypoint gần nhất *phía trước* xe trên route và trả về
+        ``RoadOption`` tương ứng dưới dạng chỉ số nguyên (0–3).
+
+        Returns
+        -------
+        int
+            0 = Follow Lane, 1 = Left, 2 = Right, 3 = Straight.
+        """
+        if not self._route or self.session is None:
+            return 0
+
+        vehicle = self.session.ego_vehicle
+        if vehicle is None:
+            return 0
+
+        ego_loc = vehicle.get_location()
+
+        # Tìm waypoint gần nhất trên route (phía trước route_idx)
+        best_idx = self._route_idx
+        best_dist = float('inf')
+        search_end = min(self._route_idx + 50, len(self._route))
+        for i in range(self._route_idx, search_end):
+            wp, _ = self._route[i]
+            dx = wp.transform.location.x - ego_loc.x
+            dy = wp.transform.location.y - ego_loc.y
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+
+        # Tiến route_idx nếu đã qua waypoint
+        if best_dist < self.WAYPOINT_SEARCH_RADIUS:
+            self._route_idx = min(best_idx + 1, len(self._route) - 1)
+
+        # Nhìn trước vài waypoint để lấy lệnh tại ngã tư
+        look_ahead = min(self._route_idx + 5, len(self._route) - 1)
+        _, road_option = self._route[look_ahead]
+        cmd = self._ROAD_OPTION_TO_CMD.get(str(road_option), 0)
+        return cmd
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+
+    def _predict_steering_cil(self, rgb_frame, speed_kmh: float, command: int) -> float:
+        """
+        Dự đoán góc lái với CIL CNN (ảnh + vận tốc + lệnh).
+
+        Parameters
+        ----------
+        rgb_frame : np.ndarray
+            Frame RGB gốc từ camera (H × W × 3).
+        speed_kmh : float
+            Tốc độ hiện tại (km/h).
+        command : int
+            Lệnh điều hướng (0–3).
+
+        Returns
+        -------
+        float
+            Góc lái trong [-1, 1].
+        """
+        height = rgb_frame.shape[0]
+        cropped = rgb_frame[int(height * 0.45):, :, :]
+        resized = cv2.resize(cropped, (200, 66), interpolation=cv2.INTER_AREA)
+
+        tensor = torch.from_numpy(resized).permute(2, 0, 1).float().div_(255.0)
+        tensor.sub_(0.5).div_(0.5)
+        tensor.unsqueeze_(0)
+        tensor = tensor.to(self._device, non_blocking=True)
+
+        speed_norm = clamp(speed_kmh * self._SPEED_NORM_FACTOR, 0.0, 1.0)
+        speed_t = torch.tensor([[speed_norm]], dtype=torch.float32, device=self._device)
+        cmd_t = torch.tensor([command], dtype=torch.long, device=self._device)
+
+        with torch.inference_mode():
+            steering = self._model(tensor, speed_t, cmd_t).item()
+        return clamp(steering, -1.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # Main step
+    # ------------------------------------------------------------------
+
+    def run_step(self, step_idx: int) -> None:
+        if not self._enabled:
+            if step_idx % 50 == 0:
+                logging.info("CIL agent waiting for CARLA runtime.")
+            return
+
+        frame = self._read_latest_frame()
+        if frame is None:
+            if not self._waiting_frame_logged:
+                logging.info("CIL agent: waiting for first camera frame...")
+                self._waiting_frame_logged = True
+            return
+
+        self._write_video_frame(frame)
+        if self._stop_requested:
+            return
+
+        # 1. Navigation command từ route planner
+        command = self._get_navigation_command()
+        self._current_cmd = command
+
+        # 2. Tốc độ hiện tại
+        speed_kmh = self._current_speed_kmh()
+        speed_mps = speed_kmh / 3.6
+
+        # 3. YOLO detection + IPM + Tracker + ADAS
+        throttle, brake = self._run_survival_pipeline(frame, speed_mps)
+
+        # 4. CIL steering
+        steering_raw = self._predict_steering_cil(frame, speed_kmh, command)
+        alpha = clamp(self.config.steer_smoothing, 0.0, 0.99)
+        steering = alpha * self._last_steer + (1.0 - alpha) * steering_raw
+        self._last_steer = steering
+
+        # 5. Áp dụng điều khiển
+        control = carla.VehicleControl(
+            throttle=float(throttle),
+            steer=float(clamp(steering, -1.0, 1.0)),
+            brake=float(brake),
+            hand_brake=False,
+            reverse=False,
+        )
+        self.session.ego_vehicle.apply_control(control)
+
+        # 6. Lưu dữ liệu (kèm command cho Phase 2 dataset)
+        if self._collector is not None:
+            self._collector.add(
+                tick=step_idx,
+                rgb_frame=frame,
+                steer=control.steer,
+                throttle=control.throttle,
+                brake=control.brake,
+                speed_kmh=speed_kmh,
+                command=command,
+            )
+
+        if step_idx % 20 == 0:
+            logging.info(
+                "cil_lane_follow tick=%d cmd=%d speed=%.1f km/h "
+                "steer=%.3f throttle=%.2f brake=%.2f",
+                step_idx, command, speed_kmh,
+                control.steer, control.throttle, control.brake,
+            )
+
+    def _run_survival_pipeline(self, rgb_frame, ego_speed_mps: float):
+        """
+        Luồng sinh tồn: YOLO → IPM → Tracker → ADAS → (throttle, brake).
+
+        Trả về điều khiển dọc (ga/phanh) từ module ADAS.
+        Nếu YOLO hoặc ADAS không có sẵn, dùng điều khiển tốc độ cơ bản.
+
+        Parameters
+        ----------
+        rgb_frame : np.ndarray
+            Frame RGB gốc.
+        ego_speed_mps : float
+            Tốc độ xe (m/s).
+
+        Returns
+        -------
+        throttle, brake : float
+        """
+        target_speed_mps = self.config.target_speed_kmh / 3.6
+
+        if self._adas is None:
+            # Fallback: điều khiển tốc độ đơn giản
+            throttle, brake = self._longitudinal_control(ego_speed_mps * 3.6)
+            return throttle, brake
+
+        # YOLO detection
+        detections = []
+        if self._yolo is not None:
+            try:
+                _, raw_dets = self._yolo.detect(rgb_frame)
+                detections = raw_dets
+            except Exception as exc:
+                logging.debug("YOLO detect failed: %s", exc)
+
+        # Tracker update
+        tracks = []
+        if self._tracker is not None:
+            tracks = self._tracker.update(detections)
+            if self._ipm is not None:
+                self._tracker.update_world_positions(self._ipm, tracks)
+
+        # ADAS: tính TTC và ACC
+        throttle, brake, min_ttc = self._adas.compute_control(
+            tracks, ego_speed_mps, target_speed_mps
+        )
+        if min_ttc < float('inf'):
+            logging.debug("ADAS TTC=%.2fs → throttle=%.2f brake=%.2f", min_ttc, throttle, brake)
+
+        return throttle, brake
+
+
 AGENT_REGISTRY: Dict[str, Type[BaseAgent]] = {
     AutopilotAgent.name: AutopilotAgent,
     LaneFollowAgent.name: LaneFollowAgent,
+    CILLaneFollowAgent.name: CILLaneFollowAgent,
     NoopAgent.name: NoopAgent,
 }
 
@@ -871,6 +1287,18 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
     )
+    # Phase 2 CIL arguments
+    parser.add_argument(
+        "--yolo-model-path",
+        default="best.pt",
+        help="Path to YOLO model weights for CIL agent (Phase 2).",
+    )
+    parser.add_argument(
+        "--destination-spawn-point",
+        type=int,
+        default=-1,
+        help="Destination spawn-point index for CIL route planning (-1 = random).",
+    )
     return parser.parse_args()
 
 
@@ -991,6 +1419,8 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         video_fps=video_fps,
         video_duration_sec=video_duration_sec,
         video_codec=video_codec,
+        yolo_model_path=args.yolo_model_path,
+        destination_spawn_point=args.destination_spawn_point,
     )
 
 
