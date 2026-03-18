@@ -328,7 +328,7 @@ class CarlaManager:
         self._spawn_npc_group("motobike", motorbike_bps, self.npc_motorbike_count)
 
     def _spawn_pedestrians(self) -> None:
-        """Spawn walker (pedestrian) actors with AI controllers."""
+        """Spawn walker (pedestrian) actors with AI controllers near the ego vehicle."""
         if self.npc_pedestrian_count <= 0:
             return
         assert self.world is not None
@@ -338,11 +338,23 @@ class CarlaManager:
             logging.warning("No pedestrian blueprints found.")
             return
 
+        # Collect random navigation locations and filter to those near ego vehicle
+        ego_loc = self._spawn_transform.location if self._spawn_transform else None
+        nearby_radius = 80.0  # metres
         spawn_points = []
-        for _ in range(self.npc_pedestrian_count * 3):
+        attempts = self.npc_pedestrian_count * 20
+        for _ in range(attempts):
             loc = self.world.get_random_location_from_navigation()
-            if loc is not None:
-                spawn_points.append(carla.Transform(location=loc))
+            if loc is None:
+                continue
+            if ego_loc is not None:
+                dx = loc.x - ego_loc.x
+                dy = loc.y - ego_loc.y
+                if (dx * dx + dy * dy) > nearby_radius * nearby_radius:
+                    continue
+            spawn_points.append(carla.Transform(location=loc))
+            if len(spawn_points) >= self.npc_pedestrian_count * 3:
+                break
         if not spawn_points:
             logging.warning("Could not find navigation spawn locations for pedestrians.")
             return
@@ -374,9 +386,25 @@ class CarlaManager:
         else:
             self.world.wait_for_tick(self.timeout)
 
-        # Start AI controllers
+        # Start AI controllers — send walkers toward nearby locations
         for controller in self._walker_controllers:
-            target = self.world.get_random_location_from_navigation()
+            # Try multiple times to find a target near ego
+            target = None
+            for _ in range(30):
+                loc = self.world.get_random_location_from_navigation()
+                if loc is None:
+                    continue
+                if ego_loc is not None:
+                    dx = loc.x - ego_loc.x
+                    dy = loc.y - ego_loc.y
+                    if (dx * dx + dy * dy) <= nearby_radius * nearby_radius:
+                        target = loc
+                        break
+                else:
+                    target = loc
+                    break
+            if target is None:
+                target = self.world.get_random_location_from_navigation()
             if target is not None:
                 controller.start()
                 controller.go_to_location(target)

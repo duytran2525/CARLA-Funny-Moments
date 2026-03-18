@@ -1,8 +1,10 @@
 ﻿from __future__ import annotations
 
 import argparse
+import importlib
 import logging
 import math
+import os
 import random
 import sys
 import threading
@@ -15,6 +17,16 @@ try:
     import carla
 except ImportError:
     carla = None
+
+try:
+    from agents.navigation.basic_agent import BasicAgent  # type: ignore[import-not-found]
+except Exception:
+    BasicAgent = None
+
+try:
+    from agents.navigation.behavior_agent import BehaviorAgent  # type: ignore[import-not-found]
+except Exception:
+    BehaviorAgent = None
 
 try:
     import cv2
@@ -46,8 +58,138 @@ from core_control.carla_manager import CarlaManager, SpectatorConfig
 from core_control.collect_data import DataCollector
 
 
+def ensure_navigation_agent_imports() -> None:
+    """Try to import CARLA navigation agents, including dynamic PythonAPI paths."""
+    global BasicAgent, BehaviorAgent
+    if BasicAgent is not None and BehaviorAgent is not None:
+        return
+
+    project_root = Path(__file__).resolve().parent
+    candidates: list[Path] = []
+
+    env_pythonapi = os.environ.get("CARLA_PYTHONAPI", "").strip()
+    if env_pythonapi:
+        candidates.append(Path(env_pythonapi))
+
+    env_carla_root = os.environ.get("CARLA_ROOT", "").strip()
+    if env_carla_root:
+        candidates.append(Path(env_carla_root) / "PythonAPI")
+        candidates.append(Path(env_carla_root) / "WindowsNoEditor" / "PythonAPI")
+
+    candidates.extend(
+        [
+            project_root / "PythonAPI",
+            project_root.parent / "PythonAPI",
+            Path("D:/CARLA/PythonAPI"),
+            Path("D:/CARLA/WindowsNoEditor/PythonAPI"),
+            Path("C:/CARLA/PythonAPI"),
+            Path("C:/CARLA/WindowsNoEditor/PythonAPI"),
+        ]
+    )
+
+    for base in candidates:
+        if not base.exists():
+            continue
+        base_str = str(base)
+        if base_str not in sys.path:
+            sys.path.append(base_str)
+        carla_sub = base / "carla"
+        if carla_sub.exists():
+            carla_sub_str = str(carla_sub)
+            if carla_sub_str not in sys.path:
+                sys.path.append(carla_sub_str)
+
+        dist_dir = base / "carla" / "dist"
+        if dist_dir.exists():
+            for egg in dist_dir.glob("*.egg"):
+                egg_str = str(egg)
+                if egg_str not in sys.path:
+                    sys.path.append(egg_str)
+
+    if BasicAgent is None:
+        try:
+            BasicAgent = importlib.import_module("agents.navigation.basic_agent").BasicAgent
+        except Exception:
+            pass
+    if BehaviorAgent is None:
+        try:
+            BehaviorAgent = importlib.import_module("agents.navigation.behavior_agent").BehaviorAgent
+        except Exception:
+            pass
+
+
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def map_road_option_to_command(road_option) -> int:
+    if road_option is None:
+        return 0
+
+    option_name = getattr(road_option, "name", str(road_option)).lower()
+    if "left" in option_name:
+        return 1
+    if "right" in option_name:
+        return 2
+    if "straight" in option_name:
+        return 3
+    return 0
+
+
+def apply_random_weather(world) -> str:
+    # 40% clear day, 20% sunset, 20% night, 20% rain.
+    roll = random.random()
+    if roll < 0.40:
+        preset_name = "clear_day"
+        weather = carla.WeatherParameters(
+            cloudiness=8.0,
+            precipitation=0.0,
+            precipitation_deposits=0.0,
+            wind_intensity=8.0,
+            fog_density=0.0,
+            wetness=0.0,
+            sun_azimuth_angle=30.0,
+            sun_altitude_angle=70.0,
+        )
+    elif roll < 0.60:
+        preset_name = "sunset"
+        weather = carla.WeatherParameters(
+            cloudiness=30.0,
+            precipitation=0.0,
+            precipitation_deposits=0.0,
+            wind_intensity=10.0,
+            fog_density=2.0,
+            wetness=0.0,
+            sun_azimuth_angle=15.0,
+            sun_altitude_angle=8.0,
+        )
+    elif roll < 0.80:
+        preset_name = "night"
+        weather = carla.WeatherParameters(
+            cloudiness=20.0,
+            precipitation=0.0,
+            precipitation_deposits=0.0,
+            wind_intensity=6.0,
+            fog_density=3.0,
+            wetness=0.0,
+            sun_azimuth_angle=0.0,
+            sun_altitude_angle=-35.0,
+        )
+    else:
+        preset_name = "rain"
+        weather = carla.WeatherParameters(
+            cloudiness=85.0,
+            precipitation=70.0,
+            precipitation_deposits=60.0,
+            wind_intensity=35.0,
+            fog_density=12.0,
+            wetness=75.0,
+            sun_azimuth_angle=25.0,
+            sun_altitude_angle=45.0,
+        )
+
+    world.set_weather(weather)
+    return preset_name
 
 
 def resolve_model_path(model_path: str) -> Path:
@@ -86,38 +228,39 @@ def resolve_model_path(model_path: str) -> Path:
 
 @dataclass
 class RunConfig:
-    env_config_path: str  # ─É╞░ß╗¥ng dß║½n tß╗¢i file cß║Ñu h├¼nh m├┤i tr╞░ß╗¥ng (.env, .json, .yaml...)
-    host: str  # ─Éß╗ïa chß╗ë IP cß╗ºa m├íy chß╗º CARLA (th╞░ß╗¥ng l├á '127.0.0.1' hoß║╖c 'localhost')
-    port: int  # Cß╗òng kß║┐t nß╗æi ch├¡nh cß╗ºa CARLA (mß║╖c ─æß╗ïnh l├á 2000)
-    tm_port: int  # Cß╗òng kß║┐t nß╗æi cho Traffic Manager ─æß╗â ─æiß╗üu phß╗æi giao th├┤ng (th╞░ß╗¥ng l├á 8000)
-    timeout: float  # Thß╗¥i gian chß╗¥ tß╗æi ─æa (gi├óy) ─æß╗â kß║┐t nß╗æi vß╗¢i server CARLA
-    sync: bool  # Bß║¡t/tß║»t chß║┐ ─æß╗Ö ─æß╗ông bß╗Ö (Synchronous mode) ─æß╗â kh├┤ng bß╗ï rß╗¢t frame
-    fixed_delta: float  # B╞░ß╗¢c thß╗¥i gian cß╗æ ─æß╗ïnh cho mß╗ùi frame (v├¡ dß╗Ñ: 0.05s t╞░╞íng ─æ╞░╞íng 20 FPS)
-    no_rendering: bool  # Tß║»t ─æß╗ô hß╗ìa hiß╗ân thß╗ï cß╗ºa server ─æß╗â t─âng tß╗æc ─æß╗Ö giß║ú lß║¡p
-    map_name: str  # T├¬n bß║ún ─æß╗ô cß║ºn nß║íp (v├¡ dß╗Ñ: 'Town01', 'Town04')
-    vehicle_filter: str  # Loß║íi xe tß╗▒ l├íi muß╗æn sinh ra (v├¡ dß╗Ñ: 'vehicle.tesla.model3')
-    spawn_point: int  # Vß╗ï tr├¡ (index) sinh ra xe tr├¬n bß║ún ─æß╗ô
-    ticks: int  # Tß╗òng sß╗æ b╞░ß╗¢c (frames) tß╗æi ─æa m├á giß║ú lß║¡p sß║╜ chß║íy
-    tick_interval: float  # Khoß║úng thß╗¥i gian nghß╗ë giß╗»a c├íc tick (nß║┐u muß╗æn chß║íy theo thß╗¥i gian thß╗▒c)
-    dry_run: bool  # Cß╗¥ chß║íy thß╗¡ nghiß╗çm (kiß╗âm tra logic code m├á kh├┤ng l╞░u data hay chß║íy model)
-    seed: Optional[int]  # Hß║ít giß╗æng random ─æß╗â cß╗æ ─æß╗ïnh kß║┐t quß║ú giß╗»a c├íc lß║ºn chß║íy (dß╗à debug)
-    model_path: str  # ─É╞░ß╗¥ng dß║½n tß╗¢i file weights cß╗ºa m├┤ h├¼nh PyTorch (.pth, .pt)
-    model_device: str  # Thiß║┐t bß╗ï d├╣ng ─æß╗â suy luß║¡n (v├¡ dß╗Ñ: 'cuda' cho GPU hoß║╖c 'cpu')
-    target_speed_kmh: float  # Tß╗æc ─æß╗Ö mß╗Ñc ti├¬u m├á xe tß╗▒ l├íi cß║ºn duy tr├¼ (km/h)
-    max_throttle: float  # Mß╗⌐c ─æß║íp ga tß╗æi ─æa cho ph├⌐p (tß╗½ 0.0 ─æß║┐n 1.0)
-    max_brake: float  # Mß╗⌐c ─æß║íp phanh tß╗æi ─æa cho ph├⌐p (tß╗½ 0.0 ─æß║┐n 1.0)
-    steer_smoothing: float  # Hß╗ç sß╗æ l├ám m╞░ß╗út v├┤ l─âng, tr├ính xe bß╗ï ─æ├ính l├íi giß║¡t cß╗Ñc
-    camera_width: int  # Chiß╗üu rß╗Öng ß║únh thu thß║¡p tß╗½ camera RGB (pixel)
-    camera_height: int  # Chiß╗üu cao ß║únh thu thß║¡p tß╗½ camera RGB (pixel)
-    camera_fov: float  # G├│c nh├¼n (Field of View) cß╗ºa camera (t├¡nh bß║▒ng ─æß╗Ö)
-    lock_spectator_on_spawn: bool  # Tß╗▒ ─æß╗Öng dß╗ïch chuyß╗ân camera tß╗òng (spectator) ─æß║┐n xe ngay khi spawn
-    spectator_reapply_each_tick: bool  # Li├¬n tß╗Ñc kh├│a g├│c nh├¼n spectator theo ─æu├┤i xe mß╗ùi frame
-    spectator_follow_distance: float  # Khoß║úng c├ích theo ─æu├┤i cß╗ºa spectator so vß╗¢i xe
-    spectator_height: float  # ─Éß╗Ö cao cß╗ºa spectator so vß╗¢i n├│c xe
-    spectator_pitch: float  # G├│c ch├║i xuß╗æng cß╗ºa camera spectator (t├¡nh bß║▒ng ─æß╗Ö)
-    collect_data: bool  # C├┤ng tß║»c bß║¡t/tß║»t viß╗çc thu thß║¡p v├á l╞░u dataset
-    collect_data_dir: str  # Th╞░ mß╗Ñc ─æ├¡ch ─æß╗â l╞░u ß║únh v├á log file cho qu├í tr├¼nh training
-    save_every_n: int  # Chß╗ë l╞░u ß║únh mß╗ùi N tick (gi├║p khung cß║únh thay ─æß╗òi giß╗»a c├íc ß║únh)
+    env_config_path: str  # Path to environment config file (.env, .json, .yaml)
+    host: str  # CARLA server host (for example: 127.0.0.1)
+    port: int  # CARLA RPC port (default: 2000)
+    tm_port: int  # Traffic Manager port (default: 8000)
+    timeout: float  # RPC timeout in seconds
+    sync: bool  # Use synchronous mode to avoid frame drops
+    fixed_delta: float  # Fixed step duration per frame (e.g. 0.05 = 20 FPS)
+    no_rendering: bool  # Disable rendering on server for higher simulation speed
+    map_name: str  # CARLA map name (for example: Town01, Town04)
+    vehicle_filter: str  # Ego vehicle blueprint filter
+    spawn_point: int  # Ego spawn point index
+    ticks: int  # Max simulation steps to run
+    tick_interval: float  # Sleep interval between ticks in dry-run mode
+    dry_run: bool  # Run without connecting to CARLA
+    seed: Optional[int]  # Random seed for reproducibility
+    model_path: str  # Path to model weights (.pth, .pt)
+    model_device: str  # Inference device (cpu or cuda)
+    target_speed_kmh: float  # Target ego speed in km/h
+    max_throttle: float  # Max throttle command in range [0.0, 1.0]
+    max_brake: float  # Max brake command in range [0.0, 1.0]
+    steer_smoothing: float  # Steering smoothing factor
+    camera_width: int  # Camera capture width in pixels
+    camera_height: int  # Camera capture height in pixels
+    camera_fov: float  # Camera field of view in degrees
+    lock_spectator_on_spawn: bool  # Lock spectator near ego on spawn
+    spectator_reapply_each_tick: bool  # Re-apply spectator transform each tick
+    spectator_follow_distance: float  # Spectator follow distance from ego
+    spectator_height: float  # Spectator height relative to ego
+    spectator_pitch: float  # Spectator camera pitch in degrees
+    collect_data: bool  # Enable synchronized dataset collection
+    collect_data_dir: str  # Dataset output folder
+    save_every_n: int  # Keep one sample every N frames
+    image_prefix: str
     npc_vehicle_count: int
     npc_bike_count: int
     npc_motorbike_count: int
@@ -128,6 +271,11 @@ class RunConfig:
     video_fps: float
     video_duration_sec: int
     video_codec: str
+    random_weather: bool
+    recovery_interval_frames: int
+    recovery_duration_frames: int
+    recovery_steer_offset: float
+    nav_agent_type: str
 
 class BaseSession:
     """Shared interface for CARLA and dry-run sessions."""
@@ -166,6 +314,12 @@ class CarlaSession(BaseSession):
         if self._manager is None:
             return None
         return self._manager.world
+
+    @property
+    def traffic_manager(self):
+        if self._manager is None:
+            return None
+        return self._manager.tm
 
     def start(self) -> None:
         assert carla is not None
@@ -256,8 +410,13 @@ class AutopilotAgent(BaseAgent):
         self._latest_rgb = None
         self._frame_lock = threading.Lock()
         self._waiting_frame_logged = False
-        self._data_camera = None
+        self._data_cameras = []
         self._collector: Optional[DataCollector] = None
+        self._nav_agent = None
+        self._spawn_points = []
+        self._recovery_start_frame = -1
+        self._recovery_direction = 1.0
+        self._tm_fallback_mode = False
 
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
@@ -265,13 +424,109 @@ class AutopilotAgent(BaseAgent):
         if vehicle is None or session.world is None:
             logging.info("No ego vehicle in this session; autopilot setup skipped.")
             return
-        try:
-            vehicle.set_autopilot(True, self.config.tm_port)
-        except TypeError:
-            vehicle.set_autopilot(True)
+
+        self._init_navigation_agent(session.world, vehicle)
+
         self._start_video_recording(session.world, vehicle)
         self._start_data_collection(session.world, vehicle)
         logging.info("Autopilot enabled for ego vehicle.")
+
+    def _init_navigation_agent(self, world, vehicle) -> None:
+        self._spawn_points = world.get_map().get_spawn_points()
+        if not self._spawn_points:
+            raise RuntimeError("No spawn points found to build navigation route.")
+
+        ensure_navigation_agent_imports()
+
+        nav_type = self.config.nav_agent_type.lower()
+        try:
+            if nav_type == "behavior":
+                if BehaviorAgent is None:
+                    raise RuntimeError("BehaviorAgent missing")
+                self._nav_agent = BehaviorAgent(vehicle, behavior="normal")
+            else:
+                if BasicAgent is None:
+                    raise RuntimeError("BasicAgent missing")
+                self._nav_agent = BasicAgent(vehicle, target_speed=max(10.0, self.config.target_speed_kmh))
+        except Exception:
+            self._nav_agent = None
+            self._tm_fallback_mode = True
+            try:
+                vehicle.set_autopilot(True, self.config.tm_port)
+            except TypeError:
+                vehicle.set_autopilot(True)
+            logging.info(
+                "Using TM autopilot fallback with heuristic command labels (set CARLA_PYTHONAPI to enable BasicAgent/BehaviorAgent)."
+            )
+            return
+
+        self._set_new_destination(vehicle)
+        logging.info("Navigation agent initialized: %s", self.config.nav_agent_type)
+
+    def _set_new_destination(self, vehicle) -> None:
+        if not self._spawn_points or self._nav_agent is None:
+            return
+        destination = random.choice(self._spawn_points).location
+        current_loc = vehicle.get_location()
+        try:
+            self._nav_agent.set_destination(current_loc, destination)
+        except TypeError:
+            self._nav_agent.set_destination(destination)
+
+    def _extract_current_command(self) -> int:
+        vehicle = self.session.ego_vehicle if self.session is not None else None
+        world = self.session.world if self.session is not None else None
+
+        if self._tm_fallback_mode and vehicle is not None and world is not None:
+            m = world.get_map()
+            waypoint = m.get_waypoint(vehicle.get_location(), project_to_road=True)
+            if waypoint is None:
+                return 0
+            # Heuristic command labels at junctions when route planner API is unavailable.
+            if waypoint.is_junction:
+                steer = float(vehicle.get_control().steer)
+                if steer < -0.10:
+                    return 1
+                if steer > 0.10:
+                    return 2
+                return 3
+            return 0
+
+        if self._nav_agent is None:
+            return 0
+        planner = None
+        if hasattr(self._nav_agent, "get_local_planner"):
+            planner = self._nav_agent.get_local_planner()
+        if planner is None:
+            return 0
+
+        road_option = getattr(planner, "target_road_option", None)
+        if road_option is None:
+            road_option = getattr(planner, "_target_road_option", None)
+
+        # Fallback: peek first waypoint command in planner queue.
+        if road_option is None:
+            queue_attr = getattr(planner, "_waypoints_queue", None)
+            if queue_attr and len(queue_attr) > 0:
+                road_option = queue_attr[0][1]
+        return map_road_option_to_command(road_option)
+
+    def _recovery_offset(self, frame_id: int) -> float:
+        if not self.config.collect_data:
+            return 0.0
+        if self._tm_fallback_mode:
+            # Keep TM autopilot untouched when navigation agent API is unavailable.
+            return 0.0
+
+        interval = max(1, self.config.recovery_interval_frames)
+        duration = max(1, self.config.recovery_duration_frames)
+        if frame_id % interval == 0:
+            self._recovery_start_frame = frame_id
+            self._recovery_direction = random.choice([-1.0, 1.0])
+
+        if self._recovery_start_frame >= 0 and frame_id < self._recovery_start_frame + duration:
+            return self._recovery_direction * self.config.recovery_steer_offset
+        return 0.0
 
     def _start_video_recording(self, world, vehicle) -> None:
         if not self.config.record_video:
@@ -325,21 +580,6 @@ class AutopilotAgent(BaseAgent):
     def _start_data_collection(self, world, vehicle) -> None:
         if not self.config.collect_data:
             return
-        # Spawn a dedicated camera for data collection if video camera is not active
-        if self._video_camera is None:
-            bp_lib = world.get_blueprint_library()
-            camera_bp = bp_lib.find("sensor.camera.rgb")
-            camera_bp.set_attribute("image_size_x", str(self.config.camera_width))
-            camera_bp.set_attribute("image_size_y", str(self.config.camera_height))
-            camera_bp.set_attribute("fov", str(self.config.camera_fov))
-            if camera_bp.has_attribute("sensor_tick") and self.config.sync:
-                camera_bp.set_attribute("sensor_tick", str(self.config.fixed_delta))
-            camera_transform = carla.Transform(
-                carla.Location(x=1.5, z=2.2), carla.Rotation(pitch=-8.0)
-            )
-            self._data_camera = world.spawn_actor(camera_bp, camera_transform, attach_to=vehicle)
-            self._data_camera.listen(self._on_video_frame)
-            logging.info("Attached data-collection camera to ego vehicle.")
 
         self._collector = DataCollector(
             output_dir=self.config.collect_data_dir,
@@ -347,7 +587,26 @@ class AutopilotAgent(BaseAgent):
             save_every_n=self.config.save_every_n,
         )
         self._collector.start()
-        logging.info("Autopilot data collector started.")
+
+        bp_lib = world.get_blueprint_library()
+        camera_bp = bp_lib.find("sensor.camera.rgb")
+        camera_bp.set_attribute("image_size_x", str(self.config.camera_width))
+        camera_bp.set_attribute("image_size_y", str(self.config.camera_height))
+        camera_bp.set_attribute("fov", str(self.config.camera_fov))
+        if camera_bp.has_attribute("sensor_tick"):
+            camera_bp.set_attribute("sensor_tick", str(self.config.fixed_delta))
+
+        camera_setups = [
+            ("center", carla.Transform(carla.Location(x=1.5, y=0.0, z=2.2), carla.Rotation(pitch=-8.0))),
+            ("left", carla.Transform(carla.Location(x=1.5, y=-0.35, z=2.2), carla.Rotation(yaw=-25.0, pitch=-8.0))),
+            ("right", carla.Transform(carla.Location(x=1.5, y=0.35, z=2.2), carla.Rotation(yaw=25.0, pitch=-8.0))),
+        ]
+        for side, transform in camera_setups:
+            sensor = world.spawn_actor(camera_bp, transform, attach_to=vehicle)
+            sensor.listen(self._collector.make_sensor_callback(side))
+            self._data_cameras.append(sensor)
+
+        logging.info("Autopilot data collector started with synchronized center/left/right cameras.")
 
     def _on_video_frame(self, image) -> None:
         if np is None or cv2 is None:
@@ -366,6 +625,8 @@ class AutopilotAgent(BaseAgent):
 
     def run_step(self, step_idx: int) -> None:
         frame = self._read_latest_video_frame()
+        vehicle = self.session.ego_vehicle if self.session is not None else None
+        world = self.session.world if self.session is not None else None
         if frame is not None:
             if self._video_writer is not None:
                 bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -373,22 +634,50 @@ class AutopilotAgent(BaseAgent):
                 self._video_frames_written += 1
                 if self._video_frames_written >= self._video_max_frames:
                     self._stop_requested = True
-            if self._collector is not None:
-                vehicle = self.session.ego_vehicle
-                velocity = vehicle.get_velocity()
-                speed_kmh = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2) * 3.6
-                control = vehicle.get_control()
-                self._collector.add(
-                    tick=step_idx,
-                    rgb_frame=frame,
-                    steer=control.steer,
-                    throttle=control.throttle,
-                    brake=control.brake,
-                    speed_kmh=speed_kmh,
-                )
         elif (self._video_writer is not None or self._collector is not None) and not self._waiting_frame_logged:
             logging.info("Autopilot waiting for first camera frame...")
             self._waiting_frame_logged = True
+
+        if vehicle is not None and self._nav_agent is not None:
+            try:
+                if self._nav_agent.done():
+                    self._set_new_destination(vehicle)
+            except Exception:
+                pass
+
+            nav_control = self._nav_agent.run_step()
+            frame_id_for_control = step_idx
+            if world is not None:
+                frame_id_for_control = int(world.get_snapshot().frame)
+            recovery_delta = self._recovery_offset(frame_id_for_control)
+            nav_control.steer = float(clamp(nav_control.steer + recovery_delta, -1.0, 1.0))
+            vehicle.apply_control(nav_control)
+        elif vehicle is not None and self._tm_fallback_mode:
+            frame_id_for_control = step_idx
+            if world is not None:
+                frame_id_for_control = int(world.get_snapshot().frame)
+            recovery_delta = self._recovery_offset(frame_id_for_control)
+            if abs(recovery_delta) > 1e-6:
+                control = vehicle.get_control()
+                control.steer = float(clamp(control.steer + recovery_delta, -1.0, 1.0))
+                vehicle.apply_control(control)
+
+        if self._collector is not None and vehicle is not None:
+            velocity = vehicle.get_velocity()
+            speed_kmh = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2) * 3.6
+            control = vehicle.get_control()
+            frame_id = step_idx
+            if world is not None:
+                frame_id = int(world.get_snapshot().frame)
+            command = self._extract_current_command()
+            self._collector.add_vehicle_state(
+                frame_id=frame_id,
+                steer=control.steer,
+                throttle=control.throttle,
+                brake=control.brake,
+                speed_kmh=speed_kmh,
+                command=command,
+            )
 
         if step_idx % 20 == 0:
             logging.info("Autopilot tick %d", step_idx)
@@ -399,17 +688,22 @@ class AutopilotAgent(BaseAgent):
         vehicle = self.session.ego_vehicle
         if vehicle is None:
             return
-        try:
-            vehicle.set_autopilot(False, self.config.tm_port)
-        except TypeError:
-            vehicle.set_autopilot(False)
+        if self._tm_fallback_mode:
+            try:
+                vehicle.set_autopilot(False, self.config.tm_port)
+            except TypeError:
+                vehicle.set_autopilot(False)
+        self._nav_agent = None
         if self._collector is not None:
             self._collector.close()
             self._collector = None
-        if self._data_camera is not None:
-            self._data_camera.stop()
-            self._data_camera.destroy()
-            self._data_camera = None
+        for sensor in self._data_cameras:
+            try:
+                sensor.stop()
+                sensor.destroy()
+            except RuntimeError:
+                pass
+        self._data_cameras = []
         if self._video_camera is not None:
             self._video_camera.stop()
             self._video_camera.destroy()
@@ -441,6 +735,7 @@ class LaneFollowAgent(BaseAgent):
         self._last_steer = 0.0
         self._waiting_frame_logged = False
         self._collector: Optional[DataCollector] = None
+        self._data_cameras = []
         self._video_writer = None
         self._video_output: Optional[Path] = None
         self._video_frames_written = 0
@@ -464,10 +759,35 @@ class LaneFollowAgent(BaseAgent):
             save_every_n=self.config.save_every_n,
         )
         self._collector.start()
+        self._start_data_collection_cameras(session.world, vehicle)
         self._init_video_writer()
 
         self._enabled = True
         logging.info("Lane-follow agent is ready.")
+
+    def _start_data_collection_cameras(self, world, vehicle) -> None:
+        if not self.config.collect_data or self._collector is None:
+            return
+
+        bp_lib = world.get_blueprint_library()
+        camera_bp = bp_lib.find("sensor.camera.rgb")
+        camera_bp.set_attribute("image_size_x", str(self.config.camera_width))
+        camera_bp.set_attribute("image_size_y", str(self.config.camera_height))
+        camera_bp.set_attribute("fov", str(self.config.camera_fov))
+        if camera_bp.has_attribute("sensor_tick"):
+            camera_bp.set_attribute("sensor_tick", str(self.config.fixed_delta))
+
+        camera_setups = [
+            ("center", carla.Transform(carla.Location(x=1.5, y=0.0, z=2.2), carla.Rotation(pitch=-8.0))),
+            ("left", carla.Transform(carla.Location(x=1.5, y=-0.35, z=2.2), carla.Rotation(yaw=-25.0, pitch=-8.0))),
+            ("right", carla.Transform(carla.Location(x=1.5, y=0.35, z=2.2), carla.Rotation(yaw=25.0, pitch=-8.0))),
+        ]
+        for side, transform in camera_setups:
+            sensor = world.spawn_actor(camera_bp, transform, attach_to=vehicle)
+            sensor.listen(self._collector.make_sensor_callback(side))
+            self._data_cameras.append(sensor)
+
+        logging.info("Lane-follow data collection cameras are attached (center/left/right).")
 
     def _init_video_writer(self) -> None:
         if not self.config.record_video:
@@ -659,13 +979,16 @@ class LaneFollowAgent(BaseAgent):
         self.session.ego_vehicle.apply_control(control)
 
         if self._collector is not None:
-            self._collector.add(
-                tick=step_idx,
-                rgb_frame=frame,
+            frame_id = step_idx
+            if self.session.world is not None:
+                frame_id = int(self.session.world.get_snapshot().frame)
+            self._collector.add_vehicle_state(
+                frame_id=frame_id,
                 steer=control.steer,
                 throttle=control.throttle,
                 brake=control.brake,
                 speed_kmh=speed_kmh,
+                command=0,
             )
 
         if step_idx % 20 == 0:
@@ -695,6 +1018,13 @@ class LaneFollowAgent(BaseAgent):
             self._camera.destroy()
             self._camera = None
             logging.info("Destroyed lane-follow camera.")
+        for sensor in self._data_cameras:
+            try:
+                sensor.stop()
+                sensor.destroy()
+            except RuntimeError:
+                pass
+        self._data_cameras = []
 
     def should_stop(self) -> bool:
         return self._stop_requested
@@ -849,11 +1179,41 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--collect-data", action="store_true")
     parser.add_argument("--collect-data-dir", default="data/collected")
+    parser.add_argument("--image-prefix", default="", help="Image filename prefix (e.g. town01_beochan)")
     parser.add_argument(
         "--save-every-n",
         type=int,
         default=50,
         help="Only save a frame every N ticks (default: 50 for diverse scenes).",
+    )
+    parser.add_argument(
+        "--nav-agent-type",
+        choices=["basic", "behavior"],
+        default="basic",
+        help="Navigation agent used by autopilot mode for route command extraction.",
+    )
+    parser.add_argument(
+        "--no-random-weather",
+        action="store_true",
+        help="Disable random weather preset selection at start.",
+    )
+    parser.add_argument(
+        "--recovery-interval-frames",
+        type=int,
+        default=100,
+        help="Apply recovery steering disturbance every N frames.",
+    )
+    parser.add_argument(
+        "--recovery-duration-frames",
+        type=int,
+        default=10,
+        help="Number of frames to keep disturbance active.",
+    )
+    parser.add_argument(
+        "--recovery-steer-offset",
+        type=float,
+        default=0.3,
+        help="Steering offset added during disturbance window.",
     )
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--video-output-path", default="outputs/town_drive_10m.mp4")
@@ -881,6 +1241,12 @@ def build_config(args: argparse.Namespace) -> RunConfig:
 
     sync = bool(_cfg_get(env_cfg, "carla", "sync", args.sync))
     fixed_delta = float(_cfg_get(env_cfg, "carla", "fixed_delta", args.fixed_delta))
+    if args.collect_data and not sync:
+        logging.warning("Data collection requires synchronous mode. Forcing sync=True.")
+        sync = True
+    if args.collect_data and fixed_delta <= 0.0:
+        fixed_delta = 0.05
+        logging.warning("Invalid fixed_delta for data collection. Using fixed_delta=0.05.")
     video_enabled = args.record_video or bool(
         _cfg_get(env_cfg, "recording", "enabled", False)
     )
@@ -905,26 +1271,10 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         else str(_cfg_get(env_cfg, "recording", "codec", args.video_codec))
     )
 
-    npc_vehicle_count = (
-        args.npc_vehicle_count
-        if args.npc_vehicle_count != 30
-        else int(_cfg_get(env_cfg, "traffic_spawn", "vehicle_count", args.npc_vehicle_count))
-    )
-    npc_bike_count = (
-        args.npc_bike_count
-        if args.npc_bike_count != 10
-        else int(_cfg_get(env_cfg, "traffic_spawn", "bike_count", args.npc_bike_count))
-    )
-    npc_motorbike_count = (
-        args.npc_motorbike_count
-        if args.npc_motorbike_count != 10
-        else int(_cfg_get(env_cfg, "traffic_spawn", "motorbike_count", args.npc_motorbike_count))
-    )
-    npc_pedestrian_count = (
-        args.npc_pedestrian_count
-        if args.npc_pedestrian_count != 50
-        else int(_cfg_get(env_cfg, "traffic_spawn", "pedestrian_count", args.npc_pedestrian_count))
-    )
+    npc_vehicle_count = args.npc_vehicle_count
+    npc_bike_count = args.npc_bike_count
+    npc_motorbike_count = args.npc_motorbike_count
+    npc_pedestrian_count = args.npc_pedestrian_count
     npc_enable_autopilot = bool(
         _cfg_get(env_cfg, "traffic_spawn", "npc_enable_autopilot", not args.disable_npc_autopilot)
     ) and not args.disable_npc_autopilot
@@ -976,6 +1326,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         collect_data=args.collect_data,
         collect_data_dir=args.collect_data_dir,
         save_every_n=args.save_every_n,
+        image_prefix=args.image_prefix,
         npc_vehicle_count=npc_vehicle_count,
         npc_bike_count=npc_bike_count,
         npc_motorbike_count=npc_motorbike_count,
@@ -986,6 +1337,11 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         video_fps=video_fps,
         video_duration_sec=video_duration_sec,
         video_codec=video_codec,
+        random_weather=not args.no_random_weather,
+        recovery_interval_frames=max(1, args.recovery_interval_frames),
+        recovery_duration_frames=max(1, args.recovery_duration_frames),
+        recovery_steer_offset=abs(args.recovery_steer_offset),
+        nav_agent_type=args.nav_agent_type,
     )
 
 
@@ -1017,6 +1373,9 @@ def main() -> int:
 
     try:
         session.start()
+        if not config.dry_run and config.random_weather and session.world is not None:
+            preset = apply_random_weather(session.world)
+            logging.info("Applied random weather preset: %s", preset)
         agent.setup(session)
         step = 0
         while tick_limit <= 0 or step < tick_limit:
