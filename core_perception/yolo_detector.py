@@ -2,13 +2,12 @@ import torch
 import numpy as np
 import cv2
 from ultralytics import YOLO
+import math
 import os
 
 class YoloDetector:
     def __init__(self, model_path, conf_threshold=0.5):
         self.conf_threshold = conf_threshold
-
-        # XÓA BỎ đoạn tự tìm current_dir đi vì run_agents.py đã làm giúp rồi
         
         # 1. Kiểm tra sự tồn tại của file model TRƯỚC TIÊN
         if not os.path.exists(model_path):
@@ -17,24 +16,65 @@ class YoloDetector:
         # 2. Thiết lập thiết bị chạy (Ưu tiên GPU CUDA cho RTX 3050)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # 3. Load model YOLO
+        # 3. Load model YOLO 1 lần duy nhất
         print(f"[YOLO DETECTOR] Đang load model từ {model_path} lên thiết bị {self.device}...")
         self.model = YOLO(model_path).to(self.device)
-        
-        # 4. Lấy tên các class từ model để tiện lọc
         self.class_names = self.model.names
-        print(f"[YOLO DETECTOR] Model đã load xong. Số lượng class nhận diện được: {len(self.class_names)}")
-        # print(f"[YOLO DETECTOR] Chi tiết các class: {self.class_names}") # Có thể uncomment để xem chi tiết
 
-        # Định nghĩa các class cần phanh gấp
-        self.target_classes = ['pedestrian', 'vehicle', 'bike', 'motobike'] 
+        # Định nghĩa các class cần phanh gấp (BỎ traffic_light và traffic_sign)
+        self.target_classes = ['pedestrian', 'vehicle', 'two_wheeler', 'traffic_light', 'traffic_sign'] 
         print(f"[YOLO DETECTOR] Chỉ lọc các đối tượng nguy hiểm thuộc nhóm: {self.target_classes}")
 
-    
-    def detect_and_evaluate(self, raw_image, area_threshold=0.01):
+        # TỪ ĐIỂN THAM SỐ VẬT THỂ (MÁY CHUẨN)
+        # Bao gồm: Chiều cao thực tế (real_h), Chiều rộng thực tế (real_w) 
+        # và ngưỡng để chuyển đổi phương pháp (ratio_threshold)
+        self.reference_objects = {
+            'pedestrian': {'real_h': 1.6, 'real_w': 0.45}, # Người
+            'vehicle': {'real_h': 1.5, 'real_w': 1.8},    # Xe con (rộng)
+            'two_wheeler': {'real_h': 1.1, 'real_w': 0.6},        
+        }
+
+    def estimate_distance_optimized(self, class_name, box, height, width):
         """
-        Hàm chính: Nhận ảnh từ CARLA, nhận diện đối tượng, 
-        và tính toán diện tích để trả về cờ phanh khẩn cấp.
+        Hàm ước lượng khoảng cách tối ưu sử dụng cả chiều cao và chiều dài.
+        """
+        x1, y1, x2, y2 = box
+        box_width = x2 - x1
+        box_height = y2 - y1
+
+        # Tránh lỗi chia cho 0
+        if box_height == 0 or box_width == 0: return float('inf')
+
+        # Lấy thông số tham số vật thể
+        obj_params = self.reference_objects.get(class_name, {'real_h': 1.5, 'real_w': 1.8})
+        real_h = obj_params['real_h']
+        real_w = obj_params['real_w']
+        
+        # TÍNH FOCAL LENGTH CHUẨN (Dùng width)
+        # Giả định FOV ngang là 90 độ (Bạn nên thay bằng FOV thực tế từ carla_manager.py nếu có thể)
+        fov_deg = 90.0 
+        fov_rad = math.radians(fov_deg)
+        focal_length = (width / 2) / math.tan(fov_rad / 2)
+
+        # CÁCH 1: Tính theo Chiều cao (Chuẩn lý thuyết)
+        d_height = (real_h * focal_length) / box_height
+        
+        # CÁCH 2: Tính theo Chiều dài (Ổn định khi ở gần)
+        d_width = (real_w * focal_length) / box_width
+
+        # HỢP NHẤT: Lấy khoảng cách ngắn nhất để an toàn tối đa
+        final_distance = min(d_height, d_width)
+
+        # Debug nhỏ để xem kết quả:
+        # if final_distance < 10:
+        #     print(f"[{class_name}] H:{d_height:.1f}m | W:{d_width:.1f}m -> {final_distance:.1f}m")
+
+        return final_distance
+
+    
+    def detect_and_evaluate(self, raw_image, distance_threshold=5.0):
+        """
+        Hàm chính: Nhận diện và ước lượng khoảng cách.
         """
         # --- BƯỚC 1: Xử lý hình ảnh ---
         if raw_image.shape[2] == 4: # Nếu là BGRA (CARLA default)
@@ -42,9 +82,7 @@ class YoloDetector:
         else: # Nếu đã là 3 kênh
             img = raw_image.copy()
 
-        # Lấy kích thước ảnh camera
         height, width, _ = img.shape
-        img_area = height * width
 
         # --- BƯỚC 2: Chạy Inference YOLO ---
         results = self.model(img, conf=self.conf_threshold, verbose=False)
@@ -72,30 +110,24 @@ class YoloDetector:
 
                 # Lấy tọa độ bounding box
                 xyxy = box.xyxy[0].cpu().numpy()
-                x1, y1, x2, y2 = map(int, xyxy)
-
-                # >> ĐÃ SỬA LỖI TÍNH TOÁN DIỆN TÍCH <<
-                box_width = x2 - x1
-                box_height = y2 - y1
-                box_area = box_width * box_height
                 
-                # Tính tỷ lệ diện tích
-                area_ratio = box_area / img_area if img_area > 0 else 0
+                # >> CẢI TIẾN: SỬ DỤNG HÀM TÍNH TOÁN KHOẢNG CÁCH TỐI ƯU MỚI <<
+                distance = self.estimate_distance_optimized(class_name, xyxy, height, width)
 
                 # Thu thập thông tin vật thể
+                x1, y1, x2, y2 = map(int, xyxy)
                 det_info = {
                     'box': (x1, y1, x2, y2),
                     'class_name': class_name,
                     'confidence': conf,
-                    'area_ratio': area_ratio
+                    'distance': distance # Đổi từ area_ratio sang distance
                 }
                 processed_detections.append(det_info)
 
-                # Ra quyết định phanh
-                if area_ratio > area_threshold:
+                # Ra quyết định phanh dựa trên khoảng cách
+                if distance < distance_threshold:
                     emergency_flag = True
-                    print(f"[CRITICAL WARNING] {class_name} quá gần! Tỷ lệ diện tích: {area_ratio:.2f}")
-                    # Nên giữ break ở đây để tối ưu hiệu năng, vì chỉ cần 1 vật quá gần là đủ để đạp phanh rồi
+                    # Bạn nên giữ break ở đây để tối ưu hiệu năng
                     break 
 
         return processed_detections, emergency_flag

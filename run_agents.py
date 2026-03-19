@@ -1245,7 +1245,7 @@ class YoloDetectAgent(BaseAgent):
             return
 
         # 1. Gọi hàm YOLO mới để nhận diện và đánh giá khoảng cách
-        detections, is_emergency = self._detector.detect_and_evaluate(frame, area_threshold=0.01)
+        detections, is_emergency = self._detector.detect_and_evaluate(frame, distance_threshold=5.0) 
 
         # 2. LOGIC PHANH GẤP (Ghi đè Autopilot)
         if is_emergency and self.session is not None and self.session.ego_vehicle is not None:
