@@ -31,7 +31,7 @@ class YoloDetector:
         print(f"[YOLO DETECTOR] Chỉ lọc các đối tượng nguy hiểm thuộc nhóm: {self.target_classes}")
 
     
-    def detect_and_evaluate(self, raw_image, area_threshold=0.3):
+    def detect_and_evaluate(self, raw_image, area_threshold=0.01):
         """
         Hàm chính: Nhận ảnh từ CARLA, nhận diện đối tượng, 
         và tính toán diện tích để trả về cờ phanh khẩn cấp.

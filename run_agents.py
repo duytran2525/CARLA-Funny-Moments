@@ -197,6 +197,32 @@ def apply_random_weather(world) -> str:
     return preset_name
 
 
+def apply_weather_preset(world, preset: str) -> None:
+    """Apply a specific weather preset to the world."""
+    if carla is None:
+        return
+    preset_lower = preset.lower().replace(" ", "").replace("_", "")
+    presets = {
+        "clearnoon": carla.WeatherParameters.ClearNoon,
+        "cloudynoon": carla.WeatherParameters.CloudyNoon,
+        "wetnoon": carla.WeatherParameters.WetNoon,
+        "wetcloudynoon": carla.WeatherParameters.WetCloudyNoon,
+        "softrainnoon": carla.WeatherParameters.SoftRainNoon,
+        "midrainnoon": carla.WeatherParameters.MidRainyNoon,
+        "hardrainnoon": carla.WeatherParameters.HardRainNoon,
+        "clearsunset": carla.WeatherParameters.ClearSunset,
+        "cloudysunset": carla.WeatherParameters.CloudySunset,
+        "wetsunset": carla.WeatherParameters.WetSunset,
+        "wetcloudysunset": carla.WeatherParameters.WetCloudySunset,
+        "softrainsunset": carla.WeatherParameters.SoftRainSunset,
+        "midrainsunset": carla.WeatherParameters.MidRainSunset,
+        "hardrainsunset": carla.WeatherParameters.HardRainSunset,
+    }
+    weather = presets.get(preset_lower, carla.WeatherParameters.ClearNoon)
+    world.set_weather(weather)
+    logging.info("Applied weather preset: %s", preset)
+
+
 def resolve_model_path(model_path: str) -> Path:
     project_root = Path(__file__).resolve().parent
     if model_path.lower() != "auto":
@@ -286,6 +312,7 @@ class RunConfig:
     video_duration_sec: int
     video_codec: str
     random_weather: bool
+    weather_preset: str  # Weather preset from config (e.g., ClearNoon)
     recovery_interval_frames: int
     recovery_duration_frames: int
     recovery_steer_offset: float
@@ -755,6 +782,10 @@ class LaneFollowAgent(BaseAgent):
         self._video_frames_written = 0
         self._video_max_frames = 0
         self._stop_requested = False
+        # YOLO integration
+        self._yolo_detector = None
+        self._yolo_window_name = "Lane Follow + YOLO Detection"
+        self._yolo_enabled = False
 
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
@@ -775,6 +806,9 @@ class LaneFollowAgent(BaseAgent):
         self._collector.start()
         self._start_data_collection_cameras(session.world, vehicle)
         self._init_video_writer()
+
+        # Load YOLO detector if model path is provided
+        self._load_yolo_detector()
 
         self._enabled = True
         logging.info("Lane-follow agent is ready.")
@@ -834,6 +868,25 @@ class LaneFollowAgent(BaseAgent):
             self.config.video_duration_sec,
             self._video_max_frames,
         )
+
+    def _load_yolo_detector(self) -> None:
+        """Load YOLO detector if yolo_model_path is provided."""
+        if not self.config.yolo_model_path:
+            logging.info("No YOLO model path provided, YOLO detection disabled.")
+            return
+
+        if YoloDetector is None:
+            logging.warning("YoloDetector not available. Install ultralytics to enable YOLO detection.")
+            return
+
+        model_path = resolve_yolo_model_path(self.config.yolo_model_path)
+        if not model_path.exists():
+            logging.warning("YOLO model file not found: %s. YOLO detection disabled.", model_path)
+            return
+
+        self._yolo_detector = YoloDetector(str(model_path))
+        self._yolo_enabled = True
+        logging.info("YOLO detection integrated with lane_follow. Model: %s", model_path)
 
     def _load_model(self):
         if torch is None:
@@ -960,6 +1013,49 @@ class LaneFollowAgent(BaseAgent):
             brake = clamp((-error) / 20.0, 0.0, self.config.max_brake)
         return throttle, brake
 
+    def _run_yolo_detection(self, frame, step_idx: int) -> bool:
+        """Run YOLO detection on frame, display results, and return emergency flag."""
+        # Convert RGB to BGR for YOLO (it expects BGR)
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        detections, is_emergency = self._yolo_detector.detect_and_evaluate(frame_bgr, area_threshold=0.3)
+
+        # Draw bounding boxes on frame
+        annotated_frame = frame_bgr.copy()
+        for det in detections:
+            x1, y1, x2, y2 = det['box']
+            class_name = det['class_name']
+            conf = det['confidence']
+            area_ratio = det['area_ratio']
+
+            # Color based on danger level
+            if area_ratio > 0.3:
+                color = (0, 0, 255)  # Red - danger
+            elif area_ratio > 0.15:
+                color = (0, 165, 255)  # Orange - warning
+            else:
+                color = (0, 255, 0)  # Green - safe
+
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+            label = f"{class_name} {conf:.2f} ({area_ratio:.1%})"
+            cv2.putText(annotated_frame, label, (x1, y1 - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        # Add status overlay
+        status_text = "EMERGENCY BRAKE!" if is_emergency else "Normal"
+        status_color = (0, 0, 255) if is_emergency else (0, 255, 0)
+        cv2.putText(annotated_frame, status_text, (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+
+        # Display in window
+        cv2.imshow(self._yolo_window_name, annotated_frame)
+        cv2.waitKey(1)
+
+        if step_idx % 20 == 0 and detections:
+            logging.info("YOLO detections: %d objects | Emergency: %s", len(detections), is_emergency)
+
+        return is_emergency
+
     def run_step(self, step_idx: int) -> None:
         if not self._enabled:
             if step_idx % 50 == 0:
@@ -973,6 +1069,11 @@ class LaneFollowAgent(BaseAgent):
                 self._waiting_frame_logged = True
             return
 
+        # Run YOLO detection and display if enabled
+        is_emergency = False
+        if self._yolo_enabled and self._yolo_detector is not None:
+            is_emergency = self._run_yolo_detection(frame, step_idx)
+
         self._write_video_frame(frame)
         if self._stop_requested:
             logging.info("Video duration target reached, stopping agent loop.")
@@ -985,6 +1086,11 @@ class LaneFollowAgent(BaseAgent):
 
         speed_kmh = self._current_speed_kmh()
         throttle, brake = self._longitudinal_control(speed_kmh)
+
+        # Apply emergency braking if YOLO detects danger
+        if is_emergency:
+            throttle = 0.0
+            brake = self.config.max_brake
 
         control = carla.VehicleControl(
             throttle=float(throttle),
@@ -1042,6 +1148,11 @@ class LaneFollowAgent(BaseAgent):
             except RuntimeError:
                 pass
         self._data_cameras = []
+        # Clean up YOLO window
+        if self._yolo_enabled:
+            cv2.destroyWindow(self._yolo_window_name)
+            self._yolo_enabled = False
+            logging.info("Closed YOLO detection window.")
 
     def should_stop(self) -> bool:
         return self._stop_requested
@@ -1134,7 +1245,7 @@ class YoloDetectAgent(BaseAgent):
             return
 
         # 1. Gọi hàm YOLO mới để nhận diện và đánh giá khoảng cách
-        detections, is_emergency = self._detector.detect_and_evaluate(frame, area_threshold=0.3)
+        detections, is_emergency = self._detector.detect_and_evaluate(frame, area_threshold=0.01)
 
         # 2. LOGIC PHANH GẤP (Ghi đè Autopilot)
         if is_emergency and self.session is not None and self.session.ego_vehicle is not None:
@@ -1437,10 +1548,10 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         else str(_cfg_get(env_cfg, "recording", "codec", args.video_codec))
     )
 
-    npc_vehicle_count = args.npc_vehicle_count
-    npc_bike_count = args.npc_bike_count
-    npc_motorbike_count = args.npc_motorbike_count
-    npc_pedestrian_count = args.npc_pedestrian_count
+    npc_vehicle_count = int(_cfg_get(env_cfg, "traffic_spawn", "vehicle_count", args.npc_vehicle_count))
+    npc_bike_count = int(_cfg_get(env_cfg, "traffic_spawn", "bike_count", args.npc_bike_count))
+    npc_motorbike_count = int(_cfg_get(env_cfg, "traffic_spawn", "motorbike_count", args.npc_motorbike_count))
+    npc_pedestrian_count = int(_cfg_get(env_cfg, "traffic_spawn", "pedestrian_count", args.npc_pedestrian_count))
     npc_enable_autopilot = bool(
         _cfg_get(env_cfg, "traffic_spawn", "npc_enable_autopilot", not args.disable_npc_autopilot)
     ) and not args.disable_npc_autopilot
@@ -1505,6 +1616,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         video_duration_sec=video_duration_sec,
         video_codec=video_codec,
         random_weather=not args.no_random_weather,
+        weather_preset=str(_cfg_get(env_cfg, "weather", "preset", "ClearNoon")),
         recovery_interval_frames=max(1, args.recovery_interval_frames),
         recovery_duration_frames=max(1, args.recovery_duration_frames),
         recovery_steer_offset=abs(args.recovery_steer_offset),
@@ -1540,9 +1652,12 @@ def main() -> int:
 
     try:
         session.start()
-        if not config.dry_run and config.random_weather and session.world is not None:
-            preset = apply_random_weather(session.world)
-            logging.info("Applied random weather preset: %s", preset)
+        if not config.dry_run and session.world is not None:
+            if config.random_weather:
+                preset = apply_random_weather(session.world)
+                logging.info("Applied random weather preset: %s", preset)
+            else:
+                apply_weather_preset(session.world, config.weather_preset)
         agent.setup(session)
         step = 0
         while tick_limit <= 0 or step < tick_limit:

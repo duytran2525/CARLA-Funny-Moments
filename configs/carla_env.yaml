@@ -7,7 +7,7 @@
   fixed_delta: 0.05
   no_rendering: false
 
-  map: "Town03"
+  map: "Town10HD"
 
 
 vehicle:
@@ -27,6 +27,9 @@ camera:
   height: 1080
   fov: 90.0
 
+weather:
+  preset: "ClearNoon"
+
 traffic_spawn:
   vehicle_count: 0
   bike_count: 0
@@ -35,8 +38,8 @@ traffic_spawn:
   npc_enable_autopilot: true
 
 recording:
-  enabled: false
-  output_path: "outputs/town03_junctions_5min.mp4"
+  enabled: true
+  output_path: "outputs/town10_background_1min.mp4"
   fps: 30.0
-  duration_sec: 300
+  duration_sec: 120
   codec: "mp4v"
