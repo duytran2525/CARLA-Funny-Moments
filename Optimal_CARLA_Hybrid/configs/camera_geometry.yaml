@@ -17,4 +17,4 @@ camera:
 
   # Độ phân giải (phải khớp với carla_env.yaml → camera width/height)
   width: 1920
-  image_height: 1080
+  height: 1080
