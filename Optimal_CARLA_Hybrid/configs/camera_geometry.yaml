@@ -1,0 +1,20 @@
+# camera_geometry.yaml
+# Thông số hình học camera gắn trên xe ego trong CARLA.
+# Được đọc bởi core_perception/spatial_math.py (SpatialMath) và run_hybrid_agent.py.
+# Không cần ma trận warp – chỉ cần 3 thông số này để tính Pinhole Camera Math.
+
+camera:
+  # Góc nhìn ngang (Horizontal Field of View) – độ
+  fov: 90.0
+
+  # Chiều cao điểm gắn camera so với mặt đường (mét)
+  # Khớp với carla_env.yaml: camera_transform z=2.2
+  height: 2.2
+
+  # Góc nghiêng camera nhìn xuống so với đường nằm ngang (độ, dương = nhìn xuống)
+  # CARLA đặt pitch=-8.0 trong camera blueprint → cam_pitch_deg=8.0
+  pitch: 8.0
+
+  # Độ phân giải (phải khớp với carla_env.yaml → camera width/height)
+  width: 1920
+  image_height: 1080

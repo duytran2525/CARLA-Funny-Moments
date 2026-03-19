@@ -1,0 +1,42 @@
+﻿carla:
+  host: "127.0.0.1"
+  port: 2000
+  tm_port: 8000
+  timeout: 60.0
+  sync: true
+  fixed_delta: 0.05
+  no_rendering: false
+
+  map: "Town03"
+
+
+vehicle:
+  filter: "vehicle.tesla.model3"
+  spawn_point: -1
+  role_name: "hero"
+
+spectator:
+  lock_on_spawn: true
+  keep_reapply_each_tick: false
+  follow_distance: 9.0
+  height: 4.5
+  pitch: -18.0
+
+camera:
+  width: 1920
+  height: 1080
+  fov: 90.0
+
+traffic_spawn:
+  vehicle_count: 0
+  bike_count: 0
+  motorbike_count: 0
+  pedestrian_count: 0
+  npc_enable_autopilot: true
+
+recording:
+  enabled: false
+  output_path: "outputs/town03_drive_10m.mp4"
+  fps: 20.0
+  duration_sec: 600
+  codec: "mp4v"

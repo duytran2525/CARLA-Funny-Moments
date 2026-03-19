@@ -1,0 +1,23 @@
+# adas_config.yaml
+# Các ngưỡng an toàn cho module ADAS Phase 2.
+# Được đọc bởi core_control/adas_logic.py (ADASModule) và run_hybrid_agent.py.
+
+adas:
+  # Time-To-Collision (giây) kích hoạt phanh KHẨN CẤP (emergency brake)
+  min_ttc: 2.0
+
+  # TTC (giây) trên ngưỡng này → xe hoạt động bình thường (no intervention)
+  safe_ttc: 5.0
+
+  # Khoảng cách tối thiểu ACC giữ với xe trước (mét)
+  # Dưới khoảng cách này, bắt đầu giảm tốc
+  acc_distance: 10.0
+
+  # Bề rộng làn đường để lọc vật thể trong làn (mét)
+  lane_width: 3.5
+
+  # Mức phanh tối đa (0.0 – 1.0)
+  max_brake: 0.8
+
+  # Mức ga tối đa khi ACC (0.0 – 1.0)
+  max_throttle: 0.6
