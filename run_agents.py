@@ -1014,40 +1014,37 @@ class LaneFollowAgent(BaseAgent):
         return throttle, brake
 
     def _run_yolo_detection(self, frame, step_idx: int) -> bool:
-        """Run YOLO detection on frame, display results, and return emergency flag."""
-        # Convert RGB to BGR for YOLO (it expects BGR)
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-        detections, is_emergency = self._yolo_detector.detect_and_evaluate(frame_bgr, area_threshold=0.3)
+        # Đổi thành distance_threshold = 5.0 (mét)
+        detections, is_emergency = self._yolo_detector.detect_and_evaluate(frame_bgr, distance_threshold=5.0)
 
-        # Draw bounding boxes on frame
         annotated_frame = frame_bgr.copy()
         for det in detections:
             x1, y1, x2, y2 = det['box']
             class_name = det['class_name']
             conf = det['confidence']
-            area_ratio = det['area_ratio']
+            distance = det['distance'] # Lấy biến distance thay vì area_ratio
 
-            # Color based on danger level
-            if area_ratio > 0.3:
+            # Color based on danger level (theo mét)
+            if distance < 5.0:
                 color = (0, 0, 255)  # Red - danger
-            elif area_ratio > 0.15:
+            elif distance < 10.0:
                 color = (0, 165, 255)  # Orange - warning
             else:
                 color = (0, 255, 0)  # Green - safe
 
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-            label = f"{class_name} {conf:.2f} ({area_ratio:.1%})"
+            # Cập nhật label hiển thị số mét
+            label = f"{class_name} {conf:.2f} ({distance:.1f}m)"
             cv2.putText(annotated_frame, label, (x1, y1 - 10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        # Add status overlay
         status_text = "EMERGENCY BRAKE!" if is_emergency else "Normal"
         status_color = (0, 0, 255) if is_emergency else (0, 255, 0)
         cv2.putText(annotated_frame, status_text, (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
 
-        # Display in window
         cv2.imshow(self._yolo_window_name, annotated_frame)
         cv2.waitKey(1)
 

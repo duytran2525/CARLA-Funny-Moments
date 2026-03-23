@@ -22,7 +22,7 @@ class YoloDetector:
         self.class_names = self.model.names
 
         # Định nghĩa các class cần phanh gấp (BỎ traffic_light và traffic_sign)
-        self.target_classes = ['pedestrian', 'vehicle', 'two_wheeler', 'traffic_light', 'traffic_sign'] 
+        self.target_classes = ['pedestrian', 'vehicle', 'two_wheeler'] 
         print(f"[YOLO DETECTOR] Chỉ lọc các đối tượng nguy hiểm thuộc nhóm: {self.target_classes}")
 
         # TỪ ĐIỂN THAM SỐ VẬT THỂ (MÁY CHUẨN)
