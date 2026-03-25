@@ -21,9 +21,9 @@ class YoloDetector:
         self.model = YOLO(model_path).to(self.device)
         self.class_names = self.model.names
 
-        # Định nghĩa các class cần phanh gấp (BỎ traffic_light và traffic_sign)
+        self.display_classes = ['pedestrian', 'vehicle', 'two_wheeler', 'traffic_light', 'traffic_sign']
         self.target_classes = ['pedestrian', 'vehicle', 'two_wheeler'] 
-        print(f"[YOLO DETECTOR] Chỉ lọc các đối tượng nguy hiểm thuộc nhóm: {self.target_classes}")
+        print(f"[YOLO DETECTOR] Hiển thị: {self.display_classes} | Phanh gấp: {self.brake_classes}")
 
         # TỪ ĐIỂN THAM SỐ VẬT THỂ (MÁY CHUẨN)
         # Bao gồm: Chiều cao thực tế (real_h), Chiều rộng thực tế (real_w) 
@@ -99,8 +99,8 @@ class YoloDetector:
                 cls_id = int(box.cls[0]) 
                 class_name = self.class_names[cls_id] 
 
-                # Lọc class
-                if class_name not in self.target_classes:
+                # 1. Lọc class để hiển thị (cho phép tất cả 5 class đi qua)
+                if class_name not in self.display_classes:
                     continue 
 
                 # Lọc confidence
@@ -111,23 +111,21 @@ class YoloDetector:
                 # Lấy tọa độ bounding box
                 xyxy = box.xyxy[0].cpu().numpy()
                 
-                # >> CẢI TIẾN: SỬ DỤNG HÀM TÍNH TOÁN KHOẢNG CÁCH TỐI ƯU MỚI <<
+                # Tính toán khoảng cách
                 distance = self.estimate_distance_optimized(class_name, xyxy, height, width)
 
-                # Thu thập thông tin vật thể
+                # Thu thập thông tin vật thể để vẽ Bounding Box
                 x1, y1, x2, y2 = map(int, xyxy)
                 det_info = {
                     'box': (x1, y1, x2, y2),
                     'class_name': class_name,
                     'confidence': conf,
-                    'distance': distance # Đổi từ area_ratio sang distance
+                    'distance': distance
                 }
                 processed_detections.append(det_info)
 
-                # Ra quyết định phanh dựa trên khoảng cách
-                if distance < distance_threshold:
+                # 2. Logic phanh khẩn cấp: CHỈ xét những vật cản nằm trong brake_classes
+                if class_name in self.brake_classes and distance < distance_threshold:
                     emergency_flag = True
-                    # Bạn nên giữ break ở đây để tối ưu hiệu năng
-                    break 
 
         return processed_detections, emergency_flag
