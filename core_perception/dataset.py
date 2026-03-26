@@ -504,6 +504,8 @@ class CarlaDataset(Dataset):
         """
 
         image = cv2.imread(img_path)
+        if image is None:
+            raise FileNotFoundError(f"Khong doc duoc anh dataset: {img_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     
         height, width, _ = image.shape

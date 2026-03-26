@@ -56,7 +56,8 @@ except Exception:
 
 try:
     from core_perception.yolo_detector import YoloDetector
-except Exception:
+except Exception as exc:
+    logging.warning("Failed to import YoloDetector: %s", exc)
     YoloDetector = None
 
 from core_control.carla_manager import CarlaManager, SpectatorConfig

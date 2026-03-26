@@ -1,25 +1,33 @@
-from ultralytics import YOLO
+from pathlib import Path
+
 import torch
+from ultralytics import YOLO
+
 
 def train_model():
-    # Kiểm tra phần cứng: Ưu tiên dùng card rời NVIDIA
-    device = 0 if torch.cuda.is_available() else 'cpu'
-    print(f"Bắt đầu huấn luyện trên thiết bị: {'GPU (RTX 3050)' if device == 0 else 'CPU'}")
+    root_dir = Path(__file__).resolve().parent.parent
+    data_config_path = root_dir / "configs" / "data.yaml"
 
-    # Khởi tạo mô hình lõi (bạn dùng bản small 18MB)
-    model = YOLO('yolo11s.pt') 
+    if not data_config_path.exists():
+        raise FileNotFoundError(
+            f"Khong tim thay file cau hinh dataset cho YOLO: {data_config_path}"
+        )
 
-    # Bắt đầu quá trình huấn luyện
-    results = model.train(
-        data='config/data.yaml',  # Đảm bảo bạn có file này trong thư mục config
+    device = 0 if torch.cuda.is_available() else "cpu"
+    print(f"Bat dau huan luyen tren thiet bi: {'GPU' if device == 0 else 'CPU'}")
+
+    model = YOLO("yolo11s.pt")
+    model.train(
+        data=str(data_config_path),
         epochs=100,
-        batch=8,                  # RTX 3050 4GB VRAM nên để batch 8 cho an toàn
+        batch=8,
         imgsz=640,
         device=device,
-        project='models/yolo',    # Lưu thẳng kết quả vào thư mục models
-        name='retrain_results'
+        project=str(root_dir / "models" / "yolo"),
+        name="retrain_results",
     )
-    print("Huấn luyện hoàn tất!")
+    print("Huan luyen hoan tat!")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     train_model()
