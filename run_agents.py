@@ -1014,35 +1014,71 @@ class LaneFollowAgent(BaseAgent):
             brake = clamp((-error) / 20.0, 0.0, self.config.max_brake)
         return throttle, brake
 
-    def _run_yolo_detection(self, frame, step_idx: int) -> bool:
+    def _run_yolo_detection(self, frame, step_idx: int) -> tuple[bool, Dict[str, Any]]:
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-        # Đổi thành distance_threshold = 5.0 (mét)
+        # distance_threshold applies to dynamic obstacles (pedestrian/vehicle/two_wheeler).
         detections, is_emergency = self._yolo_detector.detect_and_evaluate(frame_bgr, distance_threshold=5.0)
+        debug_info = {}
+        if hasattr(self._yolo_detector, "get_last_debug_info"):
+            debug_info = self._yolo_detector.get_last_debug_info() or {}
 
         annotated_frame = frame_bgr.copy()
+        for roi_region in debug_info.get("roi_regions", []):
+            x1, y1, x2, y2 = roi_region["box"]
+            is_active = bool(roi_region.get("active", False))
+            roi_color = (255, 180, 0) if is_active else (80, 80, 80)
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), roi_color, 2)
+            roi_label = (
+                f"ROI {roi_region['label']} < {roi_region['max_distance_m']:.0f}m"
+            )
+            cv2.putText(
+                annotated_frame,
+                roi_label,
+                (x1 + 4, min(y2 - 6, y1 + 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                roi_color,
+                1,
+            )
+
         for det in detections:
             x1, y1, x2, y2 = det['box']
             class_name = det['class_name']
             conf = det['confidence']
-            distance = det['distance'] # Lấy biến distance thay vì area_ratio
+            distance = det['distance']
+            roi_zone = det.get('roi_zone')
 
-            # Color based on danger level (theo mét)
-            if distance < 5.0:
-                color = (0, 0, 255)  # Red - danger
+            if class_name == "traffic_light_red":
+                color = (0, 0, 255)
+            elif class_name == "traffic_light_green":
+                color = (0, 255, 0)
+            elif distance < 5.0:
+                color = (0, 0, 255)
             elif distance < 10.0:
-                color = (0, 165, 255)  # Orange - warning
+                color = (0, 165, 255)
             else:
-                color = (0, 255, 0)  # Green - safe
+                color = (0, 255, 0)
 
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-            # Cập nhật label hiển thị số mét
             label = f"{class_name} {conf:.2f} ({distance:.1f}m)"
+            if roi_zone is not None:
+                label = f"{label} [{roi_zone}]"
             cv2.putText(annotated_frame, label, (x1, y1 - 10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        status_text = "EMERGENCY BRAKE!" if is_emergency else "Normal"
-        status_color = (0, 0, 255) if is_emergency else (0, 255, 0)
+        if debug_info.get("red_light_active"):
+            status_text = "RED LIGHT STOP"
+            if debug_info.get("decision_reason"):
+                status_text += f" | {debug_info['decision_reason']}"
+            status_color = (0, 0, 255)
+        elif debug_info.get("obstacle_emergency"):
+            status_text = "EMERGENCY BRAKE (OBSTACLE)"
+            status_color = (0, 0, 255)
+        else:
+            status_text = "Normal"
+            status_color = (0, 255, 0)
+
         cv2.putText(annotated_frame, status_text, (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
 
@@ -1050,9 +1086,14 @@ class LaneFollowAgent(BaseAgent):
         cv2.waitKey(1)
 
         if step_idx % 20 == 0 and detections:
-            logging.info("YOLO detections: %d objects | Emergency: %s", len(detections), is_emergency)
+            logging.info(
+                "YOLO detections: %d objects | Emergency: %s | Reason: %s",
+                len(detections),
+                is_emergency,
+                debug_info.get("decision_reason", "n/a"),
+            )
 
-        return is_emergency
+        return is_emergency, debug_info
 
     def run_step(self, step_idx: int) -> None:
         if not self._enabled:
@@ -1069,8 +1110,9 @@ class LaneFollowAgent(BaseAgent):
 
         # Run YOLO detection and display if enabled
         is_emergency = False
+        yolo_debug_info: Dict[str, Any] = {}
         if self._yolo_enabled and self._yolo_detector is not None:
-            is_emergency = self._run_yolo_detection(frame, step_idx)
+            is_emergency, yolo_debug_info = self._run_yolo_detection(frame, step_idx)
 
         self._write_video_frame(frame)
         if self._stop_requested:
@@ -1088,7 +1130,8 @@ class LaneFollowAgent(BaseAgent):
         # Apply emergency braking if YOLO detects danger
         if is_emergency:
             throttle = 0.0
-            brake = self.config.max_brake
+            # Red light and obstacle use the same brake cap in lane-follow mode.
+            brake = max(brake, self.config.max_brake)
 
         control = carla.VehicleControl(
             throttle=float(throttle),
@@ -1113,13 +1156,18 @@ class LaneFollowAgent(BaseAgent):
             )
 
         if step_idx % 20 == 0:
+            emergency_reason = (
+                yolo_debug_info.get("decision_reason", "n/a") if is_emergency else "none"
+            )
             logging.info(
-                "lane_follow tick=%d speed=%.1f km/h steer=%.3f throttle=%.2f brake=%.2f",
+                "lane_follow tick=%d speed=%.1f km/h steer=%.3f throttle=%.2f brake=%.2f emergency=%s reason=%s",
                 step_idx,
                 speed_kmh,
                 control.steer,
                 control.throttle,
                 control.brake,
+                is_emergency,
+                emergency_reason,
             )
 
     def teardown(self) -> None:
@@ -1242,41 +1290,94 @@ class YoloDetectAgent(BaseAgent):
                 self._waiting_frame_logged = True
             return
 
-        # 1. Gọi hàm YOLO mới để nhận diện và đánh giá khoảng cách
-        detections, is_emergency = self._detector.detect_and_evaluate(frame, distance_threshold=5.0) 
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        detections, is_emergency = self._detector.detect_and_evaluate(
+            frame_bgr,
+            distance_threshold=5.0,
+        )
+        debug_info = {}
+        if hasattr(self._detector, "get_last_debug_info"):
+            debug_info = self._detector.get_last_debug_info() or {}
 
-        # 2. LOGIC PHANH GẤP (Ghi đè Autopilot)
+        # Emergency override on top of CARLA autopilot.
         if is_emergency and self.session is not None and self.session.ego_vehicle is not None:
-            # Tạo lệnh dừng xe kịch sàn
             control = carla.VehicleControl()
             control.throttle = 0.0
-            control.steer = 0.0  # Giữ thẳng lái
-            control.brake = 1.0  # Đạp phanh 100%
+            control.steer = 0.0
+            control.brake = 1.0
             control.hand_brake = False
-            
-            # Gửi lệnh trực tiếp xuống CARLA (lệnh này sẽ ghi đè Autopilot trong tick hiện tại)
             self.session.ego_vehicle.apply_control(control)
-            logging.warning(f"[TICK {step_idx}] 🛑 PHANH KHẨN CẤP! Phát hiện đối tượng quá gần!")
+            logging.warning(
+                "[TICK %d] EMERGENCY BRAKE! Reason: %s",
+                step_idx,
+                debug_info.get("decision_reason", "dangerous object nearby"),
+            )
 
-        # 3. Vẽ Bounding Box và hiển thị camera (Không làm mất tính năng cũ)
-        # Chuyển từ RGB sang BGR để OpenCV hiển thị đúng màu
-        annotated_frame = cv2.cvtColor(frame.copy(), cv2.COLOR_RGB2BGR)
-        
+        annotated_frame = frame_bgr.copy()
+        for roi_region in debug_info.get("roi_regions", []):
+            x1, y1, x2, y2 = roi_region["box"]
+            is_active = bool(roi_region.get("active", False))
+            roi_color = (255, 180, 0) if is_active else (80, 80, 80)
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), roi_color, 2)
+            roi_label = (
+                f"ROI {roi_region['label']} < {roi_region['max_distance_m']:.0f}m"
+            )
+            cv2.putText(
+                annotated_frame,
+                roi_label,
+                (x1 + 4, min(y2 - 6, y1 + 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                roi_color,
+                1,
+            )
+
         for det in detections:
             x1, y1, x2, y2 = det['box']
-            label = f"{det['class_name']} {det['confidence']:.2f}"
-            
-            # Đổi viền sang màu ĐỎ nếu đang phanh khẩn cấp, XANH LÁ nếu an toàn
-            color = (0, 0, 255) if is_emergency else (0, 255, 0)
-            
+            class_name = det["class_name"]
+            confidence = det["confidence"]
+            distance = det["distance"]
+            roi_zone = det.get("roi_zone")
+            label = f"{class_name} {confidence:.2f} ({distance:.1f}m)"
+            if roi_zone is not None:
+                label = f"{label} [{roi_zone}]"
+
+            if class_name == "traffic_light_red":
+                color = (0, 0, 255)
+            elif class_name == "traffic_light_green":
+                color = (0, 255, 0)
+            elif is_emergency:
+                color = (0, 0, 255)
+            else:
+                color = (0, 255, 0)
+
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(annotated_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        if debug_info.get("red_light_active"):
+            status_text = "RED LIGHT STOP"
+            if debug_info.get("decision_reason"):
+                status_text += f" | {debug_info['decision_reason']}"
+            status_color = (0, 0, 255)
+        elif debug_info.get("obstacle_emergency"):
+            status_text = "EMERGENCY BRAKE (OBSTACLE)"
+            status_color = (0, 0, 255)
+        else:
+            status_text = "Normal"
+            status_color = (0, 255, 0)
+        cv2.putText(annotated_frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
 
         cv2.imshow(self._window_name, annotated_frame)
         cv2.waitKey(1)
 
         if step_idx % 20 == 0:
-            logging.info("yolo_detect tick=%d detections=%d | Emergency: %s", step_idx, len(detections), is_emergency)
+            logging.info(
+                "yolo_detect tick=%d detections=%d | Emergency: %s | Reason: %s",
+                step_idx,
+                len(detections),
+                is_emergency,
+                debug_info.get("decision_reason", "n/a"),
+            )
 
     def teardown(self) -> None:
         if self._tm_autopilot_enabled and self.session is not None and self.session.ego_vehicle is not None:
