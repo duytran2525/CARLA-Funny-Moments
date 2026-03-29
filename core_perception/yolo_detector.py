@@ -75,6 +75,35 @@ class YoloDetector:
         self.traffic_light_zone_priority = ("urban", "rural_right")
         self.green_override_ratio = 1.05
 
+        # Active ROI lock: only one zone is allowed to control stop/go at a time.
+        self.zone_lock_acquire_frames = 2
+        self.zone_lock_release_missing_frames = 4
+        self.locked_zone: Optional[str] = None
+        self._last_locked_zone: Optional[str] = None
+        self._zone_lock_missing_counter = 0
+        self._zone_lock_acquire_counter = {
+            zone_name: 0 for zone_name in self.traffic_light_regions
+        }
+
+        # After a stable green signal in locked zone, ignore other-zone takeover briefly.
+        self.green_immunity_frames = 10
+        self._green_immunity_counter = 0
+        self._green_immunity_zone: Optional[str] = None
+
+        # Turn-phase suppression:
+        # if vehicle is actively turning and recently observed GREEN in the same locked zone,
+        # temporarily suppress RED triggers likely belonging to the cross lane after camera rotates.
+        self.turn_steer_threshold = 0.22
+        self.turn_speed_threshold_kmh = 5.0
+        self.turn_confirm_frames = 3
+        self.turn_hold_frames = 18
+        self.turn_green_grace_frames = 30
+        self._turn_confirm_counter = 0
+        self._turn_hold_counter = 0
+        self._turn_active = False
+        self._turn_green_grace_counter = 0
+        self._turn_green_grace_zone: Optional[str] = None
+
         # Trapezoid danger corridor in front of ego vehicle for obstacle emergency brake.
         self.obstacle_danger_region = {
             "top_y_ratio": 0.58,
@@ -146,30 +175,13 @@ class YoloDetector:
         zone_cfg = self.traffic_light_regions[zone_name]
         return signal["distance"] < zone_cfg["max_distance"]
 
-    def _evaluate_traffic_light_decision(self, zone_signals):
-        active_zone = None
-        for zone_name in self.traffic_light_zone_priority:
-            signals = zone_signals.get(zone_name, {})
-            if self._candidate_in_zone_range(signals.get("red"), zone_name):
-                active_zone = zone_name
-                break
-            if self._candidate_in_zone_range(signals.get("green"), zone_name):
-                active_zone = zone_name
-                break
-
-        if active_zone is None:
-            return {
-                "active_zone": None,
-                "red_trigger": False,
-                "green_release": False,
-                "reason": "",
-            }
-
-        zone_cfg = self.traffic_light_regions[active_zone]
-        red_signal = zone_signals[active_zone].get("red")
-        green_signal = zone_signals[active_zone].get("green")
-        red_in_range = self._candidate_in_zone_range(red_signal, active_zone)
-        green_in_range = self._candidate_in_zone_range(green_signal, active_zone)
+    def _evaluate_zone_signal(self, zone_signals, zone_name):
+        zone_cfg = self.traffic_light_regions[zone_name]
+        zone_data = zone_signals.get(zone_name, {})
+        red_signal = zone_data.get("red")
+        green_signal = zone_data.get("green")
+        red_in_range = self._candidate_in_zone_range(red_signal, zone_name)
+        green_in_range = self._candidate_in_zone_range(green_signal, zone_name)
 
         red_trigger = False
         green_release = False
@@ -193,10 +205,173 @@ class YoloDetector:
             reason = f"{zone_cfg['label']}: GREEN @ {green_signal['distance']:.1f}m"
 
         return {
+            "zone_name": zone_name,
+            "has_signal": red_in_range or green_in_range,
+            "red_trigger": red_trigger,
+            "green_release": green_release,
+            "reason": reason,
+        }
+
+    def _select_zone_candidate_for_lock(self, zone_evaluations):
+        for zone_name in self.traffic_light_zone_priority:
+            zone_eval = zone_evaluations.get(zone_name)
+            if not zone_eval or not zone_eval["has_signal"]:
+                continue
+
+            # During green immunity, do not allow another zone to take control.
+            if (
+                self._green_immunity_counter > 0
+                and self._green_immunity_zone is not None
+                and zone_name != self._green_immunity_zone
+            ):
+                continue
+            return zone_name
+        return None
+
+    def _update_locked_zone(self, zone_evaluations):
+        if self._green_immunity_counter > 0:
+            self._green_immunity_counter -= 1
+            if self._green_immunity_counter <= 0:
+                self._green_immunity_counter = 0
+                self._green_immunity_zone = None
+
+        # Keep current lock while its signal is still visible.
+        if self.locked_zone is not None:
+            locked_eval = zone_evaluations.get(self.locked_zone)
+            if locked_eval and locked_eval["has_signal"]:
+                self._zone_lock_missing_counter = 0
+                return self.locked_zone
+
+            self._zone_lock_missing_counter += 1
+            if self._zone_lock_missing_counter < self.zone_lock_release_missing_frames:
+                return self.locked_zone
+
+            self._last_locked_zone = self.locked_zone
+            self.locked_zone = None
+            self._zone_lock_missing_counter = 0
+            for zone_name in self._zone_lock_acquire_counter:
+                self._zone_lock_acquire_counter[zone_name] = 0
+
+        # Acquire lock when no active lock is available.
+        candidate_zone = self._select_zone_candidate_for_lock(zone_evaluations)
+        if candidate_zone is None:
+            for zone_name in self._zone_lock_acquire_counter:
+                self._zone_lock_acquire_counter[zone_name] = 0
+            return None
+
+        for zone_name in self._zone_lock_acquire_counter:
+            if zone_name == candidate_zone:
+                self._zone_lock_acquire_counter[zone_name] += 1
+            else:
+                self._zone_lock_acquire_counter[zone_name] = 0
+
+        if self._zone_lock_acquire_counter[candidate_zone] >= self.zone_lock_acquire_frames:
+            self.locked_zone = candidate_zone
+            self._last_locked_zone = candidate_zone
+            self._zone_lock_missing_counter = 0
+            return self.locked_zone
+
+        return None
+
+    def _update_turn_phase(self, vehicle_steer, speed_kmh):
+        if vehicle_steer is None:
+            strong_turn = False
+        else:
+            speed_ok = True if speed_kmh is None else float(speed_kmh) >= self.turn_speed_threshold_kmh
+            strong_turn = abs(float(vehicle_steer)) >= self.turn_steer_threshold and speed_ok
+
+        if strong_turn:
+            self._turn_confirm_counter = min(
+                self._turn_confirm_counter + 1, self.turn_confirm_frames + 10
+            )
+        else:
+            self._turn_confirm_counter = max(self._turn_confirm_counter - 1, 0)
+
+        if not self._turn_active and self._turn_confirm_counter >= self.turn_confirm_frames:
+            self._turn_active = True
+            self._turn_hold_counter = self.turn_hold_frames
+
+        if self._turn_active:
+            if strong_turn:
+                self._turn_hold_counter = self.turn_hold_frames
+            else:
+                self._turn_hold_counter -= 1
+
+            if self._turn_hold_counter <= 0:
+                self._turn_active = False
+                self._turn_hold_counter = 0
+
+        if self._turn_green_grace_counter > 0:
+            self._turn_green_grace_counter -= 1
+            if self._turn_green_grace_counter <= 0:
+                self._turn_green_grace_counter = 0
+                self._turn_green_grace_zone = None
+
+        return self._turn_active
+
+    def _evaluate_traffic_light_decision(self, zone_signals, turn_active=False):
+        zone_evaluations = {
+            zone_name: self._evaluate_zone_signal(zone_signals, zone_name)
+            for zone_name in self.traffic_light_regions
+        }
+
+        active_zone = self._update_locked_zone(zone_evaluations)
+        if active_zone is None:
+            return {
+                "active_zone": None,
+                "red_trigger": False,
+                "green_release": False,
+                "reason": "",
+                "locked_zone": None,
+                "green_immunity_counter": self._green_immunity_counter,
+                "green_immunity_zone": self._green_immunity_zone,
+                "turn_phase_active": turn_active,
+                "turn_red_suppressed": False,
+                "turn_green_grace_counter": self._turn_green_grace_counter,
+                "turn_green_grace_zone": self._turn_green_grace_zone,
+                "zone_evaluations": zone_evaluations,
+            }
+
+        zone_eval = zone_evaluations.get(active_zone, {})
+        red_trigger = bool(zone_eval.get("red_trigger", False))
+        green_release = bool(zone_eval.get("green_release", False))
+        reason = zone_eval.get("reason", "")
+        turn_red_suppressed = False
+
+        if green_release:
+            self._green_immunity_counter = self.green_immunity_frames
+            self._green_immunity_zone = active_zone
+            self._turn_green_grace_counter = self.turn_green_grace_frames
+            self._turn_green_grace_zone = active_zone
+
+        if (
+            red_trigger
+            and turn_active
+            and self._turn_green_grace_counter > 0
+            and self._turn_green_grace_zone == active_zone
+        ):
+            red_trigger = False
+            green_release = True
+            turn_red_suppressed = True
+            zone_label = self.traffic_light_regions[active_zone]["label"]
+            reason = (
+                f"{zone_label}: RED suppressed while turning "
+                f"(recent GREEN context)"
+            )
+
+        return {
             "active_zone": active_zone,
             "red_trigger": red_trigger,
             "green_release": green_release,
             "reason": reason,
+            "locked_zone": self.locked_zone,
+            "green_immunity_counter": self._green_immunity_counter,
+            "green_immunity_zone": self._green_immunity_zone,
+            "turn_phase_active": turn_active,
+            "turn_red_suppressed": turn_red_suppressed,
+            "turn_green_grace_counter": self._turn_green_grace_counter,
+            "turn_green_grace_zone": self._turn_green_grace_zone,
+            "zone_evaluations": zone_evaluations,
         }
 
     def _update_red_light_state(self, red_trigger, green_release):
@@ -305,7 +480,13 @@ class YoloDetector:
         d_width = (real_w * focal_length) / box_width
         return min(d_height, d_width)
 
-    def detect_and_evaluate(self, raw_image, distance_threshold=5.0):
+    def detect_and_evaluate(
+        self,
+        raw_image,
+        distance_threshold=5.0,
+        vehicle_steer=None,
+        speed_kmh=None,
+    ):
         if raw_image is None or raw_image.ndim != 3 or raw_image.shape[2] not in (3, 4):
             raise ValueError("raw_image phai la anh HxWx3 hoac HxWx4.")
 
@@ -402,7 +583,11 @@ class YoloDetector:
                         zone_signals[roi_zone][color_key], candidate_signal
                     )
 
-        traffic_decision = self._evaluate_traffic_light_decision(zone_signals)
+        turn_phase_active = self._update_turn_phase(vehicle_steer, speed_kmh)
+        traffic_decision = self._evaluate_traffic_light_decision(
+            zone_signals,
+            turn_active=turn_phase_active,
+        )
         red_light_active = self._update_red_light_state(
             traffic_decision["red_trigger"],
             traffic_decision["green_release"],
@@ -436,11 +621,26 @@ class YoloDetector:
                 "polygon": obstacle_danger_polygon,
             },
             "active_roi_zone": traffic_decision["active_zone"],
+            "locked_zone": traffic_decision.get("locked_zone"),
+            "last_locked_zone": self._last_locked_zone,
+            "zone_lock_acquire_counter": dict(self._zone_lock_acquire_counter),
+            "zone_lock_missing_counter": self._zone_lock_missing_counter,
+            "zone_lock_acquire_frames": self.zone_lock_acquire_frames,
+            "zone_lock_release_missing_frames": self.zone_lock_release_missing_frames,
             "obstacle_emergency": obstacle_emergency_flag,
             "obstacle_reason": obstacle_reason,
             "red_light_frame_trigger": traffic_decision["red_trigger"],
             "green_light_frame_release": traffic_decision["green_release"],
             "red_light_active": red_light_active,
+            "green_immunity_counter": traffic_decision.get("green_immunity_counter", 0),
+            "green_immunity_zone": traffic_decision.get("green_immunity_zone"),
+            "turn_phase_active": traffic_decision.get("turn_phase_active", False),
+            "turn_red_suppressed": traffic_decision.get("turn_red_suppressed", False),
+            "turn_confirm_counter": self._turn_confirm_counter,
+            "turn_hold_counter": self._turn_hold_counter,
+            "turn_green_grace_counter": traffic_decision.get("turn_green_grace_counter", 0),
+            "turn_green_grace_zone": traffic_decision.get("turn_green_grace_zone"),
+            "zone_evaluations": traffic_decision.get("zone_evaluations", {}),
             "decision_reason": decision_reason,
         }
 

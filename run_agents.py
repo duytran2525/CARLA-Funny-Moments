@@ -1014,11 +1014,22 @@ class LaneFollowAgent(BaseAgent):
             brake = clamp((-error) / 20.0, 0.0, self.config.max_brake)
         return throttle, brake
 
-    def _run_yolo_detection(self, frame, step_idx: int) -> tuple[bool, Dict[str, Any]]:
+    def _run_yolo_detection(
+        self,
+        frame,
+        step_idx: int,
+        current_steer: Optional[float] = None,
+        speed_kmh: Optional[float] = None,
+    ) -> tuple[bool, Dict[str, Any]]:
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
         # distance_threshold applies to dynamic obstacles (pedestrian/vehicle/two_wheeler).
-        detections, is_emergency = self._yolo_detector.detect_and_evaluate(frame_bgr, distance_threshold=5.0)
+        detections, is_emergency = self._yolo_detector.detect_and_evaluate(
+            frame_bgr,
+            distance_threshold=5.0,
+            vehicle_steer=current_steer,
+            speed_kmh=speed_kmh,
+        )
         debug_info = {}
         if hasattr(self._yolo_detector, "get_last_debug_info"):
             debug_info = self._yolo_detector.get_last_debug_info() or {}
@@ -1113,6 +1124,36 @@ class LaneFollowAgent(BaseAgent):
 
         cv2.putText(annotated_frame, status_text, (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+        lock_zone = debug_info.get("locked_zone")
+        if lock_zone:
+            lock_text = (
+                f"LOCK={lock_zone} | immunity={debug_info.get('green_immunity_counter', 0)}"
+            )
+        else:
+            lock_text = "LOCK=None"
+        cv2.putText(
+            annotated_frame,
+            lock_text,
+            (10, 58),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 0),
+            2,
+        )
+        turn_text = (
+            f"TURN={bool(debug_info.get('turn_phase_active', False))} | "
+            f"grace={int(debug_info.get('turn_green_grace_counter', 0))} | "
+            f"suppress={bool(debug_info.get('turn_red_suppressed', False))}"
+        )
+        cv2.putText(
+            annotated_frame,
+            turn_text,
+            (10, 84),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (200, 255, 200),
+            2,
+        )
 
         cv2.imshow(self._yolo_window_name, annotated_frame)
         cv2.waitKey(1)
@@ -1140,11 +1181,18 @@ class LaneFollowAgent(BaseAgent):
                 self._waiting_frame_logged = True
             return
 
+        speed_kmh = self._current_speed_kmh()
+
         # Run YOLO detection and display if enabled
         is_emergency = False
         yolo_debug_info: Dict[str, Any] = {}
         if self._yolo_enabled and self._yolo_detector is not None:
-            is_emergency, yolo_debug_info = self._run_yolo_detection(frame, step_idx)
+            is_emergency, yolo_debug_info = self._run_yolo_detection(
+                frame,
+                step_idx,
+                current_steer=self._last_steer,
+                speed_kmh=speed_kmh,
+            )
 
         self._write_video_frame(frame)
         if self._stop_requested:
@@ -1156,7 +1204,6 @@ class LaneFollowAgent(BaseAgent):
         steering = alpha * self._last_steer + (1.0 - alpha) * steering_raw
         self._last_steer = steering
 
-        speed_kmh = self._current_speed_kmh()
         throttle, brake = self._longitudinal_control(speed_kmh)
 
         # Apply emergency braking if YOLO detects danger
@@ -1322,10 +1369,26 @@ class YoloDetectAgent(BaseAgent):
                 self._waiting_frame_logged = True
             return
 
+        current_steer = None
+        speed_kmh = None
+        if self.session is not None and self.session.ego_vehicle is not None:
+            vehicle = self.session.ego_vehicle
+            try:
+                current_steer = float(vehicle.get_control().steer)
+            except Exception:
+                current_steer = None
+            try:
+                velocity = vehicle.get_velocity()
+                speed_kmh = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2) * 3.6
+            except Exception:
+                speed_kmh = None
+
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         detections, is_emergency = self._detector.detect_and_evaluate(
             frame_bgr,
             distance_threshold=5.0,
+            vehicle_steer=current_steer,
+            speed_kmh=speed_kmh,
         )
         debug_info = {}
         if hasattr(self._detector, "get_last_debug_info"):
@@ -1430,6 +1493,36 @@ class YoloDetectAgent(BaseAgent):
             status_text = "Normal"
             status_color = (0, 255, 0)
         cv2.putText(annotated_frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+        lock_zone = debug_info.get("locked_zone")
+        if lock_zone:
+            lock_text = (
+                f"LOCK={lock_zone} | immunity={debug_info.get('green_immunity_counter', 0)}"
+            )
+        else:
+            lock_text = "LOCK=None"
+        cv2.putText(
+            annotated_frame,
+            lock_text,
+            (10, 58),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 0),
+            2,
+        )
+        turn_text = (
+            f"TURN={bool(debug_info.get('turn_phase_active', False))} | "
+            f"grace={int(debug_info.get('turn_green_grace_counter', 0))} | "
+            f"suppress={bool(debug_info.get('turn_red_suppressed', False))}"
+        )
+        cv2.putText(
+            annotated_frame,
+            turn_text,
+            (10, 84),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (200, 255, 200),
+            2,
+        )
 
         cv2.imshow(self._window_name, annotated_frame)
         cv2.waitKey(1)
