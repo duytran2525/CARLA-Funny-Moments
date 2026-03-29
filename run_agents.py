@@ -1042,19 +1042,47 @@ class LaneFollowAgent(BaseAgent):
                 1,
             )
 
+        obstacle_roi = debug_info.get("obstacle_danger_roi", {})
+        obstacle_polygon = obstacle_roi.get("polygon", [])
+        if np is not None and len(obstacle_polygon) >= 3:
+            points = np.array(obstacle_polygon, dtype=np.int32).reshape((-1, 1, 2))
+            roi_color = (0, 255, 255)
+            cv2.polylines(annotated_frame, [points], True, roi_color, 2)
+            label = (
+                f"{obstacle_roi.get('label', 'Obstacle corridor')} < "
+                f"{float(obstacle_roi.get('distance_threshold_m', 5.0)):.1f}m"
+            )
+            anchor_x = int(obstacle_polygon[0][0])
+            anchor_y = max(18, int(obstacle_polygon[0][1]) - 8)
+            cv2.putText(
+                annotated_frame,
+                label,
+                (anchor_x, anchor_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                roi_color,
+                1,
+            )
+
         for det in detections:
             x1, y1, x2, y2 = det['box']
             class_name = det['class_name']
             conf = det['confidence']
             distance = det['distance']
             roi_zone = det.get('roi_zone')
+            in_danger_roi = bool(det.get("in_danger_roi", False))
+            danger_match = bool(det.get("danger_match", False))
 
             if class_name == "traffic_light_red":
                 color = (0, 0, 255)
             elif class_name == "traffic_light_green":
                 color = (0, 255, 0)
-            elif distance < 5.0:
+            elif danger_match:
                 color = (0, 0, 255)
+            elif in_danger_roi and distance < 10.0:
+                color = (0, 165, 255)
+            elif distance < 5.0:
+                color = (255, 200, 0)
             elif distance < 10.0:
                 color = (0, 165, 255)
             else:
@@ -1064,6 +1092,10 @@ class LaneFollowAgent(BaseAgent):
             label = f"{class_name} {conf:.2f} ({distance:.1f}m)"
             if roi_zone is not None:
                 label = f"{label} [{roi_zone}]"
+            if in_danger_roi:
+                label = f"{label} [path]"
+            if danger_match:
+                label = f"{label} [BRAKE]"
             cv2.putText(annotated_frame, label, (x1, y1 - 10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
@@ -1332,22 +1364,54 @@ class YoloDetectAgent(BaseAgent):
                 1,
             )
 
+        obstacle_roi = debug_info.get("obstacle_danger_roi", {})
+        obstacle_polygon = obstacle_roi.get("polygon", [])
+        if np is not None and len(obstacle_polygon) >= 3:
+            points = np.array(obstacle_polygon, dtype=np.int32).reshape((-1, 1, 2))
+            roi_color = (0, 255, 255)
+            cv2.polylines(annotated_frame, [points], True, roi_color, 2)
+            label = (
+                f"{obstacle_roi.get('label', 'Obstacle corridor')} < "
+                f"{float(obstacle_roi.get('distance_threshold_m', 5.0)):.1f}m"
+            )
+            anchor_x = int(obstacle_polygon[0][0])
+            anchor_y = max(18, int(obstacle_polygon[0][1]) - 8)
+            cv2.putText(
+                annotated_frame,
+                label,
+                (anchor_x, anchor_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                roi_color,
+                1,
+            )
+
         for det in detections:
             x1, y1, x2, y2 = det['box']
             class_name = det["class_name"]
             confidence = det["confidence"]
             distance = det["distance"]
             roi_zone = det.get("roi_zone")
+            in_danger_roi = bool(det.get("in_danger_roi", False))
+            danger_match = bool(det.get("danger_match", False))
             label = f"{class_name} {confidence:.2f} ({distance:.1f}m)"
             if roi_zone is not None:
                 label = f"{label} [{roi_zone}]"
+            if in_danger_roi:
+                label = f"{label} [path]"
+            if danger_match:
+                label = f"{label} [BRAKE]"
 
             if class_name == "traffic_light_red":
                 color = (0, 0, 255)
             elif class_name == "traffic_light_green":
                 color = (0, 255, 0)
-            elif is_emergency:
+            elif danger_match:
                 color = (0, 0, 255)
+            elif in_danger_roi and distance < 10.0:
+                color = (0, 165, 255)
+            elif distance < 5.0:
+                color = (255, 200, 0)
             else:
                 color = (0, 255, 0)
 

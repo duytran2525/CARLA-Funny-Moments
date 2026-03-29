@@ -3,6 +3,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 import cv2
+import numpy as np
 import torch
 from ultralytics import YOLO
 
@@ -73,6 +74,15 @@ class YoloDetector:
         }
         self.traffic_light_zone_priority = ("urban", "rural_right")
         self.green_override_ratio = 1.05
+
+        # Trapezoid danger corridor in front of ego vehicle for obstacle emergency brake.
+        self.obstacle_danger_region = {
+            "top_y_ratio": 0.58,
+            "bottom_y_ratio": 0.98,
+            "top_half_width_ratio": 0.10,
+            "bottom_half_width_ratio": 0.34,
+            "label": "Obstacle corridor",
+        }
 
         # Small temporal smoothing for stable stop/go behavior.
         self.red_confirm_frames = 2
@@ -240,6 +250,38 @@ class YoloDetector:
             )
         return regions
 
+    def _build_obstacle_danger_polygon(self, width, height):
+        cfg = self.obstacle_danger_region
+        center_x = width / 2.0
+        top_y = max(0, min(height - 1, int(height * cfg["top_y_ratio"])))
+        bottom_y = max(top_y + 1, min(height - 1, int(height * cfg["bottom_y_ratio"])))
+        top_half_w = max(1, int(width * cfg["top_half_width_ratio"]))
+        bottom_half_w = max(top_half_w + 1, int(width * cfg["bottom_half_width_ratio"]))
+
+        polygon = [
+            (int(center_x - top_half_w), top_y),
+            (int(center_x + top_half_w), top_y),
+            (int(center_x + bottom_half_w), bottom_y),
+            (int(center_x - bottom_half_w), bottom_y),
+        ]
+
+        clamped = []
+        for x, y in polygon:
+            clamped.append(
+                (
+                    max(0, min(width - 1, int(x))),
+                    max(0, min(height - 1, int(y))),
+                )
+            )
+        return clamped
+
+    def _point_in_polygon(self, point_x, point_y, polygon):
+        if len(polygon) < 3:
+            return False
+        contour = np.array(polygon, dtype=np.int32).reshape((-1, 1, 2))
+        # >= 0 means inside or on the boundary.
+        return cv2.pointPolygonTest(contour, (float(point_x), float(point_y)), False) >= 0
+
     def get_last_debug_info(self):
         return self._last_debug_info
 
@@ -276,7 +318,9 @@ class YoloDetector:
         results = self.model(img, conf=self.conf_threshold, verbose=False)
 
         obstacle_emergency_flag = False
+        obstacle_trigger_candidate = None
         processed_detections = []
+        obstacle_danger_polygon = self._build_obstacle_danger_polygon(width, height)
         zone_signals: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {
             zone_name: {"red": None, "green": None}
             for zone_name in self.traffic_light_regions
@@ -312,11 +356,33 @@ class YoloDetector:
                         "distance": distance,
                         "center": (center_x, center_y),
                         "roi_zone": None,
+                        "ground_point": None,
+                        "in_danger_roi": False,
+                        "danger_match": False,
                     }
                 )
 
-                if class_name in self.brake_classes and distance < distance_threshold:
-                    obstacle_emergency_flag = True
+                if class_name in self.brake_classes:
+                    ground_point = (center_x, float(y2))
+                    in_danger_roi = self._point_in_polygon(
+                        ground_point[0],
+                        ground_point[1],
+                        obstacle_danger_polygon,
+                    )
+                    processed_detections[-1]["ground_point"] = ground_point
+                    processed_detections[-1]["in_danger_roi"] = in_danger_roi
+
+                    if in_danger_roi and distance < distance_threshold:
+                        obstacle_emergency_flag = True
+                        processed_detections[-1]["danger_match"] = True
+                        if (
+                            obstacle_trigger_candidate is None
+                            or distance < obstacle_trigger_candidate["distance"]
+                        ):
+                            obstacle_trigger_candidate = {
+                                "class_name": class_name,
+                                "distance": distance,
+                            }
 
                 if class_name in self.traffic_light_classes:
                     roi_zone = self._classify_traffic_light_zone(center_x, center_y, width, height)
@@ -342,6 +408,15 @@ class YoloDetector:
             traffic_decision["green_release"],
         )
         emergency_flag = obstacle_emergency_flag or red_light_active
+        obstacle_reason = ""
+        if obstacle_trigger_candidate is not None:
+            obstacle_reason = (
+                f"In-path obstacle: {obstacle_trigger_candidate['class_name']} "
+                f"@ {obstacle_trigger_candidate['distance']:.1f}m"
+            )
+        decision_reason = traffic_decision["reason"] or ""
+        if obstacle_reason:
+            decision_reason = f"{decision_reason} | {obstacle_reason}" if decision_reason else obstacle_reason
 
         if red_light_active and not self._last_red_light_active and traffic_decision["reason"]:
             print(f"[TRAFFIC_LIGHT] STOP | {traffic_decision['reason']}")
@@ -355,12 +430,18 @@ class YoloDetector:
                 height,
                 traffic_decision["active_zone"],
             ),
+            "obstacle_danger_roi": {
+                "label": self.obstacle_danger_region["label"],
+                "distance_threshold_m": distance_threshold,
+                "polygon": obstacle_danger_polygon,
+            },
             "active_roi_zone": traffic_decision["active_zone"],
             "obstacle_emergency": obstacle_emergency_flag,
+            "obstacle_reason": obstacle_reason,
             "red_light_frame_trigger": traffic_decision["red_trigger"],
             "green_light_frame_release": traffic_decision["green_release"],
             "red_light_active": red_light_active,
-            "decision_reason": traffic_decision["reason"],
+            "decision_reason": decision_reason,
         }
 
         return processed_detections, emergency_flag
