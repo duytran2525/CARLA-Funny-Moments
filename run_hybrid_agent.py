@@ -1290,7 +1290,7 @@ class CILLaneFollowAgent(LaneFollowAgent):
         tensor = tensor.to(self._device, non_blocking=True)
 
         speed_norm = clamp(speed_kmh * self._SPEED_NORM_FACTOR, 0.0, 1.0)
-        speed_t = torch.tensor([[speed_norm]], dtype=torch.float32, device=self._device)
+        speed_t = torch.tensor([speed_norm], dtype=torch.float32, device=self._device)  # 🌟 [CẬP NHẬT]
         cmd_t = torch.tensor([command], dtype=torch.long, device=self._device)
 
         with torch.inference_mode():
