@@ -71,7 +71,11 @@ except Exception:
 
 try:
     from agents.navigation.global_route_planner import GlobalRoutePlanner as _GRP
-except Exception:
+except ImportError:
+    logging.error(
+        "Failed to import GlobalRoutePlanner; route planning disabled.",
+        exc_info=True,
+    )
     _GRP = None
 
 
@@ -945,6 +949,18 @@ class CILLaneFollowAgent(LaneFollowAgent):
         self._route = []          # list of (waypoint, RoadOption)
         self._current_cmd = 0     # lệnh điều hướng hiện tại (0–3)
         self._route_idx = 0       # chỉ số waypoint hiện tại trên route
+        # 🌟 [CẬP NHẬT] Hybrid navigation state: EMA + dynamic look-ahead + gating + hysteresis
+        self._speed_ema_mps = 0.0
+        self._speed_ema_initialized = False
+        self._speed_ema_alpha = 0.30
+        self._lookahead_time_s = 1.2
+        self._lookahead_min_m = 8.0
+        self._lookahead_max_m = 35.0
+        self._intersection_gate_min_m = 3.0
+        self._intersection_gate_max_m = 22.0
+        self._command_latch = 0
+        self._command_latch_frames = 0
+        self._command_latch_max_frames = 12
 
     # ------------------------------------------------------------------
     # Setup
@@ -1125,37 +1141,121 @@ class CILLaneFollowAgent(LaneFollowAgent):
         int
             0 = Follow Lane, 1 = Left, 2 = Right, 3 = Straight.
         """
+        # 🌟 [CẬP NHẬT] Hybrid Dynamic Look-ahead + Intersection-aware Gating + Hysteresis
         if not self._route or self.session is None:
+            self._command_latch = 0
+            self._command_latch_frames = 0
             return 0
 
         vehicle = self.session.ego_vehicle
         if vehicle is None:
+            self._command_latch = 0
+            self._command_latch_frames = 0
             return 0
 
         ego_loc = vehicle.get_location()
+        route_len = len(self._route)
+        if route_len == 0:
+            self._command_latch = 0
+            self._command_latch_frames = 0
+            return 0
 
-        # Tìm waypoint gần nhất trên route (phía trước route_idx)
-        best_idx = self._route_idx
-        best_dist = float('inf')
-        search_end = min(self._route_idx + 50, len(self._route))
-        for i in range(self._route_idx, search_end):
+        # 1) Speed EMA filtering
+        velocity = vehicle.get_velocity()
+        speed_mps = math.sqrt(
+            velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z
+        )
+        if not self._speed_ema_initialized:
+            self._speed_ema_mps = speed_mps
+            self._speed_ema_initialized = True
+        else:
+            alpha = clamp(self._speed_ema_alpha, 0.0, 1.0)
+            self._speed_ema_mps = alpha * speed_mps + (1.0 - alpha) * self._speed_ema_mps
+
+        # 2) Dynamic look-ahead distance: L(v) = clip(Lmin + v*T, Lmin, Lmax)
+        lookahead_m = clamp(
+            self._lookahead_min_m + self._speed_ema_mps * self._lookahead_time_s,
+            self._lookahead_min_m,
+            self._lookahead_max_m,
+        )
+
+        # 3) Update route index by nearest waypoint around current progress
+        search_start = max(0, self._route_idx)
+        search_end = min(search_start + 80, route_len)
+        best_idx = search_start
+        best_dist = float("inf")
+        for i in range(search_start, search_end):
             wp, _ = self._route[i]
-            dx = wp.transform.location.x - ego_loc.x
-            dy = wp.transform.location.y - ego_loc.y
+            wp_loc = wp.transform.location
+            dx = wp_loc.x - ego_loc.x
+            dy = wp_loc.y - ego_loc.y
             dist = math.sqrt(dx * dx + dy * dy)
             if dist < best_dist:
                 best_dist = dist
                 best_idx = i
-
-        # Tiến route_idx nếu đã qua waypoint
         if best_dist < self.WAYPOINT_SEARCH_RADIUS:
-            self._route_idx = min(best_idx + 1, len(self._route) - 1)
+            self._route_idx = min(best_idx + 1, route_len - 1)
 
-        # Nhìn trước vài waypoint để lấy lệnh tại ngã tư
-        look_ahead = min(self._route_idx + 5, len(self._route) - 1)
-        _, road_option = self._route[look_ahead]
-        cmd = self._ROAD_OPTION_TO_CMD.get(str(road_option), 0)
-        return cmd
+        # Find index at dynamic look-ahead distance
+        lookahead_idx = self._route_idx
+        traveled = 0.0
+        while lookahead_idx < route_len - 1 and traveled < lookahead_m:
+            wp_curr, _ = self._route[lookahead_idx]
+            wp_next, _ = self._route[lookahead_idx + 1]
+            seg = wp_curr.transform.location.distance(wp_next.transform.location)
+            traveled += seg
+            lookahead_idx += 1
+
+        # 4) Intersection-aware gating: only emit maneuver commands near intersections
+        candidate_cmd = 0
+        candidate_dist = 0.0
+        cumulative = 0.0
+        for i in range(self._route_idx, lookahead_idx + 1):
+            wp, road_option = self._route[i]
+            cmd_i = self._ROAD_OPTION_TO_CMD.get(str(road_option), 0)
+            if i > self._route_idx:
+                wp_prev, _ = self._route[i - 1]
+                cumulative += wp_prev.transform.location.distance(wp.transform.location)
+
+            if cmd_i == 0:
+                continue
+
+            is_intersection = bool(
+                getattr(wp, "is_intersection", False) or getattr(wp, "is_junction", False)
+            )
+            if not is_intersection:
+                for j in range(max(self._route_idx, i - 2), min(route_len, i + 3)):
+                    wp_n, _ = self._route[j]
+                    if bool(
+                        getattr(wp_n, "is_intersection", False)
+                        or getattr(wp_n, "is_junction", False)
+                    ):
+                        is_intersection = True
+                        break
+
+            if is_intersection:
+                candidate_cmd = cmd_i
+                candidate_dist = cumulative
+                break
+
+        gated_cmd = 0
+        if candidate_cmd in (1, 2, 3):
+            if self._intersection_gate_min_m <= candidate_dist <= self._intersection_gate_max_m:
+                gated_cmd = candidate_cmd
+
+        # 5) Hysteresis/state latch to prevent command hunting
+        if self._command_latch_frames > 0 and self._command_latch in (1, 2, 3):
+            self._command_latch_frames -= 1
+            return self._command_latch
+
+        if gated_cmd in (1, 2, 3):
+            self._command_latch = gated_cmd
+            self._command_latch_frames = self._command_latch_max_frames
+            return gated_cmd
+
+        self._command_latch = 0
+        self._command_latch_frames = 0
+        return 0
 
     # ------------------------------------------------------------------
     # Inference
