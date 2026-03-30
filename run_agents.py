@@ -128,6 +128,202 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def decode_carla_depth_to_meters(image) -> np.ndarray:
+    """Decode CARLA depth camera BGRA buffer into meters."""
+    raw = np.frombuffer(image.raw_data, dtype=np.uint8)
+    bgra = raw.reshape((image.height, image.width, 4)).astype(np.float32)
+    normalized = (
+        bgra[:, :, 2] + bgra[:, :, 1] * 256.0 + bgra[:, :, 0] * 65536.0
+    ) / 16777215.0
+    return normalized * 1000.0
+
+
+def _camera_to_vehicle_rotation(camera_pitch_deg: float) -> np.ndarray:
+    pitch_rad = math.radians(-float(camera_pitch_deg))
+    rot_y = np.array(
+        [
+            [math.cos(pitch_rad), 0.0, math.sin(pitch_rad)],
+            [0.0, 1.0, 0.0],
+            [-math.sin(pitch_rad), 0.0, math.cos(pitch_rad)],
+        ],
+        dtype=np.float32,
+    )
+    base = np.array(
+        [
+            [0.0, 0.0, 1.0],   # z_cam -> x_vehicle
+            [1.0, 0.0, 0.0],   # x_cam -> y_vehicle
+            [0.0, -1.0, 0.0],  # -y_cam -> z_vehicle
+        ],
+        dtype=np.float32,
+    )
+    return rot_y @ base
+
+
+def _project_vehicle_to_image(
+    point_vehicle: np.ndarray,
+    frame_width: int,
+    frame_height: int,
+    camera_fov_deg: float,
+    camera_mount_xyz: tuple[float, float, float],
+    camera_pitch_deg: float,
+) -> Optional[tuple[int, int]]:
+    if np is None:
+        return None
+
+    fx = (frame_width / 2.0) / max(math.tan(math.radians(camera_fov_deg) / 2.0), 1e-6)
+    fy = fx
+    cx = frame_width / 2.0
+    cy = frame_height / 2.0
+
+    r_c2v = _camera_to_vehicle_rotation(camera_pitch_deg)
+    r_v2c = r_c2v.T
+    t = np.array(camera_mount_xyz, dtype=np.float32)
+    p_rel = point_vehicle.astype(np.float32) - t
+    p_cam = r_v2c @ p_rel
+    if p_cam[2] <= 0.15:
+        return None
+
+    u = fx * (p_cam[0] / p_cam[2]) + cx
+    v = fy * (p_cam[1] / p_cam[2]) + cy
+    if not np.isfinite(u) or not np.isfinite(v):
+        return None
+    return (int(round(u)), int(round(v)))
+
+
+def _draw_curved_obstacle_path(
+    frame_bgr: np.ndarray,
+    debug_info: Dict[str, Any],
+    camera_fov_deg: float,
+    camera_mount_xyz: tuple[float, float, float] = (1.5, 0.0, 2.2),
+    camera_pitch_deg: float = -8.0,
+) -> bool:
+    if np is None or cv2 is None:
+        return False
+
+    path_cfg = debug_info.get("obstacle_path_model", {}) or {}
+    road_plane = debug_info.get("road_plane", {}) or {}
+    if path_cfg.get("mode") != "curved_3d":
+        return False
+    if not bool(road_plane.get("valid", False)):
+        return False
+
+    normal_raw = road_plane.get("normal", [0.0, 0.0, 1.0])
+    if not isinstance(normal_raw, list) or len(normal_raw) != 3:
+        return False
+    normal = np.array(
+        [float(normal_raw[0]), float(normal_raw[1]), float(normal_raw[2])],
+        dtype=np.float32,
+    )
+    norm = float(np.linalg.norm(normal))
+    if norm < 1e-6:
+        return False
+    normal = normal / norm
+    if abs(float(normal[2])) < 1e-4:
+        return False
+    d = float(road_plane.get("d", 0.0))
+
+    steer = float(path_cfg.get("steer", 0.0))
+    curvature = float(path_cfg.get("curvature", 0.0))
+    horizon_m = float(path_cfg.get("horizon_m", 22.0))
+    min_forward_m = float(path_cfg.get("min_forward_m", 0.8))
+    base_half_width_m = float(path_cfg.get("base_half_width_m", 1.1))
+    width_growth_per_m = float(path_cfg.get("width_growth_per_m", 0.035))
+    curve_width_gain = float(path_cfg.get("curve_width_gain", 0.55))
+    max_half_width_m = float(path_cfg.get("max_half_width_m", 2.8))
+
+    horizon_m = max(min_forward_m + 2.0, min(horizon_m, 40.0))
+    sample_count = max(28, int(horizon_m * 2.5))
+    forward_values = np.linspace(min_forward_m, horizon_m, sample_count, dtype=np.float32)
+
+    left_pixels: list[tuple[int, int]] = []
+    right_pixels: list[tuple[int, int]] = []
+    center_pixels: list[tuple[int, int]] = []
+    frame_h, frame_w = frame_bgr.shape[:2]
+
+    for x in forward_values:
+        center_y = 0.5 * curvature * float(x) * float(x)
+        half_w = min(
+            max_half_width_m,
+            base_half_width_m + width_growth_per_m * float(x) + curve_width_gain * abs(curvature) * float(x),
+        )
+        y_left = center_y - half_w
+        y_right = center_y + half_w
+
+        z_center = -(float(normal[0]) * float(x) + float(normal[1]) * center_y + d) / float(normal[2])
+        z_left = -(float(normal[0]) * float(x) + float(normal[1]) * y_left + d) / float(normal[2])
+        z_right = -(float(normal[0]) * float(x) + float(normal[1]) * y_right + d) / float(normal[2])
+
+        p_center = np.array([float(x), float(center_y), float(z_center)], dtype=np.float32)
+        p_left = np.array([float(x), float(y_left), float(z_left)], dtype=np.float32)
+        p_right = np.array([float(x), float(y_right), float(z_right)], dtype=np.float32)
+
+        center_uv = _project_vehicle_to_image(
+            p_center,
+            frame_w,
+            frame_h,
+            camera_fov_deg,
+            camera_mount_xyz,
+            camera_pitch_deg,
+        )
+        left_uv = _project_vehicle_to_image(
+            p_left,
+            frame_w,
+            frame_h,
+            camera_fov_deg,
+            camera_mount_xyz,
+            camera_pitch_deg,
+        )
+        right_uv = _project_vehicle_to_image(
+            p_right,
+            frame_w,
+            frame_h,
+            camera_fov_deg,
+            camera_mount_xyz,
+            camera_pitch_deg,
+        )
+
+        if center_uv is not None:
+            center_pixels.append(center_uv)
+        if left_uv is not None:
+            left_pixels.append(left_uv)
+        if right_uv is not None:
+            right_pixels.append(right_uv)
+
+    if len(left_pixels) < 4 or len(right_pixels) < 4:
+        return False
+
+    corridor = np.array(left_pixels + right_pixels[::-1], dtype=np.int32).reshape((-1, 1, 2))
+    overlay = frame_bgr.copy()
+    fill_color = (30, 190, 255)
+    edge_color = (0, 255, 255)
+    center_color = (255, 255, 255)
+    cv2.fillPoly(overlay, [corridor], fill_color)
+    cv2.addWeighted(overlay, 0.22, frame_bgr, 0.78, 0.0, frame_bgr)
+    cv2.polylines(frame_bgr, [corridor], True, edge_color, 2)
+
+    if len(center_pixels) >= 2:
+        center_arr = np.array(center_pixels, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(frame_bgr, [center_arr], False, center_color, 2)
+
+    label = (
+        f"Curved path | steer={steer:+.2f} | k={curvature:+.3f} 1/m | "
+        f"h={horizon_m:.1f}m"
+    )
+    anchor = center_pixels[0] if center_pixels else left_pixels[0]
+    text_x = max(8, min(frame_w - 320, int(anchor[0]) - 40))
+    text_y = max(24, min(frame_h - 8, int(anchor[1]) - 10))
+    cv2.putText(
+        frame_bgr,
+        label,
+        (text_x, text_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        edge_color,
+        2,
+    )
+    return True
+
+
 def map_road_option_to_command(road_option) -> int:
     if road_option is None:
         return 0
@@ -772,7 +968,9 @@ class LaneFollowAgent(BaseAgent):
         self._model = None
         self._device = None
         self._camera = None
+        self._depth_camera = None
         self._latest_rgb = None
+        self._latest_depth_m = None
         self._frame_lock = threading.Lock()
         self._last_steer = 0.0
         self._waiting_frame_logged = False
@@ -798,6 +996,15 @@ class LaneFollowAgent(BaseAgent):
         self._model = self._load_model()
         self._camera = self._spawn_camera(session.world, vehicle)
         self._camera.listen(self._on_camera_frame)
+        try:
+            self._depth_camera = self._spawn_depth_camera(session.world, vehicle)
+            self._depth_camera.listen(self._on_depth_frame)
+        except Exception as exc:
+            self._depth_camera = None
+            logging.warning(
+                "Depth camera unavailable for lane_follow, fallback to bbox distance. Reason: %s",
+                exc,
+            )
 
         self._collector = DataCollector(
             output_dir=self.config.collect_data_dir,
@@ -885,7 +1092,15 @@ class LaneFollowAgent(BaseAgent):
             logging.warning("YOLO model file not found: %s. YOLO detection disabled.", model_path)
             return
 
-        self._yolo_detector = YoloDetector(str(model_path))
+        self._yolo_detector = YoloDetector(
+            str(model_path),
+            camera_fov_deg=self.config.camera_fov,
+            obstacle_base_distance_m=8.0,
+            camera_mount_x_m=1.5,
+            camera_mount_y_m=0.0,
+            camera_mount_z_m=2.2,
+            camera_pitch_deg=-8.0,
+        )
         self._yolo_enabled = True
         logging.info("YOLO detection integrated with lane_follow. Model: %s", model_path)
 
@@ -962,6 +1177,22 @@ class LaneFollowAgent(BaseAgent):
         logging.info("Attached RGB camera to ego vehicle.")
         return camera
 
+    def _spawn_depth_camera(self, world, vehicle):
+        bp_lib = world.get_blueprint_library()
+        depth_bp = bp_lib.find("sensor.camera.depth")
+        depth_bp.set_attribute("image_size_x", str(self.config.camera_width))
+        depth_bp.set_attribute("image_size_y", str(self.config.camera_height))
+        depth_bp.set_attribute("fov", str(self.config.camera_fov))
+        if depth_bp.has_attribute("sensor_tick") and self.config.sync:
+            depth_bp.set_attribute("sensor_tick", str(self.config.fixed_delta))
+
+        camera_transform = carla.Transform(
+            carla.Location(x=1.5, z=2.2), carla.Rotation(pitch=-8.0)
+        )
+        camera = world.spawn_actor(depth_bp, camera_transform, attach_to=vehicle)
+        logging.info("Attached depth camera to ego vehicle.")
+        return camera
+
     def _on_camera_frame(self, image) -> None:
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
         bgra = array.reshape((image.height, image.width, 4))
@@ -969,11 +1200,20 @@ class LaneFollowAgent(BaseAgent):
         with self._frame_lock:
             self._latest_rgb = rgb
 
+    def _on_depth_frame(self, image) -> None:
+        depth_m = decode_carla_depth_to_meters(image)
+        with self._frame_lock:
+            self._latest_depth_m = depth_m
+
     def _read_latest_frame(self):
         with self._frame_lock:
             frame = self._latest_rgb
+            if frame is None:
+                return None, None
+            depth_m = self._latest_depth_m
             self._latest_rgb = None
-        return frame
+            self._latest_depth_m = None
+        return frame, depth_m
 
     def _write_video_frame(self, rgb_frame) -> None:
         if self._video_writer is None:
@@ -1014,11 +1254,24 @@ class LaneFollowAgent(BaseAgent):
             brake = clamp((-error) / 20.0, 0.0, self.config.max_brake)
         return throttle, brake
 
-    def _run_yolo_detection(self, frame, step_idx: int) -> tuple[bool, Dict[str, Any]]:
+    def _run_yolo_detection(
+        self,
+        frame,
+        depth_map_m,
+        step_idx: int,
+        current_steer: Optional[float] = None,
+        speed_kmh: Optional[float] = None,
+    ) -> tuple[bool, Dict[str, Any]]:
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
         # distance_threshold applies to dynamic obstacles (pedestrian/vehicle/two_wheeler).
-        detections, is_emergency = self._yolo_detector.detect_and_evaluate(frame_bgr, distance_threshold=5.0)
+        detections, is_emergency = self._yolo_detector.detect_and_evaluate(
+            frame_bgr,
+            distance_threshold=None,
+            depth_map_m=depth_map_m,
+            vehicle_steer=current_steer,
+            speed_kmh=speed_kmh,
+        )
         debug_info = {}
         if hasattr(self._yolo_detector, "get_last_debug_info"):
             debug_info = self._yolo_detector.get_last_debug_info() or {}
@@ -1042,19 +1295,56 @@ class LaneFollowAgent(BaseAgent):
                 1,
             )
 
+        obstacle_roi = debug_info.get("obstacle_danger_roi", {})
+        drew_curved = _draw_curved_obstacle_path(
+            annotated_frame,
+            debug_info,
+            camera_fov_deg=float(self.config.camera_fov),
+            camera_mount_xyz=(1.5, 0.0, 2.2),
+            camera_pitch_deg=-8.0,
+        )
+        obstacle_polygon = obstacle_roi.get("polygon", [])
+        if (not drew_curved) and np is not None and len(obstacle_polygon) >= 3:
+            points = np.array(obstacle_polygon, dtype=np.int32).reshape((-1, 1, 2))
+            roi_color = (0, 255, 255)
+            cv2.polylines(annotated_frame, [points], True, roi_color, 2)
+            label = (
+                f"{obstacle_roi.get('label', 'Obstacle corridor')} < "
+                f"{float(obstacle_roi.get('distance_threshold_m', 5.0)):.1f}m"
+            )
+            anchor_x = int(obstacle_polygon[0][0])
+            anchor_y = max(18, int(obstacle_polygon[0][1]) - 8)
+            cv2.putText(
+                annotated_frame,
+                label,
+                (anchor_x, anchor_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                roi_color,
+                1,
+            )
+
         for det in detections:
             x1, y1, x2, y2 = det['box']
             class_name = det['class_name']
             conf = det['confidence']
             distance = det['distance']
+            distance_source = det.get("distance_source", "bbox")
             roi_zone = det.get('roi_zone')
+            in_danger_roi = bool(det.get("in_danger_roi", False))
+            danger_match = bool(det.get("danger_match", False))
+            path_check_mode = det.get("path_check_mode")
 
             if class_name == "traffic_light_red":
                 color = (0, 0, 255)
             elif class_name == "traffic_light_green":
                 color = (0, 255, 0)
-            elif distance < 5.0:
+            elif danger_match:
                 color = (0, 0, 255)
+            elif in_danger_roi and distance < 10.0:
+                color = (0, 165, 255)
+            elif distance < 5.0:
+                color = (255, 200, 0)
             elif distance < 10.0:
                 color = (0, 165, 255)
             else:
@@ -1062,8 +1352,15 @@ class LaneFollowAgent(BaseAgent):
 
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
             label = f"{class_name} {conf:.2f} ({distance:.1f}m)"
+            label = f"{label} [{distance_source}]"
             if roi_zone is not None:
                 label = f"{label} [{roi_zone}]"
+            if in_danger_roi:
+                label = f"{label} [path]"
+            if path_check_mode:
+                label = f"{label} [{path_check_mode}]"
+            if danger_match:
+                label = f"{label} [BRAKE]"
             cv2.putText(annotated_frame, label, (x1, y1 - 10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
@@ -1081,6 +1378,36 @@ class LaneFollowAgent(BaseAgent):
 
         cv2.putText(annotated_frame, status_text, (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+        lock_zone = debug_info.get("locked_zone")
+        if lock_zone:
+            lock_text = (
+                f"LOCK={lock_zone} | immunity={debug_info.get('green_immunity_counter', 0)}"
+            )
+        else:
+            lock_text = "LOCK=None"
+        cv2.putText(
+            annotated_frame,
+            lock_text,
+            (10, 58),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 0),
+            2,
+        )
+        turn_text = (
+            f"TURN={bool(debug_info.get('turn_phase_active', False))} | "
+            f"grace={int(debug_info.get('turn_green_grace_counter', 0))} | "
+            f"suppress={bool(debug_info.get('turn_red_suppressed', False))}"
+        )
+        cv2.putText(
+            annotated_frame,
+            turn_text,
+            (10, 84),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (200, 255, 200),
+            2,
+        )
 
         cv2.imshow(self._yolo_window_name, annotated_frame)
         cv2.waitKey(1)
@@ -1101,18 +1428,26 @@ class LaneFollowAgent(BaseAgent):
                 logging.info("Lane-follow agent waiting for CARLA runtime.")
             return
 
-        frame = self._read_latest_frame()
+        frame, depth_map_m = self._read_latest_frame()
         if frame is None:
             if not self._waiting_frame_logged:
                 logging.info("Waiting for first camera frame...")
                 self._waiting_frame_logged = True
             return
 
+        speed_kmh = self._current_speed_kmh()
+
         # Run YOLO detection and display if enabled
         is_emergency = False
         yolo_debug_info: Dict[str, Any] = {}
         if self._yolo_enabled and self._yolo_detector is not None:
-            is_emergency, yolo_debug_info = self._run_yolo_detection(frame, step_idx)
+            is_emergency, yolo_debug_info = self._run_yolo_detection(
+                frame,
+                depth_map_m,
+                step_idx,
+                current_steer=self._last_steer,
+                speed_kmh=speed_kmh,
+            )
 
         self._write_video_frame(frame)
         if self._stop_requested:
@@ -1124,7 +1459,6 @@ class LaneFollowAgent(BaseAgent):
         steering = alpha * self._last_steer + (1.0 - alpha) * steering_raw
         self._last_steer = steering
 
-        speed_kmh = self._current_speed_kmh()
         throttle, brake = self._longitudinal_control(speed_kmh)
 
         # Apply emergency braking if YOLO detects danger
@@ -1186,7 +1520,12 @@ class LaneFollowAgent(BaseAgent):
             self._camera.stop()
             self._camera.destroy()
             self._camera = None
-            logging.info("Destroyed lane-follow camera.")
+            logging.info("Destroyed lane-follow RGB camera.")
+        if self._depth_camera is not None:
+            self._depth_camera.stop()
+            self._depth_camera.destroy()
+            self._depth_camera = None
+            logging.info("Destroyed lane-follow depth camera.")
         for sensor in self._data_cameras:
             try:
                 sensor.stop()
@@ -1211,7 +1550,9 @@ class YoloDetectAgent(BaseAgent):
         super().__init__(config)
         self._enabled = False
         self._camera = None
+        self._depth_camera = None
         self._latest_rgb = None
+        self._latest_depth_m = None
         self._frame_lock = threading.Lock()
         self._waiting_frame_logged = False
         self._detector = None
@@ -1237,9 +1578,26 @@ class YoloDetectAgent(BaseAgent):
         if not model_path.exists():
             raise FileNotFoundError(f"YOLO model file not found: {model_path}")
 
-        self._detector = YoloDetector(str(model_path))
+        self._detector = YoloDetector(
+            str(model_path),
+            camera_fov_deg=self.config.camera_fov,
+            obstacle_base_distance_m=8.0,
+            camera_mount_x_m=1.5,
+            camera_mount_y_m=0.0,
+            camera_mount_z_m=2.2,
+            camera_pitch_deg=-8.0,
+        )
         self._camera = self._spawn_camera(world, vehicle)
         self._camera.listen(self._on_camera_frame)
+        try:
+            self._depth_camera = self._spawn_depth_camera(world, vehicle)
+            self._depth_camera.listen(self._on_depth_frame)
+        except Exception as exc:
+            self._depth_camera = None
+            logging.warning(
+                "Depth camera unavailable for yolo_detect, fallback to bbox distance. Reason: %s",
+                exc,
+            )
         try:
             vehicle.set_autopilot(True, self.config.tm_port)
         except TypeError:
@@ -1264,6 +1622,22 @@ class YoloDetectAgent(BaseAgent):
         logging.info("Attached RGB camera for YOLO detection.")
         return camera
 
+    def _spawn_depth_camera(self, world, vehicle):
+        bp_lib = world.get_blueprint_library()
+        depth_bp = bp_lib.find("sensor.camera.depth")
+        depth_bp.set_attribute("image_size_x", str(self.config.camera_width))
+        depth_bp.set_attribute("image_size_y", str(self.config.camera_height))
+        depth_bp.set_attribute("fov", str(self.config.camera_fov))
+        if depth_bp.has_attribute("sensor_tick") and self.config.sync:
+            depth_bp.set_attribute("sensor_tick", str(self.config.fixed_delta))
+
+        camera_transform = carla.Transform(
+            carla.Location(x=1.5, z=2.2), carla.Rotation(pitch=-8.0)
+        )
+        camera = world.spawn_actor(depth_bp, camera_transform, attach_to=vehicle)
+        logging.info("Attached depth camera for YOLO detection.")
+        return camera
+
     def _on_camera_frame(self, image) -> None:
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
         bgra = array.reshape((image.height, image.width, 4))
@@ -1271,11 +1645,20 @@ class YoloDetectAgent(BaseAgent):
         with self._frame_lock:
             self._latest_rgb = rgb
 
+    def _on_depth_frame(self, image) -> None:
+        depth_m = decode_carla_depth_to_meters(image)
+        with self._frame_lock:
+            self._latest_depth_m = depth_m
+
     def _read_latest_frame(self):
         with self._frame_lock:
             frame = self._latest_rgb
+            if frame is None:
+                return None, None
+            depth_m = self._latest_depth_m
             self._latest_rgb = None
-        return frame
+            self._latest_depth_m = None
+        return frame, depth_m
 
     def run_step(self, step_idx: int) -> None:
         if not self._enabled:
@@ -1283,17 +1666,34 @@ class YoloDetectAgent(BaseAgent):
                 logging.info("YOLO agent waiting for CARLA runtime.")
             return
 
-        frame = self._read_latest_frame()
+        frame, depth_map_m = self._read_latest_frame()
         if frame is None:
             if not self._waiting_frame_logged:
                 logging.info("YOLO waiting for first camera frame...")
                 self._waiting_frame_logged = True
             return
 
+        current_steer = None
+        speed_kmh = None
+        if self.session is not None and self.session.ego_vehicle is not None:
+            vehicle = self.session.ego_vehicle
+            try:
+                current_steer = float(vehicle.get_control().steer)
+            except Exception:
+                current_steer = None
+            try:
+                velocity = vehicle.get_velocity()
+                speed_kmh = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2) * 3.6
+            except Exception:
+                speed_kmh = None
+
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         detections, is_emergency = self._detector.detect_and_evaluate(
             frame_bgr,
-            distance_threshold=5.0,
+            distance_threshold=None,
+            depth_map_m=depth_map_m,
+            vehicle_steer=current_steer,
+            speed_kmh=speed_kmh,
         )
         debug_info = {}
         if hasattr(self._detector, "get_last_debug_info"):
@@ -1332,22 +1732,66 @@ class YoloDetectAgent(BaseAgent):
                 1,
             )
 
+        obstacle_roi = debug_info.get("obstacle_danger_roi", {})
+        drew_curved = _draw_curved_obstacle_path(
+            annotated_frame,
+            debug_info,
+            camera_fov_deg=float(self.config.camera_fov),
+            camera_mount_xyz=(1.5, 0.0, 2.2),
+            camera_pitch_deg=-8.0,
+        )
+        obstacle_polygon = obstacle_roi.get("polygon", [])
+        if (not drew_curved) and np is not None and len(obstacle_polygon) >= 3:
+            points = np.array(obstacle_polygon, dtype=np.int32).reshape((-1, 1, 2))
+            roi_color = (0, 255, 255)
+            cv2.polylines(annotated_frame, [points], True, roi_color, 2)
+            label = (
+                f"{obstacle_roi.get('label', 'Obstacle corridor')} < "
+                f"{float(obstacle_roi.get('distance_threshold_m', 5.0)):.1f}m"
+            )
+            anchor_x = int(obstacle_polygon[0][0])
+            anchor_y = max(18, int(obstacle_polygon[0][1]) - 8)
+            cv2.putText(
+                annotated_frame,
+                label,
+                (anchor_x, anchor_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                roi_color,
+                1,
+            )
+
         for det in detections:
             x1, y1, x2, y2 = det['box']
             class_name = det["class_name"]
             confidence = det["confidence"]
             distance = det["distance"]
+            distance_source = det.get("distance_source", "bbox")
             roi_zone = det.get("roi_zone")
+            in_danger_roi = bool(det.get("in_danger_roi", False))
+            danger_match = bool(det.get("danger_match", False))
+            path_check_mode = det.get("path_check_mode")
             label = f"{class_name} {confidence:.2f} ({distance:.1f}m)"
+            label = f"{label} [{distance_source}]"
             if roi_zone is not None:
                 label = f"{label} [{roi_zone}]"
+            if in_danger_roi:
+                label = f"{label} [path]"
+            if path_check_mode:
+                label = f"{label} [{path_check_mode}]"
+            if danger_match:
+                label = f"{label} [BRAKE]"
 
             if class_name == "traffic_light_red":
                 color = (0, 0, 255)
             elif class_name == "traffic_light_green":
                 color = (0, 255, 0)
-            elif is_emergency:
+            elif danger_match:
                 color = (0, 0, 255)
+            elif in_danger_roi and distance < 10.0:
+                color = (0, 165, 255)
+            elif distance < 5.0:
+                color = (255, 200, 0)
             else:
                 color = (0, 255, 0)
 
@@ -1366,6 +1810,36 @@ class YoloDetectAgent(BaseAgent):
             status_text = "Normal"
             status_color = (0, 255, 0)
         cv2.putText(annotated_frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+        lock_zone = debug_info.get("locked_zone")
+        if lock_zone:
+            lock_text = (
+                f"LOCK={lock_zone} | immunity={debug_info.get('green_immunity_counter', 0)}"
+            )
+        else:
+            lock_text = "LOCK=None"
+        cv2.putText(
+            annotated_frame,
+            lock_text,
+            (10, 58),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 0),
+            2,
+        )
+        turn_text = (
+            f"TURN={bool(debug_info.get('turn_phase_active', False))} | "
+            f"grace={int(debug_info.get('turn_green_grace_counter', 0))} | "
+            f"suppress={bool(debug_info.get('turn_red_suppressed', False))}"
+        )
+        cv2.putText(
+            annotated_frame,
+            turn_text,
+            (10, 84),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (200, 255, 200),
+            2,
+        )
 
         cv2.imshow(self._window_name, annotated_frame)
         cv2.waitKey(1)
@@ -1392,6 +1866,11 @@ class YoloDetectAgent(BaseAgent):
             self._camera.destroy()
             self._camera = None
             logging.info("Destroyed YOLO camera.")
+        if self._depth_camera is not None:
+            self._depth_camera.stop()
+            self._depth_camera.destroy()
+            self._depth_camera = None
+            logging.info("Destroyed YOLO depth camera.")
 
         if cv2 is not None:
             try:
