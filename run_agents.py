@@ -1615,8 +1615,12 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         else lock_from_yaml
     )
 
-    sync = bool(_cfg_get(env_cfg, "carla", "sync", args.sync))
-    fixed_delta = float(_cfg_get(env_cfg, "carla", "fixed_delta", args.fixed_delta))
+    sync = args.sync or bool(_cfg_get(env_cfg, "carla", "sync", False))
+    fixed_delta = (
+        args.fixed_delta
+        if args.fixed_delta != 0.05
+        else float(_cfg_get(env_cfg, "carla", "fixed_delta", args.fixed_delta))
+    )
     if args.collect_data and not sync:
         logging.warning("Data collection requires synchronous mode. Forcing sync=True.")
         sync = True
@@ -1647,10 +1651,26 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         else str(_cfg_get(env_cfg, "recording", "codec", args.video_codec))
     )
 
-    npc_vehicle_count = int(_cfg_get(env_cfg, "traffic_spawn", "vehicle_count", args.npc_vehicle_count))
-    npc_bike_count = int(_cfg_get(env_cfg, "traffic_spawn", "bike_count", args.npc_bike_count))
-    npc_motorbike_count = int(_cfg_get(env_cfg, "traffic_spawn", "motorbike_count", args.npc_motorbike_count))
-    npc_pedestrian_count = int(_cfg_get(env_cfg, "traffic_spawn", "pedestrian_count", args.npc_pedestrian_count))
+    npc_vehicle_count = (
+        args.npc_vehicle_count
+        if args.npc_vehicle_count != 30
+        else int(_cfg_get(env_cfg, "traffic_spawn", "vehicle_count", args.npc_vehicle_count))
+    )
+    npc_bike_count = (
+        args.npc_bike_count
+        if args.npc_bike_count != 10
+        else int(_cfg_get(env_cfg, "traffic_spawn", "bike_count", args.npc_bike_count))
+    )
+    npc_motorbike_count = (
+        args.npc_motorbike_count
+        if args.npc_motorbike_count != 10
+        else int(_cfg_get(env_cfg, "traffic_spawn", "motorbike_count", args.npc_motorbike_count))
+    )
+    npc_pedestrian_count = (
+        args.npc_pedestrian_count
+        if args.npc_pedestrian_count != 50
+        else int(_cfg_get(env_cfg, "traffic_spawn", "pedestrian_count", args.npc_pedestrian_count))
+    )
     npc_enable_autopilot = bool(
         _cfg_get(env_cfg, "traffic_spawn", "npc_enable_autopilot", not args.disable_npc_autopilot)
     ) and not args.disable_npc_autopilot
@@ -1666,13 +1686,17 @@ def build_config(args: argparse.Namespace) -> RunConfig:
 
     return RunConfig(
         env_config_path=args.config,
-        host=_cfg_get(env_cfg, "carla", "host", args.host),
-        port=int(_cfg_get(env_cfg, "carla", "port", args.port)),
-        tm_port=int(_cfg_get(env_cfg, "carla", "tm_port", args.tm_port)),
-        timeout=float(_cfg_get(env_cfg, "carla", "timeout", args.timeout)),
+        host=args.host if args.host != "127.0.0.1" else _cfg_get(env_cfg, "carla", "host", args.host),
+        port=args.port if args.port != 2000 else int(_cfg_get(env_cfg, "carla", "port", args.port)),
+        tm_port=args.tm_port if args.tm_port != 8000 else int(_cfg_get(env_cfg, "carla", "tm_port", args.tm_port)),
+        timeout=(
+            args.timeout
+            if args.timeout != 1000.0
+            else float(_cfg_get(env_cfg, "carla", "timeout", args.timeout))
+        ),
         sync=sync,
         fixed_delta=fixed_delta,
-        no_rendering=bool(_cfg_get(env_cfg, "carla", "no_rendering", args.no_rendering)),
+        no_rendering=args.no_rendering or bool(_cfg_get(env_cfg, "carla", "no_rendering", False)),
         map_name=args.map if args.map != "Town03" else _cfg_get(env_cfg, "carla", "map", args.map),
         vehicle_filter=_cfg_get(env_cfg, "vehicle", "filter", args.vehicle_filter),
         spawn_point=args.spawn_point if args.spawn_point != -1 else int(_cfg_get(env_cfg, "vehicle", "spawn_point", args.spawn_point)),
@@ -1687,9 +1711,21 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         max_throttle=args.max_throttle,
         max_brake=args.max_brake,
         steer_smoothing=args.steer_smoothing,
-        camera_width=int(_cfg_get(env_cfg, "camera", "width", args.camera_width)),
-        camera_height=int(_cfg_get(env_cfg, "camera", "height", args.camera_height)),
-        camera_fov=float(_cfg_get(env_cfg, "camera", "fov", args.camera_fov)),
+        camera_width=(
+            args.camera_width
+            if args.camera_width != 800
+            else int(_cfg_get(env_cfg, "camera", "width", args.camera_width))
+        ),
+        camera_height=(
+            args.camera_height
+            if args.camera_height != 600
+            else int(_cfg_get(env_cfg, "camera", "height", args.camera_height))
+        ),
+        camera_fov=(
+            args.camera_fov
+            if args.camera_fov != 90.0
+            else float(_cfg_get(env_cfg, "camera", "fov", args.camera_fov))
+        ),
         lock_spectator_on_spawn=lock_spectator,
         spectator_reapply_each_tick=(
             args.spectator_reapply_each_tick
