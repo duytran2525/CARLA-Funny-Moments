@@ -40,3 +40,9 @@ recording:
   fps: 20.0
   duration_sec: 600
   codec: "mp4v"
+
+traffic_rules:
+  red_light_max_distance: 15.0   # Quét đèn đỏ tối đa 15m phía trước
+  roi_width_left: 2.0            # Quét lệch trái 2m (để bắt đèn nằm giữa đường)
+  roi_width_right: 4.0           # Quét lệch phải 4m (để bắt đèn nằm bên lề phải)
+  green_immunity_frames: 50      # Miễn nhiễm phanh trong 50 frames (2.5s) sau khi thấy đèn xanh

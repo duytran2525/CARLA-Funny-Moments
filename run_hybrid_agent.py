@@ -59,6 +59,12 @@ except Exception:
     ADASModule = None
 
 try:
+    from core_control.traffic_supervisor import TrafficSupervisor, TrafficState
+except Exception:
+    TrafficSupervisor = None
+    TrafficState = None
+
+try:
     from core_perception.yolo_detector import YoloDetector
 except Exception:
     YoloDetector = None
@@ -67,6 +73,8 @@ try:
     from agents.navigation.global_route_planner import GlobalRoutePlanner as _GRP
 except Exception:
     _GRP = None
+
+
 
 from core_control.carla_manager import CarlaManager, SpectatorConfig
 from core_control.collect_data import DataCollector
@@ -109,6 +117,66 @@ def resolve_model_path(model_path: str) -> Path:
 
     return (models_dir / "cnn_steering.pth").resolve()
 
+def apply_random_weather(world) -> str:
+    # 40% clear day, 20% sunset, 20% night, 20% rain.
+    roll = random.random()
+    if roll < 0.40:
+        preset_name = "clear_day"
+        weather = carla.WeatherParameters(
+            cloudiness=8.0, precipitation=0.0, precipitation_deposits=0.0,
+            wind_intensity=8.0, fog_density=0.0, wetness=0.0,
+            sun_azimuth_angle=30.0, sun_altitude_angle=70.0,
+        )
+    elif roll < 0.60:
+        preset_name = "sunset"
+        weather = carla.WeatherParameters(
+            cloudiness=30.0, precipitation=0.0, precipitation_deposits=0.0,
+            wind_intensity=10.0, fog_density=2.0, wetness=0.0,
+            sun_azimuth_angle=15.0, sun_altitude_angle=8.0,
+        )
+    elif roll < 0.80:
+        preset_name = "night"
+        weather = carla.WeatherParameters(
+            cloudiness=20.0, precipitation=0.0, precipitation_deposits=0.0,
+            wind_intensity=6.0, fog_density=3.0, wetness=0.0,
+            sun_azimuth_angle=0.0, sun_altitude_angle=-35.0,
+        )
+    else:
+        preset_name = "rain"
+        weather = carla.WeatherParameters(
+            cloudiness=85.0, precipitation=70.0, precipitation_deposits=60.0,
+            wind_intensity=35.0, fog_density=12.0, wetness=75.0,
+            sun_azimuth_angle=25.0, sun_altitude_angle=45.0,
+        )
+
+    world.set_weather(weather)
+    return preset_name
+
+
+def apply_weather_preset(world, preset: str) -> None:
+    """Apply a specific weather preset to the world."""
+    if carla is None:
+        return
+    preset_lower = preset.lower().replace(" ", "").replace("_", "")
+    presets = {
+        "clearnoon": carla.WeatherParameters.ClearNoon,
+        "cloudynoon": carla.WeatherParameters.CloudyNoon,
+        "wetnoon": carla.WeatherParameters.WetNoon,
+        "wetcloudynoon": carla.WeatherParameters.WetCloudyNoon,
+        "softrainnoon": carla.WeatherParameters.SoftRainNoon,
+        "midrainnoon": carla.WeatherParameters.MidRainyNoon,
+        "hardrainnoon": carla.WeatherParameters.HardRainNoon,
+        "clearsunset": carla.WeatherParameters.ClearSunset,
+        "cloudysunset": carla.WeatherParameters.CloudySunset,
+        "wetsunset": carla.WeatherParameters.WetSunset,
+        "wetcloudysunset": carla.WeatherParameters.WetCloudySunset,
+        "softrainsunset": carla.WeatherParameters.SoftRainSunset,
+        "midrainsunset": carla.WeatherParameters.MidRainSunset,
+        "hardrainsunset": carla.WeatherParameters.HardRainSunset,
+    }
+    weather = presets.get(preset_lower, carla.WeatherParameters.ClearNoon)
+    world.set_weather(weather)
+    logging.info("Applied weather preset: %s", preset)
 
 @dataclass
 class RunConfig:
@@ -157,6 +225,16 @@ class RunConfig:
     # Phase 2 CIL fields
     yolo_model_path: str = "best.pt"
     destination_spawn_point: int = -1
+    random_weather: bool = True
+    weather_preset: str = "ClearNoon"
+    recovery_interval_frames: int = 100
+    recovery_duration_frames: int = 10
+    recovery_steer_offset: float = 0.3
+    red_light_max_distance: float = 15.0
+    roi_width_left: float = 2.0
+    roi_width_right: float = 4.0
+    green_immunity_frames: int = 50
+    
 
 class BaseSession:
     """Shared interface for CARLA and dry-run sessions."""
@@ -285,8 +363,10 @@ class AutopilotAgent(BaseAgent):
         self._latest_rgb = None
         self._frame_lock = threading.Lock()
         self._waiting_frame_logged = False
-        self._data_camera = None
+        self._data_cameras = []  # Thay thế cho _data_camera cũ
         self._collector: Optional[DataCollector] = None
+        self._recovery_start_frame = -1
+        self._recovery_direction = 1.0
 
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
@@ -354,29 +434,38 @@ class AutopilotAgent(BaseAgent):
     def _start_data_collection(self, world, vehicle) -> None:
         if not self.config.collect_data:
             return
-        # Spawn a dedicated camera for data collection if video camera is not active
-        if self._video_camera is None:
-            bp_lib = world.get_blueprint_library()
-            camera_bp = bp_lib.find("sensor.camera.rgb")
-            camera_bp.set_attribute("image_size_x", str(self.config.camera_width))
-            camera_bp.set_attribute("image_size_y", str(self.config.camera_height))
-            camera_bp.set_attribute("fov", str(self.config.camera_fov))
-            if camera_bp.has_attribute("sensor_tick") and self.config.sync:
-                camera_bp.set_attribute("sensor_tick", str(self.config.fixed_delta))
-            camera_transform = carla.Transform(
-                carla.Location(x=1.5, z=2.2), carla.Rotation(pitch=-8.0)
-            )
-            self._data_camera = world.spawn_actor(camera_bp, camera_transform, attach_to=vehicle)
-            self._data_camera.listen(self._on_video_frame)
-            logging.info("Attached data-collection camera to ego vehicle.")
 
+        # Nạp DataCollector chuẩn Phương án C2 (Queue ngầm)
         self._collector = DataCollector(
             output_dir=self.config.collect_data_dir,
             enabled=True,
+            use_multi_camera=True,  # Kích hoạt chế độ 3 camera
             save_every_n=self.config.save_every_n,
         )
         self._collector.start()
-        logging.info("Autopilot data collector started.")
+
+        bp_lib = world.get_blueprint_library()
+        camera_bp = bp_lib.find("sensor.camera.rgb")
+        camera_bp.set_attribute("image_size_x", str(self.config.camera_width))
+        camera_bp.set_attribute("image_size_y", str(self.config.camera_height))
+        camera_bp.set_attribute("fov", str(self.config.camera_fov))
+        if camera_bp.has_attribute("sensor_tick") and self.config.sync:
+            camera_bp.set_attribute("sensor_tick", str(self.config.fixed_delta))
+
+        # Cấu hình 3 góc nhìn
+        camera_setups = [
+            ("center", carla.Transform(carla.Location(x=1.5, y=0.0, z=2.2), carla.Rotation(pitch=-8.0))),
+            ("left", carla.Transform(carla.Location(x=1.5, y=-0.35, z=2.2), carla.Rotation(yaw=-25.0, pitch=-8.0))),
+            ("right", carla.Transform(carla.Location(x=1.5, y=0.35, z=2.2), carla.Rotation(yaw=25.0, pitch=-8.0))),
+        ]
+        
+        self._data_cameras = []
+        for side, transform in camera_setups:
+            sensor = world.spawn_actor(camera_bp, transform, attach_to=vehicle)
+            sensor.listen(self._collector.make_sensor_callback(side))
+            self._data_cameras.append(sensor)
+
+        logging.info("Autopilot data collector started with 3 synchronized cameras.")
 
     def _on_video_frame(self, image) -> None:
         if np is None or cv2 is None:
@@ -392,9 +481,44 @@ class AutopilotAgent(BaseAgent):
             frame = self._latest_rgb
             self._latest_rgb = None
         return frame
+    def _recovery_offset(self, frame_id: int) -> float:
+        """Kích hoạt lạng lách xe ngẫu nhiên để thu thập dữ liệu phục hồi."""
+        if not self.config.collect_data:
+            return 0.0
+        interval = max(1, self.config.recovery_interval_frames)
+        duration = max(1, self.config.recovery_duration_frames)
+        if frame_id % interval == 0:
+            self._recovery_start_frame = frame_id
+            self._recovery_direction = random.choice([-1.0, 1.0])
 
+        if self._recovery_start_frame >= 0 and frame_id < self._recovery_start_frame + duration:
+            return self._recovery_direction * self.config.recovery_steer_offset
+        return 0.0
+
+    def _extract_current_command(self) -> int:
+        """Suy luận lệnh điều hướng thô (heuristic) khi ở ngã tư."""
+        vehicle = self.session.ego_vehicle if self.session is not None else None
+        world = self.session.world if self.session is not None else None
+
+        if vehicle is not None and world is not None:
+            m = world.get_map()
+            waypoint = m.get_waypoint(vehicle.get_location(), project_to_road=True)
+            if waypoint is None:
+                return 0
+            if waypoint.is_junction:
+                steer = float(vehicle.get_control().steer)
+                if steer < -0.10:
+                    return 1  # Rẽ trái
+                if steer > 0.10:
+                    return 2  # Rẽ phải
+                return 3      # Đi thẳng
+            return 0
+        return 0
     def run_step(self, step_idx: int) -> None:
         frame = self._read_latest_video_frame()
+        world = self.session.world if self.session is not None else None
+        vehicle = self.session.ego_vehicle if self.session is not None else None
+
         if frame is not None:
             if self._video_writer is not None:
                 bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -402,22 +526,38 @@ class AutopilotAgent(BaseAgent):
                 self._video_frames_written += 1
                 if self._video_frames_written >= self._video_max_frames:
                     self._stop_requested = True
+        elif (self._video_writer is not None or self._collector is not None) and not self._waiting_frame_logged:
+            logging.info("Autopilot waiting for first camera frame...")
+            self._waiting_frame_logged = True
+
+        if vehicle is not None:
+            # 1. Áp dụng lạng lách phục hồi (Recovery Steer)
+            frame_id_for_control = step_idx
+            if world is not None:
+                frame_id_for_control = int(world.get_snapshot().frame)
+            
+            recovery_delta = self._recovery_offset(frame_id_for_control)
+            if abs(recovery_delta) > 1e-6:
+                control = vehicle.get_control()
+                control.steer = float(clamp(control.steer + recovery_delta, -1.0, 1.0))
+                vehicle.apply_control(control)
+
+            # 2. Ghi nhật ký (Data Logging)
             if self._collector is not None:
-                vehicle = self.session.ego_vehicle
                 velocity = vehicle.get_velocity()
                 speed_kmh = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2) * 3.6
                 control = vehicle.get_control()
+                command = self._extract_current_command()
+                
+                # Gọi hàm add() của Phương án C2 (Không cần nhét frame ảnh, Background thread tự kéo từ Queue)
                 self._collector.add(
-                    tick=step_idx,
-                    rgb_frame=frame,
+                    tick=frame_id_for_control,
                     steer=control.steer,
                     throttle=control.throttle,
                     brake=control.brake,
                     speed_kmh=speed_kmh,
+                    command=command
                 )
-        elif (self._video_writer is not None or self._collector is not None) and not self._waiting_frame_logged:
-            logging.info("Autopilot waiting for first camera frame...")
-            self._waiting_frame_logged = True
 
         if step_idx % 20 == 0:
             logging.info("Autopilot tick %d", step_idx)
@@ -435,10 +575,16 @@ class AutopilotAgent(BaseAgent):
         if self._collector is not None:
             self._collector.close()
             self._collector = None
-        if self._data_camera is not None:
-            self._data_camera.stop()
-            self._data_camera.destroy()
-            self._data_camera = None
+            
+        # Dọn dẹp mảng 3 camera
+        for sensor in self._data_cameras:
+            try:
+                sensor.stop()
+                sensor.destroy()
+            except RuntimeError:
+                pass
+        self._data_cameras = []
+        
         if self._video_camera is not None:
             self._video_camera.stop()
             self._video_camera.destroy()
@@ -630,11 +776,8 @@ class LaneFollowAgent(BaseAgent):
         cropped = rgb_frame[int(height * 0.45) :, :, :]
         resized = cv2.resize(cropped, (200, 66), interpolation=cv2.INTER_AREA)
 
-        # [MỚI THÊM] ĐỔI SANG YUV ĐỂ KHỚP VỚI DATASET LÚC TRAIN!
-        # yuv_image = cv2.cvtColor(resized, cv2.COLOR_RGB2YUV)
-        # tensor = torch.from_numpy(yuv_image).permute(2, 0, 1).float().div_(255.0)
-
-        tensor = torch.from_numpy(resized).permute(2, 0, 1).float().div_(255.0)
+        yuv_image = cv2.cvtColor(resized, cv2.COLOR_RGB2YUV)
+        tensor = torch.from_numpy(yuv_image).permute(2, 0, 1).float().div_(255.0)
         tensor.sub_(0.5).div_(0.5)
         tensor.unsqueeze_(0)
         tensor = tensor.to(self._device, non_blocking=True)
@@ -811,13 +954,53 @@ class CILLaneFollowAgent(LaneFollowAgent):
         if session.ego_vehicle is None or session.world is None:
             return
 
+        # --- BẮT ĐẦU CẤY GHÉP ĐA CAMERA ---
+        if self.config.collect_data:
+            if self._collector is not None:
+                self._collector.close()  # Đóng collector 1 camera mặc định của lớp cha
+            self._start_multi_camera_data_collection(session.world, session.ego_vehicle)
+        # --- KẾT THÚC CẤY GHÉP ---
+
         self._spatial_math = self._init_spatial_math()
         self._tracker = SimpleTracker() if SimpleTracker is not None else None
         self._adas = ADASModule() if ADASModule is not None else None
+        self._traffic_supervisor = TrafficSupervisor(self.config) if TrafficSupervisor is not None else None
+        self._yolo = self._init_yolo()
         self._yolo = self._init_yolo()
         self._route = self._plan_route(session)
         self._route_idx = 0
         logging.info("CIL agent ready. Route length: %d waypoints.", len(self._route))
+
+    def _start_multi_camera_data_collection(self, world, vehicle):
+        """Khởi tạo 3 camera phục vụ thu thập dữ liệu Closed-loop."""
+        self._collector = DataCollector(
+            output_dir=self.config.collect_data_dir,
+            enabled=True,
+            use_multi_camera=True,
+            save_every_n=self.config.save_every_n,
+        )
+        self._collector.start()
+
+        bp_lib = world.get_blueprint_library()
+        camera_bp = bp_lib.find("sensor.camera.rgb")
+        camera_bp.set_attribute("image_size_x", str(self.config.camera_width))
+        camera_bp.set_attribute("image_size_y", str(self.config.camera_height))
+        camera_bp.set_attribute("fov", str(self.config.camera_fov))
+        if camera_bp.has_attribute("sensor_tick") and self.config.sync:
+            camera_bp.set_attribute("sensor_tick", str(self.config.fixed_delta))
+
+        camera_setups = [
+            ("center", carla.Transform(carla.Location(x=1.5, y=0.0, z=2.2), carla.Rotation(pitch=-8.0))),
+            ("left", carla.Transform(carla.Location(x=1.5, y=-0.35, z=2.2), carla.Rotation(yaw=-25.0, pitch=-8.0))),
+            ("right", carla.Transform(carla.Location(x=1.5, y=0.35, z=2.2), carla.Rotation(yaw=25.0, pitch=-8.0))),
+        ]
+        
+        self._data_cameras = []
+        for side, transform in camera_setups:
+            sensor = world.spawn_actor(camera_bp, transform, attach_to=vehicle)
+            sensor.listen(self._collector.make_sensor_callback(side))
+            self._data_cameras.append(sensor)
+        logging.info("CILLaneFollowAgent: Multi-camera closed-loop collection started.")
 
     def _init_spatial_math(self):
         if SpatialMath is None:
@@ -1000,7 +1183,8 @@ class CILLaneFollowAgent(LaneFollowAgent):
         cropped = rgb_frame[int(height * 0.45):, :, :]
         resized = cv2.resize(cropped, (200, 66), interpolation=cv2.INTER_AREA)
 
-        tensor = torch.from_numpy(resized).permute(2, 0, 1).float().div_(255.0)
+        yuv_image = cv2.cvtColor(resized, cv2.COLOR_RGB2YUV)
+        tensor = torch.from_numpy(yuv_image).permute(2, 0, 1).float().div_(255.0)
         tensor.sub_(0.5).div_(0.5)
         tensor.unsqueeze_(0)
         tensor = tensor.to(self._device, non_blocking=True)
@@ -1043,7 +1227,16 @@ class CILLaneFollowAgent(LaneFollowAgent):
         speed_mps = speed_kmh / 3.6
 
         # 3. YOLO detection + IPM + Tracker + ADAS
-        throttle, brake = self._run_survival_pipeline(frame, speed_mps)
+        throttle, brake, tracks = self._run_survival_pipeline(frame, speed_mps)
+
+        # 🌟 [CẬP NHẬT] Đánh giá Luật lệ giao thông (Traffic Supervisor)
+        if self._traffic_supervisor is not None and TrafficState is not None:
+            traffic_state, traffic_debug = self._traffic_supervisor.evaluate(tracks)
+            if traffic_state == TrafficState.MUST_STOP:
+                throttle = 0.0
+                brake = max(brake, self.config.max_brake) 
+                if step_idx % 20 == 0:
+                    logging.info("TrafficSupervisor: ĐÈN ĐỎ TRONG ROI - KÍCH HOẠT PHANH!")
 
         # 4. CIL steering
         steering_raw = self._predict_steering_cil(frame, speed_kmh, command)
@@ -1062,10 +1255,13 @@ class CILLaneFollowAgent(LaneFollowAgent):
         self.session.ego_vehicle.apply_control(control)
 
         # 6. Lưu dữ liệu (kèm command cho Phase 2 dataset)
-        if self._collector is not None:
+        if self._collector is not None and self.config.collect_data:
+            frame_id_for_control = step_idx
+            if self.session.world is not None:
+                frame_id_for_control = int(self.session.world.get_snapshot().frame)
+                
             self._collector.add(
-                tick=step_idx,
-                rgb_frame=frame,
+                tick=frame_id_for_control,
                 steer=control.steer,
                 throttle=control.throttle,
                 brake=control.brake,
@@ -1080,6 +1276,7 @@ class CILLaneFollowAgent(LaneFollowAgent):
                 step_idx, command, speed_kmh,
                 control.steer, control.throttle, control.brake,
             )
+    
 
     def _run_survival_pipeline(self, rgb_frame, ego_speed_mps: float):
         """
@@ -1104,7 +1301,7 @@ class CILLaneFollowAgent(LaneFollowAgent):
         if self._adas is None:
             # Fallback: điều khiển tốc độ đơn giản
             throttle, brake = self._longitudinal_control(ego_speed_mps * 3.6)
-            return throttle, brake
+            return throttle, brake, []
 
         # YOLO detection
         detections = []
@@ -1128,6 +1325,17 @@ class CILLaneFollowAgent(LaneFollowAgent):
         )
         if min_ttc < float('inf'):
             logging.debug("ADAS TTC=%.2fs → throttle=%.2f brake=%.2f", min_ttc, throttle, brake)
+
+    def teardown(self) -> None:
+        super().teardown()
+        if hasattr(self, '_data_cameras'):
+            for sensor in self._data_cameras:
+                try:
+                    sensor.stop()
+                    sensor.destroy()
+                except RuntimeError:
+                    pass
+            self._data_cameras = []
 
         return throttle, brake
 
@@ -1303,6 +1511,25 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="Destination spawn-point index for CIL route planning (-1 = random).",
     )
+    parser.add_argument(
+        "--no-random-weather", 
+        action="store_true", 
+        help="Disable random weather preset selection at start.")
+    parser.add_argument(
+        "--recovery-interval-frames", 
+        type=int, 
+        default=100, 
+        help="Apply recovery steering disturbance every N frames.")
+    parser.add_argument(
+        "--recovery-duration-frames", 
+        type=int, 
+        default=10, 
+        help="Number of frames to keep disturbance active.")
+    parser.add_argument(
+        "--recovery-steer-offset", 
+        type=float, 
+        default=0.3, 
+        help="Steering offset added during disturbance window.")
     return parser.parse_args()
 
 
@@ -1425,6 +1652,15 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         video_codec=video_codec,
         yolo_model_path=args.yolo_model_path,
         destination_spawn_point=args.destination_spawn_point,
+        random_weather=not args.no_random_weather,
+        weather_preset=str(_cfg_get(env_cfg, "weather", "preset", "ClearNoon")),
+        recovery_interval_frames=max(1, args.recovery_interval_frames),
+        recovery_duration_frames=max(1, args.recovery_duration_frames),
+        recovery_steer_offset=abs(args.recovery_steer_offset),
+        red_light_max_distance=float(_cfg_get(env_cfg, "traffic_rules", "red_light_max_distance", 15.0)),
+        roi_width_left=float(_cfg_get(env_cfg, "traffic_rules", "roi_width_left", 2.0)),
+        roi_width_right=float(_cfg_get(env_cfg, "traffic_rules", "roi_width_right", 4.0)),
+        green_immunity_frames=int(_cfg_get(env_cfg, "traffic_rules", "green_immunity_frames", 50)),
     )
 
 
@@ -1456,6 +1692,12 @@ def main() -> int:
 
     try:
         session.start()
+        if not config.dry_run and session.world is not None:
+            if config.random_weather:
+                preset = apply_random_weather(session.world)
+                logging.info("Applied random weather preset: %s", preset)
+            else:
+                apply_weather_preset(session.world, config.weather_preset)
         agent.setup(session)
         step = 0
         while tick_limit <= 0 or step < tick_limit:

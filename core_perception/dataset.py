@@ -84,10 +84,7 @@ class CarlaDataset(Dataset):
         is_training : bool, optional
             Kích hoạt augmentation và dùng 3 camera.  Mặc định ``True``.
         """
-        self.data_df = pd.read_csv(
-            csv_file, header=0,
-            names=['img_id', 'steering', 'throttle', 'brake', 'speed', 'command']
-        )
+        self.data_df = pd.read_csv(csv_file)
         self.root_dir = root_dir
         self.transform = transform
         self.steering_correction = steering_correction
@@ -113,24 +110,13 @@ class CarlaDataset(Dataset):
         """
         print("Đang rà soát file ảnh từ 3 camera...")
         for _, row in self.data_df.iterrows():
-            steering = float(row['steering'])
-            img_id_str = str(row['img_id']).strip()
-            if '.' in img_id_str:
-                img_id_str = img_id_str.split('.')[0]  # Bỏ phần thập phân nếu có
-            img_id = img_id_str.zfill(8) + '.jpg'
+            steering = float(row['steer']) 
+            img_rel_path = str(row['image']).strip() 
 
-            configs = [
-                ('images_center', 0),
-                ('images_left',  self.steering_correction),
-                ('images_right', -self.steering_correction),
-            ]
-
-            for sub_dir, correction in configs:
-                if not self.is_training and sub_dir != 'images_center':
-                    continue
-                img_path = os.path.join(self.root_dir, sub_dir, img_id)
-                if os.path.exists(img_path):
-                    self.samples.append((img_path, steering + correction))
+            img_path = os.path.join(self.root_dir, img_rel_path)
+            
+            if os.path.exists(img_path):
+                self.samples.append((img_path, steering))
 
         print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
         if self.is_training:
@@ -629,16 +615,15 @@ class CILCarlaDataset(CarlaDataset):
                 UserWarning, stacklevel=2,
             )
             raw_df['command'] = 0
-        if 'speed' not in raw_df.columns:
+        if 'speed_kmh' not in raw_df.columns:
             import warnings
             warnings.warn(
-                "CSV file does not contain a 'speed' column - defaulting all "
-                "speeds to 0.0. Add a 'speed' column to enable speed-conditioned "
+                "CSV file does not contain a 'speed_kmh' column - defaulting all "
+                "speeds to 0.0. Add a 'speed_kmh' column to enable speed-conditioned "
                 "CIL training for Phase 2.",
                 UserWarning, stacklevel=2,
             )
-            raw_df['speed'] = 0.0
-
+            raw_df['speed_kmh'] = 0.0
         # Persist as an attribute that _prepare_data (inside super().__init__)
         # can also reference.
         self._raw_df = raw_df
@@ -671,29 +656,17 @@ class CILCarlaDataset(CarlaDataset):
 
         self.samples = []  # reset in case called a second time
         for _, row in source_df.iterrows():
-            steering = float(row['steering'])
-            speed_norm = float(row.get('speed', 0.0)) / self.MAX_SPEED_KMH
+            steering = float(row['steer'])
+            speed_norm = float(row.get('speed_kmh', 0.0)) / self.MAX_SPEED_KMH
             command = int(row.get('command', 0))
 
-            img_id_str = str(row['img_id']).strip()
-            if '.' in img_id_str:
-                img_id_str = img_id_str.split('.')[0]
-            img_id = img_id_str.zfill(8) + '.jpg'
+            img_rel_path = str(row['image']).strip()
+            img_path = os.path.join(self.root_dir, img_rel_path)
 
-            configs = [
-                ('images_center', 0),
-                ('images_left',  self.steering_correction),
-                ('images_right', -self.steering_correction),
-            ]
-
-            for sub_dir, correction in configs:
-                if not self.is_training and sub_dir != 'images_center':
-                    continue
-                img_path = os.path.join(self.root_dir, sub_dir, img_id)
-                if os.path.exists(img_path):
-                    self.samples.append(
-                        (img_path, steering + correction, speed_norm, command)
-                    )
+            if os.path.exists(img_path):
+                self.samples.append(
+                    (img_path, steering, speed_norm, command)
+                )
 
         print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
         if self.is_training:
