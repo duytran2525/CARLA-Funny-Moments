@@ -838,11 +838,12 @@ class LaneFollowAgent(BaseAgent):
         if self._collector is not None:
             self._collector.add(
                 tick=step_idx,
-                rgb_frame=frame,
                 steer=control.steer,
                 throttle=control.throttle,
                 brake=control.brake,
                 speed_kmh=speed_kmh,
+                command=0,
+                image_center=frame,
             )
 
         if step_idx % 20 == 0:
@@ -1325,6 +1326,7 @@ class CILLaneFollowAgent(LaneFollowAgent):
         )
         if min_ttc < float('inf'):
             logging.debug("ADAS TTC=%.2fs → throttle=%.2f brake=%.2f", min_ttc, throttle, brake)
+        return throttle, brake, tracks
 
     def teardown(self) -> None:
         super().teardown()
@@ -1336,8 +1338,6 @@ class CILLaneFollowAgent(LaneFollowAgent):
                 except RuntimeError:
                     pass
             self._data_cameras = []
-
-        return throttle, brake
 
 
 AGENT_REGISTRY: Dict[str, Type[BaseAgent]] = {
