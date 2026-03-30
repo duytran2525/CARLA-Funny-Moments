@@ -967,7 +967,6 @@ class CILLaneFollowAgent(LaneFollowAgent):
         self._adas = ADASModule() if ADASModule is not None else None
         self._traffic_supervisor = TrafficSupervisor(self.config) if TrafficSupervisor is not None else None
         self._yolo = self._init_yolo()
-        self._yolo = self._init_yolo()
         self._route = self._plan_route(session)
         self._route_idx = 0
         logging.info("CIL agent ready. Route length: %d waypoints.", len(self._route))
