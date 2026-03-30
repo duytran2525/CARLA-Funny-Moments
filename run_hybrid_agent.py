@@ -72,7 +72,10 @@ except Exception:
 try:
     from agents.navigation.global_route_planner import GlobalRoutePlanner as _GRP
 except ImportError:
-    logging.exception("Failed to import GlobalRoutePlanner; route planning disabled.")
+    logging.error(
+        "Failed to import GlobalRoutePlanner; route planning disabled.",
+        exc_info=True,
+    )
     _GRP = None
 
 
