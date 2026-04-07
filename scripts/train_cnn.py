@@ -67,8 +67,8 @@ def main():
     )
     
     # Đưa vào DataLoader (Đã gỡ bỏ lớp Subset gây lỗi)
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=2, pin_memory=True)
 
     model = NvidiaCNN().to(device)
     criterion = nn.MSELoss()
@@ -82,7 +82,7 @@ def main():
     )
     # Mixed-precision scaler (disabled automatically on CPU)
     use_amp = torch.cuda.is_available()
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler('cuda' if use_amp else 'cpu', enabled=use_amp)
 
     epochs = config['epochs']
     early_stopping_patience = config.get('early_stopping_patience', 5)
@@ -96,13 +96,13 @@ def main():
         for i, (images, speeds, commands, steerings) in enumerate(train_loader):
             images = images.to(device, non_blocking=True)
             speeds = speeds.to(device, non_blocking=True)
-            commands = commands.to(device, non_blocking=True)
+            commands = commands.to(device, non_blocking=True).float()  # Convert Long to Float
             steerings = steerings.to(device, non_blocking=True)
             
             optimizer.zero_grad()
             
             # TÍNH TOÁN BẰNG MIXED PRECISION
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(device_type='cuda' if use_amp else 'cpu', enabled=use_amp):
                 outputs = model(images, speeds, commands)
                 loss = criterion(outputs, steerings)
                 
@@ -121,10 +121,10 @@ def main():
             for images, speeds, commands, steerings in val_loader:
                 images = images.to(device, non_blocking=True)
                 speeds = speeds.to(device, non_blocking=True)
-                commands = commands.to(device, non_blocking=True)
+                commands = commands.to(device, non_blocking=True).float()  # Convert Long to Float
                 steerings = steerings.to(device, non_blocking=True)
                 # Validation cũng có thể dùng autocast để đánh giá nhanh hơn
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.amp.autocast(device_type='cuda' if use_amp else 'cpu', enabled=use_amp):
                     outputs = model(images, speeds, commands)
                     loss = criterion(outputs, steerings)
                 val_loss += loss.item()
