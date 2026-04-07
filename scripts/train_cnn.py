@@ -50,7 +50,7 @@ def main():
     val_df.to_csv(val_csv_path, index=False)
 
     # Khởi tạo Dataset từ 2 file CSV riêng biệt
-    train_dataset = CarlaDataset(
+    train_dataset = CILCarlaDataset(
         csv_file=train_csv_path, 
         root_dir=DATA_DIR, 
         transform=transform, 
@@ -58,7 +58,7 @@ def main():
         is_training=True  # Sẽ gọi hàm balance và augmentation
     )
     
-    val_dataset = CarlaDataset(
+    val_dataset = CILCarlaDataset(
         csv_file=val_csv_path, 
         root_dir=DATA_DIR, 
         transform=transform, 
@@ -93,14 +93,17 @@ def main():
         model.train()
         running_loss = 0.0
         
-        for i, (images, steerings) in enumerate(train_loader):
-            images, steerings = images.to(device, non_blocking=True), steerings.to(device, non_blocking=True)
+        for i, (images, speeds, commands, steerings) in enumerate(train_loader):
+            images = images.to(device, non_blocking=True)
+            speeds = speeds.to(device, non_blocking=True)
+            commands = commands.to(device, non_blocking=True)
+            steerings = steerings.to(device, non_blocking=True)
             
             optimizer.zero_grad()
             
             # TÍNH TOÁN BẰNG MIXED PRECISION
             with torch.cuda.amp.autocast(enabled=use_amp):
-                outputs = model(images)
+                outputs = model(images, speeds, commands)
                 loss = criterion(outputs, steerings)
                 
             # BACKWARD THÔNG QUA SCALER
@@ -115,11 +118,14 @@ def main():
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for images, steerings in val_loader:
-                images, steerings = images.to(device, non_blocking=True), steerings.to(device, non_blocking=True)
+            for images, speeds, commands, steerings in val_loader:
+                images = images.to(device, non_blocking=True)
+                speeds = speeds.to(device, non_blocking=True)
+                commands = commands.to(device, non_blocking=True)
+                steerings = steerings.to(device, non_blocking=True)
                 # Validation cũng có thể dùng autocast để đánh giá nhanh hơn
                 with torch.cuda.amp.autocast(enabled=use_amp):
-                    outputs = model(images)
+                    outputs = model(images, speeds, commands)
                     loss = criterion(outputs, steerings)
                 val_loss += loss.item()
                 
