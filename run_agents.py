@@ -1740,7 +1740,37 @@ class CILAgent(BaseAgent):
             }
 
         model = CIL_NvidiaCNN().to(self._device)
-        model.load_state_dict(state_dict, strict=True)
+        try:
+            model.load_state_dict(state_dict, strict=True)
+        except RuntimeError as exc:
+            has_lane_dense = any(key.startswith("dense_layers.") for key in state_dict.keys())
+            has_cil_heads = any(key.startswith("command_heads.") for key in state_dict.keys())
+            if has_lane_dense and not has_cil_heads:
+                # Allow quick smoke testing when user passes a lane-follow checkpoint by mistake.
+                # Only shared conv layers are transferred; CIL-specific heads remain randomly initialized.
+                model_state = model.state_dict()
+                transferable = {
+                    key: value
+                    for key, value in state_dict.items()
+                    if key.startswith("conv_layers.")
+                    and key in model_state
+                    and model_state[key].shape == value.shape
+                }
+                if not transferable:
+                    raise RuntimeError(
+                        "Incompatible checkpoint for CIL model: no transferable conv_layers were found. "
+                        "Provide a checkpoint trained with CIL_NvidiaCNN."
+                    ) from exc
+
+                model.load_state_dict(transferable, strict=False)
+                logging.warning(
+                    "Checkpoint %s appears to be a lane-follow model (dense_layers.* found). "
+                    "Loaded only shared conv_layers into CIL model; speed_branch/command_heads are randomly initialized. "
+                    "Use a CIL_NvidiaCNN checkpoint for production-quality driving.",
+                    model_path,
+                )
+            else:
+                raise
         model.eval()
         logging.info("Loaded CIL model from %s on %s", model_path, self._device)
         return model
