@@ -49,8 +49,9 @@ except ImportError:
     yaml = None
 
 try:
-    from core_perception.cnn_model import NvidiaCNN, NvidiaCNNV2
+    from core_perception.cnn_model import CIL_NvidiaCNN, NvidiaCNN, NvidiaCNNV2
 except Exception:
+    CIL_NvidiaCNN = None
     NvidiaCNN = None
     NvidiaCNNV2 = None
 
@@ -454,6 +455,40 @@ def resolve_model_path(model_path: str) -> Path:
     return (models_dir / "cnn_steering.pth").resolve()
 
 
+def resolve_cil_model_path(model_path: str) -> Path:
+    project_root = Path(__file__).resolve().parent
+    if model_path.lower() != "auto":
+        candidate = Path(model_path)
+        if not candidate.is_absolute():
+            candidate = project_root / candidate
+        return candidate.resolve()
+
+    models_dir = project_root / "models"
+    if not models_dir.exists():
+        return (project_root / "models" / "cil_nvidia.pth").resolve()
+
+    def newest(pattern: str) -> list[Path]:
+        return sorted(
+            models_dir.glob(pattern),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+
+    preferred = newest("cil*.pth")
+    if preferred:
+        return preferred[0]
+
+    preferred = newest("*cil*.pth")
+    if preferred:
+        return preferred[0]
+
+    any_pth = newest("*.pth")
+    if any_pth:
+        return any_pth[0]
+
+    return (models_dir / "cil_nvidia.pth").resolve()
+
+
 def resolve_yolo_model_path(model_path: str) -> Path:
     project_root = Path(__file__).resolve().parent
     candidate = Path(model_path)
@@ -475,11 +510,13 @@ class RunConfig:
     map_name: str  # CARLA map name (for example: Town01, Town04)
     vehicle_filter: str  # Ego vehicle blueprint filter
     spawn_point: int  # Ego spawn point index
+    destination_point: int  # Destination spawn index for route target (negative means random)
     ticks: int  # Max simulation steps to run
     tick_interval: float  # Sleep interval between ticks in dry-run mode
     dry_run: bool  # Run without connecting to CARLA
     seed: Optional[int]  # Random seed for reproducibility
     model_path: str  # Path to model weights (.pth, .pt)
+    cil_model_path: str  # Path to CIL model weights (.pth)
     yolo_model_path: str  # Path to YOLO weights (.pt)
     model_device: str  # Inference device (cpu or cuda)
     target_speed_kmh: float  # Target ego speed in km/h
@@ -704,7 +741,10 @@ class AutopilotAgent(BaseAgent):
     def _set_new_destination(self, vehicle) -> None:
         if not self._spawn_points or self._nav_agent is None:
             return
-        destination = random.choice(self._spawn_points).location
+        if self.config.destination_point >= 0:
+            destination = self._spawn_points[self.config.destination_point % len(self._spawn_points)].location
+        else:
+            destination = random.choice(self._spawn_points).location
         current_loc = vehicle.get_location()
         try:
             self._nav_agent.set_destination(current_loc, destination)
@@ -1551,6 +1591,394 @@ class LaneFollowAgent(BaseAgent):
         return self._stop_requested
 
 
+class CILAgent(BaseAgent):
+    name = "cil"
+    CIL_MAX_SPEED_KMH = 120.0
+
+    def __init__(self, config: RunConfig) -> None:
+        super().__init__(config)
+        self._enabled = False
+        self._model = None
+        self._device = None
+        self._camera = None
+        self._latest_rgb = None
+        self._frame_lock = threading.Lock()
+        self._last_steer = 0.0
+        self._waiting_frame_logged = False
+        self._collector: Optional[DataCollector] = None
+        self._data_cameras = []
+        self._video_writer = None
+        self._video_output: Optional[Path] = None
+        self._video_frames_written = 0
+        self._video_max_frames = 0
+        self._stop_requested = False
+        self._nav_agent = None
+        self._spawn_points = []
+
+    def setup(self, session: BaseSession) -> None:
+        super().setup(session)
+        vehicle = session.ego_vehicle
+        world = session.world
+        if vehicle is None or world is None:
+            logging.info("No CARLA vehicle/world available; CIL agent runs as noop.")
+            return
+
+        self._model = self._load_cil_model()
+        self._camera = self._spawn_camera(world, vehicle)
+        self._camera.listen(self._on_camera_frame)
+        self._init_navigation_agent(world, vehicle)
+
+        self._collector = DataCollector(
+            output_dir=self.config.collect_data_dir,
+            enabled=self.config.collect_data,
+            save_every_n=self.config.save_every_n,
+        )
+        self._collector.start()
+        self._start_data_collection_cameras(world, vehicle)
+        self._init_video_writer()
+
+        self._enabled = True
+        logging.info("CIL agent is ready.")
+
+    def _init_navigation_agent(self, world, vehicle) -> None:
+        self._spawn_points = world.get_map().get_spawn_points()
+        if not self._spawn_points:
+            logging.warning("No spawn points found to build navigation route for CIL command extraction.")
+            self._nav_agent = None
+            return
+
+        ensure_navigation_agent_imports()
+        nav_type = self.config.nav_agent_type.lower()
+        try:
+            if nav_type == "behavior":
+                if BehaviorAgent is None:
+                    raise RuntimeError("BehaviorAgent missing")
+                self._nav_agent = BehaviorAgent(vehicle, behavior="normal")
+            else:
+                if BasicAgent is None:
+                    raise RuntimeError("BasicAgent missing")
+                self._nav_agent = BasicAgent(vehicle, target_speed=max(10.0, self.config.target_speed_kmh))
+            self._set_new_destination(vehicle)
+            logging.info("CIL navigation planner initialized: %s", self.config.nav_agent_type)
+        except Exception as exc:
+            self._nav_agent = None
+            logging.warning("CIL route planner unavailable, fallback command=0. Reason: %s", exc)
+
+    def _set_new_destination(self, vehicle) -> None:
+        if not self._spawn_points or self._nav_agent is None:
+            return
+        if self.config.destination_point >= 0:
+            destination = self._spawn_points[self.config.destination_point % len(self._spawn_points)].location
+        else:
+            destination = random.choice(self._spawn_points).location
+        current_loc = vehicle.get_location()
+        try:
+            self._nav_agent.set_destination(current_loc, destination)
+        except TypeError:
+            self._nav_agent.set_destination(destination)
+
+    def _extract_current_command(self) -> int:
+        if self._nav_agent is None:
+            return 0
+        planner = None
+        if hasattr(self._nav_agent, "get_local_planner"):
+            planner = self._nav_agent.get_local_planner()
+        if planner is None:
+            return 0
+
+        road_option = getattr(planner, "target_road_option", None)
+        if road_option is None:
+            road_option = getattr(planner, "_target_road_option", None)
+        if road_option is None:
+            queue_attr = getattr(planner, "_waypoints_queue", None)
+            if queue_attr and len(queue_attr) > 0:
+                road_option = queue_attr[0][1]
+        return map_road_option_to_command(road_option)
+
+    def _load_cil_model(self):
+        if torch is None:
+            raise RuntimeError("PyTorch is required for CIL agent.")
+        if cv2 is None:
+            raise RuntimeError("opencv-python is required for CIL agent.")
+        if np is None:
+            raise RuntimeError("numpy is required for CIL agent.")
+        if CIL_NvidiaCNN is None:
+            raise RuntimeError("Cannot import CIL_NvidiaCNN from core_perception.cnn_model.")
+
+        model_path = resolve_cil_model_path(self.config.cil_model_path)
+        if self.config.cil_model_path.lower() == "auto":
+            logging.info("Auto-selected CIL model path: %s", model_path)
+        if not model_path.exists():
+            models_dir = Path(__file__).resolve().parent / "models"
+            existing = ", ".join(str(p.name) for p in sorted(models_dir.glob("*.pth")))
+            if not existing:
+                existing = "no .pth file found in models/"
+            raise RuntimeError(f"CIL model file not found: {model_path}. Available: {existing}")
+
+        device_name = self.config.model_device.lower()
+        if device_name == "auto":
+            device_name = "cuda" if torch.cuda.is_available() else "cpu"
+        if device_name == "cuda" and not torch.cuda.is_available():
+            logging.warning("CUDA requested but unavailable. Falling back to CPU.")
+            device_name = "cpu"
+
+        self._device = torch.device(device_name)
+
+        checkpoint = torch.load(model_path, map_location=self._device)
+        state_dict = checkpoint
+        if isinstance(checkpoint, dict):
+            if "state_dict" in checkpoint:
+                state_dict = checkpoint["state_dict"]
+            elif "model_state_dict" in checkpoint:
+                state_dict = checkpoint["model_state_dict"]
+        if not isinstance(state_dict, dict):
+            raise RuntimeError("Unsupported CIL checkpoint format. Expected state_dict.")
+
+        if any(key.startswith("module.") for key in state_dict.keys()):
+            state_dict = {
+                key.replace("module.", "", 1): value for key, value in state_dict.items()
+            }
+
+        model = CIL_NvidiaCNN().to(self._device)
+        model.load_state_dict(state_dict, strict=True)
+        model.eval()
+        logging.info("Loaded CIL model from %s on %s", model_path, self._device)
+        return model
+
+    def _spawn_camera(self, world, vehicle):
+        bp_lib = world.get_blueprint_library()
+        camera_bp = bp_lib.find("sensor.camera.rgb")
+        camera_bp.set_attribute("image_size_x", str(self.config.camera_width))
+        camera_bp.set_attribute("image_size_y", str(self.config.camera_height))
+        camera_bp.set_attribute("fov", str(self.config.camera_fov))
+        if camera_bp.has_attribute("sensor_tick") and self.config.sync:
+            camera_bp.set_attribute("sensor_tick", str(self.config.fixed_delta))
+
+        camera_transform = carla.Transform(
+            carla.Location(x=1.5, z=2.2), carla.Rotation(pitch=-8.0)
+        )
+        camera = world.spawn_actor(camera_bp, camera_transform, attach_to=vehicle)
+        logging.info("Attached RGB camera to CIL agent ego vehicle.")
+        return camera
+
+    def _start_data_collection_cameras(self, world, vehicle) -> None:
+        if not self.config.collect_data or self._collector is None:
+            return
+
+        bp_lib = world.get_blueprint_library()
+        camera_bp = bp_lib.find("sensor.camera.rgb")
+        camera_bp.set_attribute("image_size_x", str(self.config.camera_width))
+        camera_bp.set_attribute("image_size_y", str(self.config.camera_height))
+        camera_bp.set_attribute("fov", str(self.config.camera_fov))
+        if camera_bp.has_attribute("sensor_tick"):
+            camera_bp.set_attribute("sensor_tick", str(self.config.fixed_delta))
+
+        camera_setups = [
+            ("center", carla.Transform(carla.Location(x=1.5, y=0.0, z=2.2), carla.Rotation(pitch=-8.0))),
+            ("left", carla.Transform(carla.Location(x=1.5, y=-0.35, z=2.2), carla.Rotation(yaw=-25.0, pitch=-8.0))),
+            ("right", carla.Transform(carla.Location(x=1.5, y=0.35, z=2.2), carla.Rotation(yaw=25.0, pitch=-8.0))),
+        ]
+        for side, transform in camera_setups:
+            sensor = world.spawn_actor(camera_bp, transform, attach_to=vehicle)
+            sensor.listen(self._collector.make_sensor_callback(side))
+            self._data_cameras.append(sensor)
+
+        logging.info("CIL data collection cameras are attached (center/left/right).")
+
+    def _init_video_writer(self) -> None:
+        if not self.config.record_video:
+            return
+        if cv2 is None:
+            raise RuntimeError("opencv-python is required for video recording.")
+
+        output_path = Path(self.config.video_output_path)
+        if not output_path.is_absolute():
+            output_path = Path(__file__).resolve().parent / output_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        fourcc = cv2.VideoWriter_fourcc(*self.config.video_codec)
+        writer = cv2.VideoWriter(
+            str(output_path),
+            fourcc,
+            float(self.config.video_fps),
+            (int(self.config.camera_width), int(self.config.camera_height)),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Cannot open video writer: {output_path}")
+
+        self._video_writer = writer
+        self._video_output = output_path
+        self._video_max_frames = max(1, int(self.config.video_duration_sec * self.config.video_fps))
+        logging.info(
+            "CIL video recording started: %s (fps=%.2f, duration=%ds, max_frames=%d)",
+            output_path,
+            self.config.video_fps,
+            self.config.video_duration_sec,
+            self._video_max_frames,
+        )
+
+    def _on_camera_frame(self, image) -> None:
+        array = np.frombuffer(image.raw_data, dtype=np.uint8)
+        bgra = array.reshape((image.height, image.width, 4))
+        rgb = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGB)
+        with self._frame_lock:
+            self._latest_rgb = rgb
+
+    def _read_latest_frame(self):
+        with self._frame_lock:
+            frame = self._latest_rgb
+            self._latest_rgb = None
+        return frame
+
+    def _write_video_frame(self, rgb_frame) -> None:
+        if self._video_writer is None:
+            return
+        bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
+        self._video_writer.write(bgr)
+        self._video_frames_written += 1
+        if self._video_frames_written >= self._video_max_frames:
+            self._stop_requested = True
+
+    def _current_speed_kmh(self) -> float:
+        velocity = self.session.ego_vehicle.get_velocity()
+        speed_mps = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+        return speed_mps * 3.6
+
+    def _longitudinal_control(self, speed_kmh: float) -> tuple[float, float]:
+        error = self.config.target_speed_kmh - speed_kmh
+        if error >= 0.0:
+            throttle = clamp(0.20 + 0.02 * error, 0.05, self.config.max_throttle)
+            brake = 0.0
+        else:
+            throttle = 0.0
+            brake = clamp((-error) / 20.0, 0.0, self.config.max_brake)
+        return throttle, brake
+
+    def _predict_cil_steering(self, rgb_frame, speed_kmh: float, command: int) -> float:
+        height = rgb_frame.shape[0]
+        cropped = rgb_frame[int(height * 0.45) :, :, :]
+        resized = cv2.resize(cropped, (200, 66), interpolation=cv2.INTER_AREA)
+
+        yuv_image = cv2.cvtColor(resized, cv2.COLOR_RGB2YUV)
+        image_tensor = torch.from_numpy(yuv_image).permute(2, 0, 1).float().div_(255.0)
+        image_tensor.sub_(0.5).div_(0.5)
+        image_tensor.unsqueeze_(0)
+
+        speed_norm = clamp(speed_kmh / self.CIL_MAX_SPEED_KMH, 0.0, 1.0)
+        command_idx = max(0, min(3, int(command)))
+        speed_tensor = torch.tensor([speed_norm], dtype=torch.float32)
+        command_tensor = torch.tensor([command_idx], dtype=torch.long)
+
+        image_tensor = image_tensor.to(self._device, non_blocking=True)
+        speed_tensor = speed_tensor.to(self._device, non_blocking=True)
+        command_tensor = command_tensor.to(self._device, non_blocking=True)
+
+        with torch.inference_mode():
+            steering = self._model(image_tensor, speed_tensor, command_tensor).item()
+        return clamp(steering, -1.0, 1.0)
+
+    def run_step(self, step_idx: int) -> None:
+        if not self._enabled:
+            if step_idx % 50 == 0:
+                logging.info("CIL agent waiting for CARLA runtime.")
+            return
+
+        frame = self._read_latest_frame()
+        if frame is None:
+            if not self._waiting_frame_logged:
+                logging.info("CIL waiting for first camera frame...")
+                self._waiting_frame_logged = True
+            return
+
+        speed_kmh = self._current_speed_kmh()
+
+        if self._nav_agent is not None and self.session is not None and self.session.ego_vehicle is not None:
+            try:
+                if self._nav_agent.done():
+                    self._set_new_destination(self.session.ego_vehicle)
+            except Exception:
+                pass
+
+        command = self._extract_current_command()
+
+        self._write_video_frame(frame)
+        if self._stop_requested:
+            logging.info("CIL video duration target reached, stopping agent loop.")
+            return
+
+        steering_raw = self._predict_cil_steering(frame, speed_kmh, command)
+        alpha = clamp(self.config.steer_smoothing, 0.0, 0.99)
+        steering = alpha * self._last_steer + (1.0 - alpha) * steering_raw
+        self._last_steer = steering
+
+        throttle, brake = self._longitudinal_control(speed_kmh)
+        control = carla.VehicleControl(
+            throttle=float(throttle),
+            steer=float(clamp(steering, -1.0, 1.0)),
+            brake=float(brake),
+            hand_brake=False,
+            reverse=False,
+        )
+        self.session.ego_vehicle.apply_control(control)
+
+        if self._collector is not None:
+            frame_id = step_idx
+            if self.session.world is not None:
+                frame_id = int(self.session.world.get_snapshot().frame)
+            rotation = self.session.ego_vehicle.get_transform().rotation
+            self._collector.add_vehicle_state(
+                frame_id=frame_id,
+                steer=control.steer,
+                throttle=control.throttle,
+                brake=control.brake,
+                speed_kmh=speed_kmh,
+                command=command,
+                pitch=rotation.pitch,
+                roll=rotation.roll,
+                yaw=rotation.yaw,
+            )
+
+        if step_idx % 20 == 0:
+            logging.info(
+                "cil tick=%d speed=%.1f km/h cmd=%d steer=%.3f throttle=%.2f brake=%.2f",
+                step_idx,
+                speed_kmh,
+                command,
+                control.steer,
+                control.throttle,
+                control.brake,
+            )
+
+    def teardown(self) -> None:
+        if self._collector is not None:
+            self._collector.close()
+            self._collector = None
+        if self._video_writer is not None:
+            self._video_writer.release()
+            self._video_writer = None
+            logging.info(
+                "Saved CIL video to %s (%d frames).",
+                self._video_output,
+                self._video_frames_written,
+            )
+        if self._camera is not None:
+            self._camera.stop()
+            self._camera.destroy()
+            self._camera = None
+            logging.info("Destroyed CIL RGB camera.")
+        for sensor in self._data_cameras:
+            try:
+                sensor.stop()
+                sensor.destroy()
+            except RuntimeError:
+                pass
+        self._data_cameras = []
+        self._nav_agent = None
+
+    def should_stop(self) -> bool:
+        return self._stop_requested
+
+
 class YoloDetectAgent(BaseAgent):
     name = "yolo_detect"
 
@@ -1898,6 +2326,7 @@ class NoopAgent(BaseAgent):
 AGENT_REGISTRY: Dict[str, Type[BaseAgent]] = {
     AutopilotAgent.name: AutopilotAgent,
     LaneFollowAgent.name: LaneFollowAgent,
+    CILAgent.name: CILAgent,
     YoloDetectAgent.name: YoloDetectAgent,
     NoopAgent.name: NoopAgent,
 }
@@ -1939,7 +2368,7 @@ def parse_args() -> argparse.Namespace:
         "--agent",
         choices=sorted(AGENT_REGISTRY),
         default="lane_follow",
-        help="Choose lane_follow/autopilot/yolo_detect agent mode.",
+        help="Choose lane_follow/cil/autopilot/yolo_detect agent mode.",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=2000)
@@ -1964,6 +2393,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=-1,
         help="Spawn-point index. Negative means random.",
+    )
+    parser.add_argument(
+        "--destination-point",
+        type=int,
+        default=-1,
+        help="Destination point index B. Negative means random destination.",
     )
     parser.add_argument("--npc-vehicle-count", type=int, default=30)
     parser.add_argument("--npc-bike-count", type=int, default=10)
@@ -1995,6 +2430,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to .pth model for lane_follow agent (or 'auto').",
     )
     parser.add_argument(
+        "--cil-model-path",
+        default="auto",
+        help="Path to .pth model for CIL agent (or 'auto').",
+    )
+    parser.add_argument(
         "--yolo-model-path",
         default="best.pt",
         help="Path to YOLO .pt model used by yolo_detect agent.",
@@ -2003,7 +2443,7 @@ def parse_args() -> argparse.Namespace:
         "--device",
         default="auto",
         choices=["auto", "cpu", "cuda"],
-        help="Inference device for lane_follow.",
+        help="Inference device for lane_follow/cil.",
     )
     parser.add_argument("--target-speed-kmh", type=float, default=30.0)
     parser.add_argument("--max-throttle", type=float, default=0.2)
@@ -2187,11 +2627,17 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         map_name=args.map if args.map != "Town03" else _cfg_get(env_cfg, "carla", "map", args.map),
         vehicle_filter=_cfg_get(env_cfg, "vehicle", "filter", args.vehicle_filter),
         spawn_point=args.spawn_point if args.spawn_point != -1 else int(_cfg_get(env_cfg, "vehicle", "spawn_point", args.spawn_point)),
+        destination_point=(
+            args.destination_point
+            if args.destination_point != -1
+            else int(_cfg_get(env_cfg, "vehicle", "destination_point", args.destination_point))
+        ),
         ticks=ticks,
         tick_interval=args.tick_interval,
         dry_run=args.dry_run,
         seed=args.seed,
         model_path=args.model_path,
+        cil_model_path=args.cil_model_path,
         yolo_model_path=args.yolo_model_path,
         model_device=args.device,
         target_speed_kmh=args.target_speed_kmh,
