@@ -33,7 +33,7 @@ def main():
     ])
 
     print("Đang phân chia tập Train và Validation từ file CSV...")
-    df = pd.read_csv(CSV_PATH, header=0, names=['img_id', 'steering', 'throttle', 'brake', 'speed', 'command'])
+    df = pd.read_csv(CSV_PATH)
     
     
     # Tính toán chỉ số chia (vd: 80% train, 20% val)

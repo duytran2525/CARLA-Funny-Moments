@@ -6,6 +6,8 @@ import queue
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from core_control.sync_data import build_synchronized_data, normalize_camera_side
+
 try:
     import numpy as np
 except ImportError:  # pragma: no cover
@@ -19,6 +21,18 @@ except ImportError:  # pragma: no cover
 
 class DataCollector:
     """Collect synchronized center/left/right camera frames and vehicle states."""
+
+    CSV_FIELDNAMES = [
+        "img_id",
+        "steering",
+        "throttle",
+        "brake",
+        "speed",
+        "command",
+        "pitch",
+        "roll",
+        "yaw",
+    ]
 
     def __init__(
         self,
@@ -63,10 +77,13 @@ class DataCollector:
         self.images_right_dir.mkdir(parents=True, exist_ok=True)
 
         append = self.csv_path.exists()
+        if append:
+            self._migrate_csv_schema_if_needed()
+
         self._csv_file = self.csv_path.open("a" if append else "w", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(
             self._csv_file,
-            fieldnames=["img_id", "steering", "throttle", "brake", "speed", "command"],
+            fieldnames=self.CSV_FIELDNAMES,
         )
         if not append:
             self._writer.writeheader()
@@ -98,12 +115,48 @@ class DataCollector:
             self.resize_height,
         )
 
+    def _migrate_csv_schema_if_needed(self) -> None:
+        if not self.csv_path.exists():
+            return
+
+        with self.csv_path.open("r", newline="", encoding="utf-8") as csv_file:
+            reader = csv.DictReader(csv_file)
+            existing_fieldnames = list(reader.fieldnames or [])
+            if existing_fieldnames == self.CSV_FIELDNAMES:
+                return
+
+            rows = list(reader)
+
+        normalized_rows = []
+        for row in rows:
+            normalized_row = {field: row.get(field, "") for field in self.CSV_FIELDNAMES}
+            normalized_row["pitch"] = normalized_row["pitch"] or "0.0"
+            normalized_row["roll"] = normalized_row["roll"] or "0.0"
+            normalized_row["yaw"] = normalized_row["yaw"] or "0.0"
+            normalized_rows.append(normalized_row)
+
+        with self.csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=self.CSV_FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(normalized_rows)
+
+        logging.info(
+            "Migrated driving_log.csv schema from %s to %s.",
+            existing_fieldnames,
+            self.CSV_FIELDNAMES,
+        )
+
     @staticmethod
     def _camera_name_from_side(side: str) -> str:
-        side_norm = side.strip().lower()
-        if side_norm not in {"center", "left", "right"}:
-            raise ValueError(f"Invalid camera side '{side}'. Expected center/left/right.")
-        return side_norm
+        return normalize_camera_side(side)
+
+    def get_synchronized_data(self, frame_id: int) -> Optional[Dict[str, Any]]:
+        self._drain_sensor_queue()
+        return build_synchronized_data(
+            frame_id=frame_id,
+            pending_images=self._pending_images,
+            pending_states=self._pending_states,
+        )
 
     def make_sensor_callback(self, camera_side: str):
         camera_name = self._camera_name_from_side(camera_side)
@@ -126,6 +179,9 @@ class DataCollector:
         brake: float,
         speed_kmh: float,
         command: int = 0,
+        pitch: float = 0.0,
+        roll: float = 0.0,
+        yaw: float = 0.0,
     ) -> None:
         if not self.enabled:
             return
@@ -139,6 +195,9 @@ class DataCollector:
             "brake": float(brake),
             "speed": float(speed_kmh),
             "command": int(command),
+            "pitch": float(pitch),
+            "roll": float(roll),
+            "yaw": float(yaw),
         }
         self._finalize_ready_frames(max_frame_id=frame_id)
         self._cleanup_old_frames(current_frame_id=frame_id)
@@ -172,12 +231,12 @@ class DataCollector:
         cv2.imwrite(str(image_path), bgr, self._encode_params)
 
     def _try_finalize_frame(self, frame_id: int) -> None:
-        images = self._pending_images.get(frame_id)
-        state = self._pending_states.get(frame_id)
-        if images is None or state is None:
+        synchronized = self.get_synchronized_data(frame_id)
+        if synchronized is None:
             return
-        if not all(side in images for side in ("center", "left", "right")):
-            return
+
+        images = synchronized["images"]
+        state = synchronized["state"]
 
         # Save only configured sampling rate; still consume complete triplets for skipped frames.
         if frame_id % self.save_every_n != 0:
@@ -204,6 +263,9 @@ class DataCollector:
                 "brake": round(float(state["brake"]), 4),
                 "speed": round(float(state["speed"]), 3),
                 "command": int(state["command"]),
+                "pitch": round(float(state["pitch"]), 5),
+                "roll": round(float(state["roll"]), 5),
+                "yaw": round(float(state["yaw"]), 5),
             }
         )
         self._saved_frames += 1

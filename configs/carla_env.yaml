@@ -7,7 +7,7 @@
   fixed_delta: 0.05
   no_rendering: false
 
-  map: "Town04"
+  map: "Town06"
 
 
 vehicle:
@@ -38,8 +38,8 @@ traffic_spawn:
   npc_enable_autopilot: true
 
 recording:
-  enabled: yes
+  enabled: false
   output_path: "outputs/2min_2.mp4"
   fps: 30.0
-  duration_sec: 120
+  duration_sec: 600
   codec: "mp4v"

@@ -40,7 +40,7 @@ class CarlaDataset(Dataset):
         ├── images_left/     (ảnh từ camera trái, steering + correction)
         └── images_right/    (ảnh từ camera phải, steering - correction)
 
-    File CSV phải có header: ``img_id, steering, throttle, brake, speed``.
+    File CSV phải có header: ``img_id, steering, throttle, brake, speed, command, pitch, roll, yaw``.
     ``img_id`` là tên file ảnh không có phần mở rộng, được pad thành 8 chữ số.
 
     Parameters
@@ -84,10 +84,7 @@ class CarlaDataset(Dataset):
         is_training : bool, optional
             Kích hoạt augmentation và dùng 3 camera.  Mặc định ``True``.
         """
-        self.data_df = pd.read_csv(
-            csv_file, header=0,
-            names=['img_id', 'steering', 'throttle', 'brake', 'speed', 'command']
-        )
+        self.data_df = pd.read_csv(csv_file)
         self.root_dir = root_dir
         self.transform = transform
         self.steering_correction = steering_correction

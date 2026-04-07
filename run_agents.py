@@ -128,7 +128,7 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def decode_carla_depth_to_meters(image) -> np.ndarray:
+def decode_carla_depth_to_meters(image) -> Any:
     """Decode CARLA depth camera BGRA buffer into meters."""
     raw = np.frombuffer(image.raw_data, dtype=np.uint8)
     bgra = raw.reshape((image.height, image.width, 4)).astype(np.float32)
@@ -138,7 +138,7 @@ def decode_carla_depth_to_meters(image) -> np.ndarray:
     return normalized * 1000.0
 
 
-def _camera_to_vehicle_rotation(camera_pitch_deg: float) -> np.ndarray:
+def _camera_to_vehicle_rotation(camera_pitch_deg: float) -> Any:
     pitch_rad = math.radians(-float(camera_pitch_deg))
     rot_y = np.array(
         [
@@ -160,7 +160,7 @@ def _camera_to_vehicle_rotation(camera_pitch_deg: float) -> np.ndarray:
 
 
 def _project_vehicle_to_image(
-    point_vehicle: np.ndarray,
+    point_vehicle: Any,
     frame_width: int,
     frame_height: int,
     camera_fov_deg: float,
@@ -191,7 +191,7 @@ def _project_vehicle_to_image(
 
 
 def _draw_curved_obstacle_path(
-    frame_bgr: np.ndarray,
+    frame_bgr: Any,
     debug_info: Dict[str, Any],
     camera_fov_deg: float,
     camera_mount_xyz: tuple[float, float, float] = (1.5, 0.0, 2.2),
@@ -904,6 +904,7 @@ class AutopilotAgent(BaseAgent):
             velocity = vehicle.get_velocity()
             speed_kmh = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2) * 3.6
             control = vehicle.get_control()
+            rotation = vehicle.get_transform().rotation
             frame_id = step_idx
             if world is not None:
                 frame_id = int(world.get_snapshot().frame)
@@ -915,6 +916,9 @@ class AutopilotAgent(BaseAgent):
                 brake=control.brake,
                 speed_kmh=speed_kmh,
                 command=command,
+                pitch=rotation.pitch,
+                roll=rotation.roll,
+                yaw=rotation.yaw,
             )
 
         if step_idx % 20 == 0:
@@ -1480,6 +1484,7 @@ class LaneFollowAgent(BaseAgent):
             frame_id = step_idx
             if self.session.world is not None:
                 frame_id = int(self.session.world.get_snapshot().frame)
+            rotation = self.session.ego_vehicle.get_transform().rotation
             self._collector.add_vehicle_state(
                 frame_id=frame_id,
                 steer=control.steer,
@@ -1487,6 +1492,9 @@ class LaneFollowAgent(BaseAgent):
                 brake=control.brake,
                 speed_kmh=speed_kmh,
                 command=0,
+                pitch=rotation.pitch,
+                roll=rotation.roll,
+                yaw=rotation.yaw,
             )
 
         if step_idx % 20 == 0:
