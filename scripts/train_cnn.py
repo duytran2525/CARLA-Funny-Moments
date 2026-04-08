@@ -17,6 +17,27 @@ def load_config(config_path):
     with open(config_path, 'r') as file:
         return yaml.safe_load(file)
 
+def collate_cil_batch(batch):
+    """
+    Custom collate_fn để fix dtype casting issue trong DataLoader.
+    
+    DataLoader mặc định collate bằng cách stack tất cả tensors cùng dtype,
+    gây ra casting nhầm (commands float32→cần long, steerings long→cần float32).
+    
+    __getitem__ trả về: (image, steering, speed, command)
+    
+    Returns:
+        (images, steerings, speeds, commands) với dtype chính xác
+    """
+    images, steerings, speeds, commands = zip(*batch)
+    
+    return (
+        torch.stack(images),                                    # float32
+        torch.stack(steerings).float(),                         # ← FORCE float32
+        torch.stack(speeds),                                    # float32
+        torch.stack(commands).long(),                           # ← FORCE long
+    )
+
 def main():
     ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     config = load_config(os.path.join(ROOT_DIR, 'configs', 'train_params.yaml'))
@@ -35,6 +56,15 @@ def main():
     print("Đang phân chia tập Train và Validation từ file CSV...")
     df = pd.read_csv(CSV_PATH)
     
+    # Xóa file CSV tạm cũ để tránh load lại steering đã bị normalize
+    train_csv_path = os.path.join(DATA_DIR, 'train_split_log.csv')
+    val_csv_path = os.path.join(DATA_DIR, 'val_split_log.csv')
+    if os.path.exists(train_csv_path):
+        os.remove(train_csv_path)
+        print(f"Xóa file cache cũ: {train_csv_path}")
+    if os.path.exists(val_csv_path):
+        os.remove(val_csv_path)
+        print(f"Xóa file cache cũ: {val_csv_path}")
     
     # Tính toán chỉ số chia (vd: 80% train, 20% val)
     train_split_ratio = config.get('train_split', 0.8)
@@ -43,9 +73,8 @@ def main():
     train_df = df.iloc[:split_idx]
     val_df = df.iloc[split_idx:]
     
-    # Lưu ra 2 file CSV tạm thời
-    train_csv_path = os.path.join(DATA_DIR, 'train_split_log.csv')
-    val_csv_path = os.path.join(DATA_DIR, 'val_split_log.csv')
+    # Lưu ra 2 file CSV tạm thời với steering GỐCTRANSLATION
+    print("Lưu CSV tạm thời cho train và val...")
     train_df.to_csv(train_csv_path, index=False)
     val_df.to_csv(val_csv_path, index=False)
 
@@ -67,8 +96,9 @@ def main():
     )
     
     # Đưa vào DataLoader (Đã gỡ bỏ lớp Subset gây lỗi)
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=2, pin_memory=True)
+    pin_mem = torch.cuda.is_available()
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=2, pin_memory=pin_mem, collate_fn=collate_cil_batch)
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=2, pin_memory=pin_mem, collate_fn=collate_cil_batch)
 
     model = NvidiaCNN().to(device)
     criterion = nn.MSELoss()
@@ -93,10 +123,10 @@ def main():
         model.train()
         running_loss = 0.0
         
-        for i, (images, speeds, commands, steerings) in enumerate(train_loader):
+        for i, (images, steerings, speeds, commands) in enumerate(train_loader):
             images = images.to(device, non_blocking=True)
-            speeds = speeds.to(device, non_blocking=True)
-            commands = commands.to(device, non_blocking=True).float()  # Convert Long to Float
+            speeds = speeds.to(device, non_blocking=True).float()  # Ensure float dtype
+            commands = commands.to(device, non_blocking=True)  # Keep as Long for indexing
             steerings = steerings.to(device, non_blocking=True)
             
             optimizer.zero_grad()
@@ -118,10 +148,10 @@ def main():
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for images, speeds, commands, steerings in val_loader:
+            for images, steerings, speeds, commands in val_loader:
                 images = images.to(device, non_blocking=True)
                 speeds = speeds.to(device, non_blocking=True)
-                commands = commands.to(device, non_blocking=True).float()  # Convert Long to Float
+                commands = commands.to(device, non_blocking=True)  # Keep as Long for indexing
                 steerings = steerings.to(device, non_blocking=True)
                 # Validation cũng có thể dùng autocast để đánh giá nhanh hơn
                 with torch.amp.autocast(device_type='cuda' if use_amp else 'cpu', enabled=use_amp):

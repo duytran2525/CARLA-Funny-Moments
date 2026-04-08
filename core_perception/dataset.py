@@ -109,8 +109,24 @@ class CarlaDataset(Dataset):
         ``_balance_steering_distribution()`` để cắt bớt mẫu đi thẳng.
         """
         print("Đang rà soát file ảnh từ 3 camera...")
+        
+        # BƯỚC 1: Đọc toàn bộ steering values để tính min/max
+        steerings = self.data_df['steering'].astype(float).values
+        steering_min = np.min(steerings)
+        steering_max = np.max(steerings)
+        steering_range = steering_max - steering_min
+        print(f"Steering range từ CSV: [{steering_min:.4f}, {steering_max:.4f}]")
+        
         for _, row in self.data_df.iterrows():
             steering = float(row['steering'])
+            
+            # NORMALIZE steering từ [steering_min, steering_max] → [-1, 1]
+            # Formula: normalized = 2 * (value - min) / range - 1
+            if steering_range > 0:
+                steering_normalized = 2.0 * (steering - steering_min) / steering_range - 1.0
+            else:
+                steering_normalized = 0.0
+            
             img_id_str = str(row['img_id']).strip()
             if '.' in img_id_str:
                 img_id_str = img_id_str.split('.')[0]  # Bỏ phần thập phân nếu có
@@ -127,9 +143,11 @@ class CarlaDataset(Dataset):
                     continue
                 img_path = os.path.join(self.root_dir, sub_dir, img_id)
                 if os.path.exists(img_path):
-                    self.samples.append((img_path, steering + correction))
+                    # Áp dụng steering_correction TRÊN steering đã normalize
+                    self.samples.append((img_path, steering_normalized + correction))
 
         print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
+        print(f"   Steering sau normalize nằm trong khoảng [-1, 1] (+ correction offset)")
         if self.is_training:
             self._balance_steering_distribution()
 
@@ -668,9 +686,23 @@ class CILCarlaDataset(CarlaDataset):
         # Use the raw df that already has 'speed' and 'command'
         source_df = self._raw_df if hasattr(self, '_raw_df') else self.data_df
 
+        # BƯỚC 1: Tính min/max steering để normalize
+        steerings = source_df['steering'].astype(float).values
+        steering_min = np.min(steerings)
+        steering_max = np.max(steerings)
+        steering_range = steering_max - steering_min
+        print(f"Steering range từ CSV: [{steering_min:.4f}, {steering_max:.4f}]")
+
         self.samples = []  # reset in case called a second time
         for _, row in source_df.iterrows():
             steering = float(row['steering'])
+            
+            # BƯỚC 2: Normalize steering từ [steering_min, steering_max] → [-1, 1]
+            if steering_range > 0:
+                steering_normalized = 2.0 * (steering - steering_min) / steering_range - 1.0
+            else:
+                steering_normalized = 0.0
+            
             speed_norm = float(row.get('speed', 0.0)) / self.MAX_SPEED_KMH
             command = int(row.get('command', 0))
 
@@ -691,10 +723,12 @@ class CILCarlaDataset(CarlaDataset):
                 img_path = os.path.join(self.root_dir, sub_dir, img_id)
                 if os.path.exists(img_path):
                     self.samples.append(
-                        (img_path, steering + correction, speed_norm, command)
+                        (img_path, steering_normalized + correction, speed_norm, command)
                     )
 
         print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
+        print(f"   Steering sau normalize nằm trong khoảng [-1, 1] (+ correction offset)")
+        
         if self.is_training:
             self._balance_steering_distribution()
 

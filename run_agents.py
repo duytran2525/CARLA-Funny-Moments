@@ -63,6 +63,7 @@ except Exception as exc:
 
 from core_control.carla_manager import CarlaManager, SpectatorConfig
 from core_control.collect_data import DataCollector
+from core_control.pid_manager import SpeedPIDController
 
 
 def ensure_navigation_agent_imports() -> None:
@@ -1029,6 +1030,12 @@ class LaneFollowAgent(BaseAgent):
         self._yolo_detector = None
         self._yolo_window_name = "Lane Follow + YOLO Detection"
         self._yolo_enabled = False
+        # Speed control (PID)
+        self._speed_controller = SpeedPIDController(
+            target_speed_kmh=config.target_speed_kmh,
+            max_throttle=config.max_throttle,
+            max_brake=config.max_brake,
+        )
 
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
@@ -1289,13 +1296,9 @@ class LaneFollowAgent(BaseAgent):
         return speed_mps * 3.6
 
     def _longitudinal_control(self, speed_kmh: float) -> tuple[float, float]:
-        error = self.config.target_speed_kmh - speed_kmh
-        if error >= 0.0:
-            throttle = clamp(0.20 + 0.02 * error, 0.05, self.config.max_throttle)
-            brake = 0.0
-        else:
-            throttle = 0.0
-            brake = clamp((-error) / 20.0, 0.0, self.config.max_brake)
+        """Compute throttle and brake using PID controller."""
+        self._speed_controller.set_target_speed(self.config.target_speed_kmh)
+        throttle, brake = self._speed_controller.compute(speed_kmh)
         return throttle, brake
 
     def _run_yolo_detection(
@@ -1614,6 +1617,12 @@ class CILAgent(BaseAgent):
         self._stop_requested = False
         self._nav_agent = None
         self._spawn_points = []
+        # Speed control (PID)
+        self._speed_controller = SpeedPIDController(
+            target_speed_kmh=config.target_speed_kmh,
+            max_throttle=config.max_throttle,
+            max_brake=config.max_brake,
+        )
 
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
@@ -1875,13 +1884,9 @@ class CILAgent(BaseAgent):
         return speed_mps * 3.6
 
     def _longitudinal_control(self, speed_kmh: float) -> tuple[float, float]:
-        error = self.config.target_speed_kmh - speed_kmh
-        if error >= 0.0:
-            throttle = clamp(0.20 + 0.02 * error, 0.05, self.config.max_throttle)
-            brake = 0.0
-        else:
-            throttle = 0.0
-            brake = clamp((-error) / 20.0, 0.0, self.config.max_brake)
+        """Compute throttle and brake using PID controller."""
+        self._speed_controller.set_target_speed(self.config.target_speed_kmh)
+        throttle, brake = self._speed_controller.compute(speed_kmh)
         return throttle, brake
 
     def _predict_cil_steering(self, rgb_frame, speed_kmh: float, command: int) -> float:
