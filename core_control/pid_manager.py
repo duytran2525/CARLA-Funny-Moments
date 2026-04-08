@@ -142,19 +142,25 @@ class SpeedPIDController:
         """
         Clean throttle state when switching from throttle to brake.
         PRE-CLEAN: Called BEFORE mode change to prevent state contamination.
+        
+        NOTE: We preserve self.prev_error to maintain continuous velocity history.
+        Resetting prev_error would cause a false spike in the derivative term
+        when the mode switches, creating unnatural jerking behavior.
         """
         self.integral_t = 0.0
         self.prev_derivative = 0.0
-        self.prev_error = 0.0
     
     def _clean_brake_state(self) -> None:
         """
         Clean brake state when switching from brake to throttle.
         PRE-CLEAN: Called BEFORE mode change to prevent state contamination.
+        
+        NOTE: We preserve self.prev_error to maintain continuous velocity history.
+        Resetting prev_error would cause a false spike in the derivative term
+        when the mode switches, creating unnatural jerking behavior.
         """
         self.integral_b = 0.0
         self.prev_derivative = 0.0
-        self.prev_error = 0.0
     
     def _apply_integral_decay(self, error: float) -> None:
         """
