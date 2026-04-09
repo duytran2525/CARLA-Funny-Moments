@@ -1617,6 +1617,8 @@ class CILAgent(BaseAgent):
         self._stop_requested = False
         self._nav_agent = None
         self._spawn_points = []
+        self._heuristic_junction_id: Optional[int] = None
+        self._heuristic_junction_command = 0
         # Speed control (PID)
         self._speed_controller = SpeedPIDController(
             target_speed_kmh=config.target_speed_kmh,
@@ -1671,7 +1673,84 @@ class CILAgent(BaseAgent):
             logging.info("CIL navigation planner initialized: %s", self.config.nav_agent_type)
         except Exception as exc:
             self._nav_agent = None
-            logging.warning("CIL route planner unavailable, fallback command=0. Reason: %s", exc)
+            logging.warning(
+                "CIL route planner unavailable, using map-based heuristic commands. Reason: %s",
+                exc,
+            )
+
+    def _extract_heuristic_command(self) -> int:
+        if self.session is None or self.session.world is None or self.session.ego_vehicle is None:
+            return 0
+
+        vehicle = self.session.ego_vehicle
+        world = self.session.world
+        waypoint = world.get_map().get_waypoint(vehicle.get_location(), project_to_road=True)
+        if waypoint is None:
+            self._heuristic_junction_id = None
+            self._heuristic_junction_command = 0
+            return 0
+
+        if not waypoint.is_junction:
+            self._heuristic_junction_id = None
+            self._heuristic_junction_command = 0
+            return 0
+
+        junction = waypoint.get_junction() if hasattr(waypoint, "get_junction") else None
+        junction_id = int(junction.id) if junction is not None else None
+        if (
+            junction_id is not None
+            and self._heuristic_junction_id == junction_id
+            and self._heuristic_junction_command in (1, 2, 3)
+        ):
+            return self._heuristic_junction_command
+
+        vehicle_loc = vehicle.get_location()
+        forward_vec = vehicle.get_transform().get_forward_vector()
+        next_waypoints = waypoint.next(6.0)
+        if not next_waypoints:
+            chosen_command = 3
+        else:
+            candidates: list[tuple[float, int]] = []
+            for next_wp in next_waypoints:
+                dx = float(next_wp.transform.location.x - vehicle_loc.x)
+                dy = float(next_wp.transform.location.y - vehicle_loc.y)
+                norm = math.hypot(dx, dy)
+                if norm <= 1e-4:
+                    continue
+
+                dir_x = dx / norm
+                dir_y = dy / norm
+                dot = clamp(float(forward_vec.x) * dir_x + float(forward_vec.y) * dir_y, -1.0, 1.0)
+                cross_z = float(forward_vec.x) * dir_y - float(forward_vec.y) * dir_x
+                angle_deg = math.degrees(math.atan2(cross_z, dot))
+
+                if angle_deg > 15.0:
+                    cmd = 1  # left
+                elif angle_deg < -15.0:
+                    cmd = 2  # right
+                else:
+                    cmd = 3  # straight in junction
+                candidates.append((abs(angle_deg), cmd))
+
+            if not candidates:
+                chosen_command = 3
+            else:
+                prefer_cmd = 0
+                if self._last_steer <= -0.05:
+                    prefer_cmd = 1
+                elif self._last_steer >= 0.05:
+                    prefer_cmd = 2
+
+                if prefer_cmd and any(cmd == prefer_cmd for _, cmd in candidates):
+                    chosen_command = prefer_cmd
+                elif any(cmd == 3 for _, cmd in candidates):
+                    chosen_command = 3
+                else:
+                    chosen_command = min(candidates, key=lambda item: item[0])[1]
+
+        self._heuristic_junction_id = junction_id
+        self._heuristic_junction_command = chosen_command
+        return chosen_command
 
     def _set_new_destination(self, vehicle) -> None:
         if not self._spawn_points or self._nav_agent is None:
@@ -1688,7 +1767,7 @@ class CILAgent(BaseAgent):
 
     def _extract_current_command(self) -> int:
         if self._nav_agent is None:
-            return 0
+            return self._extract_heuristic_command()
         planner = None
         if hasattr(self._nav_agent, "get_local_planner"):
             planner = self._nav_agent.get_local_planner()
