@@ -11,8 +11,8 @@ augmentation_prob: 0.5
 train_split: 0.8        
 
 #learning rate scheduler
-lr_patience: 3
+lr_patience: 5
 lr_factor: 0.5
 
 #early stopping
-early_stopping_patience: 5
+early_stopping_patience: 15
