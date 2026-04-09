@@ -1767,7 +1767,9 @@ class CILAgent(BaseAgent):
 
     def _extract_current_command(self) -> int:
         if self._nav_agent is None:
-            return self._extract_heuristic_command()
+            # Route-planner-only mode: disable heuristic fallback once planner is stable.
+            # return self._extract_heuristic_command()
+            return 0
         planner = None
         if hasattr(self._nav_agent, "get_local_planner"):
             planner = self._nav_agent.get_local_planner()
