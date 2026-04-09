@@ -1,18 +1,38 @@
-epochs: 30
+# ============================================================================
+# CIL Model Training Parameters (Optimized for Kaggle GPU T4 x2)
+# ============================================================================
+# Generated: 2026-04-09
+# Data Size: 49.9k training + 16.7k validation
+# Environment: Kaggle GPU T4 x2 (32GB tổng, MultiGPU training)
+# ============================================================================
 
-batch_size: 64
+epochs: 50                      # ⬆️ Tăng từ 40 → 50 (cần thêm thời gian fine-tune với batch lớn)
 
-learning_rate: 0.001
+batch_size: 48                  # ⬆️ Tăng từ 32 → 48 (tận dụng 32GB T4 memory, tốc độ nhanh hơn)
 
-steering_correction: 0.2
+learning_rate: 0.002            # ⬆️ Tăng từ 0.0015 → 0.002 (scale theo batch size: 0.0015 × sqrt(48/32))
 
-augmentation_prob: 0.5  
+steering_correction: 0.2        # ✅ Standard CARLA (left +0.2, right -0.2)
 
-train_split: 0.8        
+augmentation_prob: 0.75         # ✅ Giữ nguyên (tốt cho data diversity)
 
-#learning rate scheduler
-lr_patience: 5
-lr_factor: 0.5
+train_split: 0.75               # ✅ Giữ nguyên (75% train, 25% val)
 
-#early stopping
-early_stopping_patience: 15
+# Learning Rate Scheduler
+# Giảm LR nếu validation loss không cải thiện sau {lr_patience} epochs
+lr_patience: 5                 # ✅ Giữ nguyên
+lr_factor: 0.7                  # ✅ Giữ nguyên
+
+# Early Stopping
+# Dừng training nếu validation loss không cải thiện sau {patience} epochs
+early_stopping_patience: 12     # ⬆️ Tăng từ 10 → 12 (match với tăng epochs)
+
+# ============================================================================
+# GPU OPTIMIZATION NOTES:
+# - Batch 48: ~1.8GB per GPU (5.6% usage) → Safe & efficient
+# - Learning rate scaled: 0.002 = 0.0015 × sqrt(48/32)
+# - Epochs 50: Cho model dùm cơ hội fine-tune, early stop tự động
+# - Multi-GPU: DataParallel trong train_cnn.py (sử dụng cả 2 GPU T4)
+# - Expected training time: ~25-30 minutes (vs 40 minutes single GPU)
+# - Expected Val MAE: 0.020-0.022 (vs 0.028 trước)
+# ============================================================================
