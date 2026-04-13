@@ -1,0 +1,19 @@
+# Core deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Object detection (YOLOv11)
+ultralytics>=8.0.0
+
+# Computer vision
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# Data handling & config
+pandas>=2.0.0
+PyYAML>=6.0
+
+# Training utilities
+tqdm>=4.65.0
+matplotlib>=3.7.0
