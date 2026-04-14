@@ -107,25 +107,21 @@ class CarlaDataset(Dataset):
 
         Sau khi duyệt xong, nếu là tập huấn luyện thì gọi
         ``_balance_steering_distribution()`` để cắt bớt mẫu đi thẳng.
+        
+        FIX (2026-04-14): Sử dụng SYMMETRIC SCALING thay vì data-dependent min-max.
+        - Giải quyết: Train/Val inconsistency (Issue #1)
+        - Giải quyết: Zero point loss (Issue #3)  
+        - Giải quyết: Clipping data loss (Issue #2)
         """
         print("Đang rà soát file ảnh từ 3 camera...")
         
-        # BƯỚC 1: Đọc toàn bộ steering values để tính min/max
-        steerings = self.data_df['steering'].astype(float).values
-        steering_min = np.min(steerings)
-        steering_max = np.max(steerings)
-        steering_range = steering_max - steering_min
-        print(f"Steering range từ CSV: [{steering_min:.4f}, {steering_max:.4f}]")
+        # ✅ SỬ DỤNG HẰNG SỐ VẬT LÝ (SYMMETRIC SCALING)
+        # CARLA max steering angle (physical constant, không phụ thuộc dữ liệu)
+        # Đảm bảo consistency giữa train/val/deploy
+        MAX_STEER = 1.0
         
         for _, row in self.data_df.iterrows():
             steering = float(row['steering'])
-            
-            # NORMALIZE steering từ [steering_min, steering_max] → [-1, 1]
-            # Formula: normalized = 2 * (value - min) / range - 1
-            if steering_range > 0:
-                steering_normalized = 2.0 * (steering - steering_min) / steering_range - 1.0
-            else:
-                steering_normalized = 0.0
             
             img_id_str = str(row['img_id']).strip()
             if '.' in img_id_str:
@@ -133,7 +129,7 @@ class CarlaDataset(Dataset):
             img_id = img_id_str.zfill(8) + '.jpg'
 
             configs = [
-                ('images_center', 0),
+                ('images_center', 0.0),
                 ('images_left',  self.steering_correction),
                 ('images_right', -self.steering_correction),
             ]
@@ -143,11 +139,15 @@ class CarlaDataset(Dataset):
                     continue
                 img_path = os.path.join(self.root_dir, sub_dir, img_id)
                 if os.path.exists(img_path):
-                    # Áp dụng steering_correction TRÊN steering đã normalize
-                    self.samples.append((img_path, steering_normalized + correction))
+                    # ✅ Áp correction TRƯỚC chuẩn hóa để tránh xén dữ liệu
+                    # Sau đó normalize bằng hằng số cố định (không phụ thuộc data)
+                    steering_with_correction = steering + correction
+                    steering_normalized = steering_with_correction / MAX_STEER
+                    self.samples.append((img_path, steering_normalized))
 
         print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
-        print(f"   Steering sau normalize nằm trong khoảng [-1, 1] (+ correction offset)")
+        print(f"   Steering được chuẩn hóa bằng: MAX_STEER = {MAX_STEER} (symmetric scaling)")
+        print(f"   Zero point được bảo toàn: 0 / {MAX_STEER} = 0 ✓")
         if self.is_training:
             self._balance_steering_distribution()
 
@@ -686,23 +686,14 @@ class CILCarlaDataset(CarlaDataset):
         # Use the raw df that already has 'speed' and 'command'
         source_df = self._raw_df if hasattr(self, '_raw_df') else self.data_df
 
-        # BƯỚC 1: Tính min/max steering để normalize
-        steerings = source_df['steering'].astype(float).values
-        steering_min = np.min(steerings)
-        steering_max = np.max(steerings)
-        steering_range = steering_max - steering_min
-        print(f"Steering range từ CSV: [{steering_min:.4f}, {steering_max:.4f}]")
+        # ✅ SỬ DỤNG HẰNG SỐ VẬT LÝ (SYMMETRIC SCALING)
+        # CARLA max steering angle (physical constant, không phụ thuộc dữ liệu)
+        # Đảm bảo consistency giữa train/val/deploy (FIX 2026-04-14)
+        MAX_STEER = 1.0
 
         self.samples = []  # reset in case called a second time
         for _, row in source_df.iterrows():
             steering = float(row['steering'])
-            
-            # BƯỚC 2: Normalize steering từ [steering_min, steering_max] → [-1, 1]
-            if steering_range > 0:
-                steering_normalized = 2.0 * (steering - steering_min) / steering_range - 1.0
-            else:
-                steering_normalized = 0.0
-            
             speed_norm = float(row.get('speed', 0.0)) / self.MAX_SPEED_KMH
             command = int(row.get('command', 0))
 
@@ -712,7 +703,7 @@ class CILCarlaDataset(CarlaDataset):
             img_id = img_id_str.zfill(8) + '.jpg'
 
             configs = [
-                ('images_center', 0),
+                ('images_center', 0.0),
                 ('images_left',  self.steering_correction),
                 ('images_right', -self.steering_correction),
             ]
@@ -722,12 +713,17 @@ class CILCarlaDataset(CarlaDataset):
                     continue
                 img_path = os.path.join(self.root_dir, sub_dir, img_id)
                 if os.path.exists(img_path):
+                    # ✅ Áp correction TRƯỚC chuẩn hóa để tránh xén dữ liệu
+                    # Sau đó normalize bằng hằng số cố định (không phụ thuộc data)
+                    steering_with_correction = steering + correction
+                    steering_normalized = steering_with_correction / MAX_STEER
                     self.samples.append(
-                        (img_path, steering_normalized + correction, speed_norm, command)
+                        (img_path, steering_normalized, speed_norm, command)
                     )
 
         print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
-        print(f"   Steering sau normalize nằm trong khoảng [-1, 1] (+ correction offset)")
+        print(f"   Steering được chuẩn hóa bằng: MAX_STEER = {MAX_STEER} (symmetric scaling)")
+        print(f"   Zero point được bảo toàn: 0 / {MAX_STEER} = 0 ✓")
         
         if self.is_training:
             self._balance_steering_distribution()
