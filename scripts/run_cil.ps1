@@ -1,7 +1,7 @@
 param(
     [string]$CarlaRoot = "E:\Carla",
     [string]$Config = "configs/carla_env.yaml",
-    [string]$Model = "models/cnn_steering Train Loss 0.0096 Val Loss 0.0085.pth",
+    [string]$Model = "D:\AI\CARLA-Funny-Moments\models\cnn_steering Train Loss 0.0074 Val Loss 0.0151.pth",
     [double]$TargetSpeedKmh = 40,
     [double]$MaxThrottle = 0.85,
     [double]$MaxBrake = 0.80,
