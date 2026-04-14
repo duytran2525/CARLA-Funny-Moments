@@ -1674,7 +1674,7 @@ class CILAgent(BaseAgent):
         except Exception as exc:
             self._nav_agent = None
             logging.warning(
-                "CIL route planner unavailable, using map-based heuristic commands. Reason: %s",
+                "CIL route planner unavailable, heuristic fallback disabled (planner-only mode, command=0). Reason: %s",
                 exc,
             )
 
