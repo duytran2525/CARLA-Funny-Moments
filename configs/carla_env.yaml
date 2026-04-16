@@ -31,6 +31,14 @@ camera:
 weather:
   preset: "ClearNoon"
 
+cil:
+  soft_weight_smoothing: 0.68
+  route_lookahead_m: 11.0
+  hybrid_lateral: true
+  residual_steer_gain: 0.24
+  pure_pursuit_wheelbase_m: 2.8
+  pure_pursuit_max_steer_deg: 28.0
+
 traffic_spawn:
   vehicle_count: 0
   bike_count: 0
