@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -62,8 +63,16 @@ class YoloDetector:
         self.camera_pitch_deg = float(camera_pitch_deg)
         self.camera_roll_deg = float(camera_roll_deg)
 
+        model_ext = os.path.splitext(model_path)[1].lower()
+        self._is_exported_model = model_ext in {".engine", ".onnx", ".openvino", ".xml", ".tflite"}
+
+        if model_ext == ".engine":
+            self._ensure_tensorrt_module_alias()
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = YOLO(model_path).to(self.device)
+        self.model = YOLO(model_path, task="detect")
+        if not self._is_exported_model:
+            self.model = self.model.to(self.device)
         self.class_names = self.model.names
 
         self.display_classes = set(
@@ -91,6 +100,24 @@ class YoloDetector:
         self._spatial: Optional[DynamicIPM] = None
         self._spatial_resolution: Optional[Tuple[int, int]] = None
         self._last_debug_info: Dict[str, Any] = {}
+
+    @staticmethod
+    def _ensure_tensorrt_module_alias() -> None:
+        """Map tensorrt_bindings to tensorrt when NVIDIA meta package is unavailable."""
+        try:
+            import tensorrt  # type: ignore  # noqa: F401
+            return
+        except Exception:
+            pass
+
+        try:
+            import tensorrt_bindings as trt  # type: ignore
+
+            if "tensorrt" not in sys.modules:
+                sys.modules["tensorrt"] = trt
+        except Exception:
+            # Keep default import behavior; Ultralytics will raise a clear error if TRT is unavailable.
+            pass
 
     @staticmethod
     def _normalize_class_name(class_name: Any) -> str:
@@ -132,7 +159,16 @@ class YoloDetector:
 
     def detect(self, raw_image: np.ndarray) -> List[Dict[str, Any]]:
         image_bgr = self._prepare_bgr(raw_image)
-        results = self.model(image_bgr, conf=self.conf_threshold, verbose=False)
+        if self._is_exported_model:
+            infer_device: Any = 0 if torch.cuda.is_available() else "cpu"
+            results = self.model.predict(
+                source=image_bgr,
+                conf=self.conf_threshold,
+                verbose=False,
+                device=infer_device,
+            )
+        else:
+            results = self.model(image_bgr, conf=self.conf_threshold, verbose=False)
         detections: List[Dict[str, Any]] = []
 
         if len(results) == 0:
@@ -251,7 +287,7 @@ class YoloDetector:
         speed_kmh: Optional[float] = None,
         imu_pitch_deg: float = 0.0,
         imu_roll_deg: float = 0.0,
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], bool]:
         _ = (distance_threshold, depth_map_m, vehicle_steer)
         pipeline = self.process_frame(
             raw_image=raw_image,
@@ -299,7 +335,9 @@ class YoloDetector:
             },
             "pipeline_timestamp": float(pipeline["timestamp"]),
         }
-        return processed
+        # Emergency-stop policy was intentionally removed in this module.
+        is_emergency = False
+        return processed, is_emergency
 
     def get_last_debug_info(self) -> Dict[str, Any]:
         return self._last_debug_info

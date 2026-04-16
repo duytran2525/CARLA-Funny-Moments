@@ -5,12 +5,34 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional, TYPE_CHECKING
 
 try:
     import carla  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     carla = None
+
+
+if TYPE_CHECKING:
+    import carla as carla_api
+
+    CarlaClient = carla_api.Client
+    CarlaWorld = carla_api.World
+    CarlaTrafficManager = carla_api.TrafficManager
+    CarlaVehicle = carla_api.Vehicle
+    CarlaWorldSettings = carla_api.WorldSettings
+    CarlaTransform = carla_api.Transform
+    CarlaActor = carla_api.Actor
+    CarlaActorBlueprint = carla_api.ActorBlueprint
+else:
+    CarlaClient = Any
+    CarlaWorld = Any
+    CarlaTrafficManager = Any
+    CarlaVehicle = Any
+    CarlaWorldSettings = Any
+    CarlaTransform = Any
+    CarlaActor = Any
+    CarlaActorBlueprint = Any
 
 
 def map_basename(name: str) -> str:
@@ -65,15 +87,15 @@ class CarlaManager:
         self.npc_pedestrian_count = max(0, npc_pedestrian_count)
         self.npc_enable_autopilot = npc_enable_autopilot
 
-        self.client: Optional[carla.Client] = None
-        self.world: Optional[carla.World] = None
-        self.tm: Optional[carla.TrafficManager] = None
-        self.ego_vehicle: Optional[carla.Vehicle] = None
-        self._original_settings: Optional[carla.WorldSettings] = None
-        self._spawn_transform: Optional[carla.Transform] = None
-        self._npc_actors: List[carla.Actor] = []
-        self._walker_actors: List[carla.Actor] = []
-        self._walker_controllers: List[carla.Actor] = []
+        self.client: Optional[CarlaClient] = None
+        self.world: Optional[CarlaWorld] = None
+        self.tm: Optional[CarlaTrafficManager] = None
+        self.ego_vehicle: Optional[CarlaVehicle] = None
+        self._original_settings: Optional[CarlaWorldSettings] = None
+        self._spawn_transform: Optional[CarlaTransform] = None
+        self._npc_actors: List[CarlaActor] = []
+        self._walker_actors: List[CarlaActor] = []
+        self._walker_controllers: List[CarlaActor] = []
 
     def _retry_rpc_call(
         self,
@@ -236,7 +258,7 @@ class CarlaManager:
         )
 
     @staticmethod
-    def _wheel_count(bp: carla.ActorBlueprint) -> int:
+    def _wheel_count(bp: CarlaActorBlueprint) -> int:
         if bp.has_attribute("number_of_wheels"):
             try:
                 return int(bp.get_attribute("number_of_wheels").as_int())
@@ -247,7 +269,7 @@ class CarlaManager:
         return 4
 
     @staticmethod
-    def _is_motorbike(bp: carla.ActorBlueprint) -> bool:
+    def _is_motorbike(bp: CarlaActorBlueprint) -> bool:
         bp_id = bp.id.lower()
         motor_keywords = (
             "harley",
@@ -261,7 +283,7 @@ class CarlaManager:
         return CarlaManager._wheel_count(bp) == 2 and any(k in bp_id for k in motor_keywords)
 
     @staticmethod
-    def _is_bike(bp: carla.ActorBlueprint) -> bool:
+    def _is_bike(bp: CarlaActorBlueprint) -> bool:
         bp_id = bp.id.lower()
         bike_keywords = (
             "bike",
@@ -276,13 +298,13 @@ class CarlaManager:
         return CarlaManager._wheel_count(bp) == 2 and any(k in bp_id for k in bike_keywords)
 
     @staticmethod
-    def _is_car(bp: carla.ActorBlueprint) -> bool:
+    def _is_car(bp: CarlaActorBlueprint) -> bool:
         return CarlaManager._wheel_count(bp) >= 4
 
     def _spawn_npc_group(
         self,
         label: str,
-        blueprints: List[carla.ActorBlueprint],
+        blueprints: List[CarlaActorBlueprint],
         desired_count: int,
     ) -> int:
         if desired_count <= 0:
@@ -428,7 +450,7 @@ class CarlaManager:
             traffic_signs,
         )
 
-    def _spawn_spectator_transform(self) -> Optional[carla.Transform]:
+    def _spawn_spectator_transform(self) -> Optional[CarlaTransform]:
         if self._spawn_transform is None:
             return None
 

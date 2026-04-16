@@ -7,13 +7,13 @@
   fixed_delta: 0.05
   no_rendering: false
 
-  map: "Town04"
+  map: "Town03"
 
 
 vehicle:
   filter: "vehicle.tesla.model3"
   spawn_point: 1
-  destination_point: -1
+  destination_point: 15
   role_name: "hero"
 
 spectator:
