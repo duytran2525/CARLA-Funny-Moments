@@ -10,9 +10,10 @@
   map: "Town03"
 
 
+
 vehicle:
   filter: "vehicle.tesla.model3"
-  spawn_point: 1
+  spawn_point: 3
   destination_point: 15
   role_name: "hero"
 
@@ -38,6 +39,9 @@ cil:
   residual_steer_gain: 0.24
   pure_pursuit_wheelbase_m: 2.8
   pure_pursuit_max_steer_deg: 28.0
+
+yolo:
+  disable_autopilot_red_light: true
 
 traffic_spawn:
   vehicle_count: 0
