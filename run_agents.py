@@ -3845,10 +3845,21 @@ class YoloDetectAgent(BaseAgent):
             else:
                 color = (0, 255, 0)
 
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(annotated_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            bx1, by1, bx2, by2 = int(x1), int(y1), int(x2), int(y2)
+            cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), color, 2)
+            cv2.putText(annotated_frame, label, (bx1, by1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # Đánh dấu điểm chạm đất (Bottom Center) để trực quan hóa logic lọc đa giác Bước 1
+            cv2.circle(annotated_frame, (int((bx1 + bx2) / 2), by2), 5, color, -1)
 
         sup_debug = self._last_supervisor_debug_info or {}
+
+        # Vẽ Đa Giác Vùng Nguy Hiểm (Danger Polygon) từ Traffic Supervisor
+        danger_polygon = sup_debug.get('danger_polygon')
+        if danger_polygon is not None and len(danger_polygon) >= 3:
+            cv2.polylines(annotated_frame, [danger_polygon], True, (0, 255, 255), 2)
+            cv2.putText(annotated_frame, "Traffic Supervisor Zone", (int(danger_polygon[0][0]), int(danger_polygon[0][1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
         if supervisor_brake > 0.0:
             status_text = f"SUPERVISOR BRAKE {supervisor_brake:.2f} ({supervisor_reason})"
             status_color = (0, 0, 255)

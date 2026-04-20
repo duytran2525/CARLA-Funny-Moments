@@ -300,4 +300,3 @@ class KalmanObjectTracker:
 
 # Compatibility alias for old references.
 OCSortTracker = KalmanObjectTracker
-
