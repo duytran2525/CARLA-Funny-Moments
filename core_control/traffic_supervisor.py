@@ -191,6 +191,7 @@ class TrafficSupervisor:
         self._last_acc_urgency = 0.0
         self._last_ttc_urgency = float('-inf')
         self._last_selected_target_type = None
+        self.last_danger_polygon = None
         
         # ─────────────────────────────────────────────────────────
         # DEBUG INFO
@@ -259,18 +260,27 @@ class TrafficSupervisor:
             return None
     
     def _build_obstacle_danger_polygon(self,
-                       image_shape: Optional[Tuple] = None
+                       image_shape: Optional[Tuple] = None,
+                       vehicle_steer: float = 0.0
                        ) -> Optional[np.ndarray]:
-      """Build trapezoid corridor ahead of ego vehicle in image space."""
+      """Tạo vùng hành lang hình thang, có thể đung đưa theo góc lái (vehicle_steer)"""
       if image_shape is None:
         image_shape = (480, 640, 3)
 
       h, w = image_shape[0], image_shape[1]
+      
+      # Tính toán độ lệch ngang (shift) dựa trên góc lái
+      # Giả sử ở full lock (steer = 1.0 hoặc -1.0), đỉnh đa giác sẽ lệch đi tối đa 35% màn hình
+      max_shift_ratio = 0.35
+      shift_x = int(vehicle_steer * w * max_shift_ratio)
+
+      # Horizon thường nằm dưới đường giữa ảnh một chút ở góc nhìn CARLA (khoảng 55% height)
+      # Đáy xe chiếm khoảng 50% chiều rộng màn hình thay vì 80% như cũ
       polygon = np.array([
-        [int(w * 0.10), int(h)],
-        [int(w * 0.35), int(h * 0.40)],
-        [int(w * 0.65), int(h * 0.40)],
-        [int(w * 0.90), int(h)]
+        [int(w * 0.25), int(h)],             # Đáy trái (hẹp lại)
+        [int(w * 0.42) + shift_x, int(h * 0.55)], # Đỉnh trái chân trời (đung đưa theo lái)
+        [int(w * 0.58) + shift_x, int(h * 0.55)], # Đỉnh phải chân trời (đung đưa theo lái)
+        [int(w * 0.75), int(h)]              # Đáy phải (hẹp lại)
       ], dtype=np.int32)
       return polygon
     
@@ -564,7 +574,8 @@ class TrafficSupervisor:
     def _parse_detections(self,
                detections: List[dict],
                image_shape: Optional[Tuple] = None,
-               dt: float = 0.033
+               dt: float = 0.033,
+               vehicle_steer: float = 0.0
                          ) -> Tuple[Optional[DetectionResult], 
                                    Optional[DetectionResult],
                                    Optional[List[DetectionResult]]]:
@@ -598,7 +609,8 @@ class TrafficSupervisor:
         red_light = None
         obstacle_candidates: List[DetectionResult] = []
         stop_lines = []
-        danger_polygon = self._build_obstacle_danger_polygon(image_shape)
+        danger_polygon = self._build_obstacle_danger_polygon(image_shape, vehicle_steer)
+        self.last_danger_polygon = danger_polygon
         
         for det in detections:
             class_name = det.get('class_name', '').lower()
@@ -1482,7 +1494,8 @@ class TrafficSupervisor:
         """
         # Layer 1: Parse + Zone classification + Zone locking
         # NEW: Now returns 3-tuple with stop_lines support
-        red_light, obstacle, stop_lines = self._parse_detections(detections, image_shape, dt)
+        steer_val = vehicle_steer if vehicle_steer is not None else 0.0
+        red_light, obstacle, stop_lines = self._parse_detections(detections, image_shape, dt, steer_val)
         
         # Update turn phase
         self._update_turn_phase(vehicle_steer)
