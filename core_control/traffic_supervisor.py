@@ -18,6 +18,7 @@ Architecture (6 Layers):
   6. State Management: Track vehicle state + green immunity timer
 """
 
+import math
 import numpy as np
 import cv2
 from collections import deque
@@ -261,27 +262,120 @@ class TrafficSupervisor:
     
     def _build_obstacle_danger_polygon(self,
                        image_shape: Optional[Tuple] = None,
-                       vehicle_steer: float = 0.0
+                       vehicle_steer: float = 0.0,
+                       vehicle_speed_kmh: float = 0.0
                        ) -> Optional[np.ndarray]:
-      """Tạo vùng hành lang hình thang, có thể đung đưa theo góc lái (vehicle_steer)"""
+      """
+      Tạo vùng hành lang hình thang CÓ BẼ CONG theo góc lái + curvature thực tế
+      
+      Cải tiến:
+      1. Tính toán curvature từ vehicle_steer + speed
+      2. Bẻ cong đa giác theo trajectory parabol (v² * curvature)
+      3. Trả về polygon đã bẻ cong chính xác
+      """
       if image_shape is None:
-        image_shape = (480, 640, 3)
+          image_shape = (480, 640, 3)
 
       h, w = image_shape[0], image_shape[1]
       
-      # Tính toán độ lệch ngang (shift) dựa trên góc lái
-      # Giả sử ở full lock (steer = 1.0 hoặc -1.0), đỉnh đa giác sẽ lệch đi tối đa 35% màn hình
-      max_shift_ratio = 0.35
-      shift_x = int(vehicle_steer * w * max_shift_ratio)
-
-      # Horizon thường nằm dưới đường giữa ảnh một chút ở góc nhìn CARLA (khoảng 55% height)
-      # Đáy xe chiếm khoảng 50% chiều rộng màn hình thay vì 80% như cũ
-      polygon = np.array([
-        [int(w * 0.25), int(h)],             # Đáy trái (hẹp lại)
-        [int(w * 0.42) + shift_x, int(h * 0.55)], # Đỉnh trái chân trời (đung đưa theo lái)
-        [int(w * 0.58) + shift_x, int(h * 0.55)], # Đỉnh phải chân trời (đung đưa theo lái)
-        [int(w * 0.75), int(h)]              # Đáy phải (hẹp lại)
-      ], dtype=np.int32)
+      # ─────────────────────────────────────────────────────────
+      # Bước 1: Tính Curvature từ Steering + Speed
+      # ─────────────────────────────────────────────────────────
+      # Công thức: curvature = tan(steer) / wheelbase
+      # wheelbase CARLA ≈ 2.7m, nhưng để đơn giản dùng hệ số tỉ lệ
+      wheelbase_m = 2.7
+      max_steer_angle_deg = 70.0
+      
+      # Chuyển steering (-1 to 1) thành góc lái thực tế (degrees)
+      steer_angle_deg = float(vehicle_steer) * max_steer_angle_deg
+      steer_angle_rad = math.radians(steer_angle_deg)
+      
+      # Curvature = tan(steer_angle) / wheelbase (1/meters)
+      if abs(steer_angle_rad) > 1e-4:
+        curvature_1pm = math.tan(steer_angle_rad) / wheelbase_m
+      else:
+        curvature_1pm = 0.0
+      
+      # Hạn chế curvature cực trị
+      curvature_1pm = np.clip(curvature_1pm, -0.15, 0.15)
+      
+      # ─────────────────────────────────────────────────────────
+      # Bước 2: Thiết lập Keyframe Points (theo Y - chiều rộng)
+      # ─────────────────────────────────────────────────────────
+      # Horizon thường ở ~55% của chiều cao
+      horizon_ratio = 0.55
+      bottom_v = int(h)
+      horizon_v = int(h * horizon_ratio)
+      
+      # Tham số hành lang (corridor)
+      corridor_bottom_width_ratio = 0.50  # 50% chiều rộng ở đáy
+      corridor_horizon_width_ratio = 0.15  # 15% chiều rộng ở chân trời
+      
+      # ─────────────────────────────────────────────────────────
+      # Bước 3: Xây dựng Polyline với Curvature
+      # ─────────────────────────────────────────────────────────
+      # Chúng ta sẽ sample nhiều điểm từ dưới lên (bottom → horizon)
+      sample_count = 40  # Số điểm sample để tạo đường cong mịn
+      
+      left_points: List[Tuple[int, int]] = []
+      center_points: List[Tuple[int, int]] = []
+      right_points: List[Tuple[int, int]] = []
+      
+      # v = từ bottom_v đến horizon_v (Y screen space)
+      # Tính toán x offset dựa trên curvature
+      v_values = np.linspace(bottom_v, horizon_v, sample_count, dtype=np.float32)
+      
+      for v in v_values:
+        # Khoảng cách từ camera mount về phía trước (meters)
+        # Với camera pitch = -8°, v → distance_forward (xấp xỉ)
+        # Normalize v từ [horizon_v, bottom_v] → [0, max_forward]
+        forward_distance = (1.0 - (v - horizon_v) / (bottom_v - horizon_v)) * 30.0  # 30m horizon
+        
+        # Tính lateral offset từ curvature
+        # x_lateral = 0.5 * curvature * forward_distance²
+        if abs(curvature_1pm) > 1e-6:
+          lateral_offset_m = 0.5 * curvature_1pm * (forward_distance ** 2)
+        else:
+          lateral_offset_m = 0.0
+        
+        # Chuyển lateral_offset (meters) thành pixel offset
+        # Focal length ≈ 800 pixels (với FOV 90°)
+        focal_length = 800.0
+        pixel_x_offset = lateral_offset_m * focal_length / max(forward_distance, 0.1)
+        
+        # Tính width của corridor ở vị trí này (linear interpolation)
+        ratio_forward = (forward_distance / 30.0)  # 0 at horizon, 1 at 30m
+        corridor_width = (
+          corridor_horizon_width_ratio * (1.0 - ratio_forward) +
+          corridor_bottom_width_ratio * ratio_forward
+        ) * w
+        
+        # Center point (chính giữa với offset curvature)
+        center_x = int(w / 2.0 + pixel_x_offset)
+        center_points.append((center_x, int(v)))
+        
+        # Left & Right points
+        half_width = corridor_width / 2.0
+        left_x = int(center_x - half_width)
+        right_x = int(center_x + half_width)
+        
+        left_points.append((left_x, int(v)))
+        right_points.append((right_x, int(v)))
+      
+      # ─────────────────────────────────────────────────────────
+      # Bước 4: Kết hợp Left + Right để tạo Polygon Kín
+      # ─────────────────────────────────────────────────────────
+      # Polygon = left_points + reversed(right_points)
+      polygon_points = left_points + list(reversed(right_points))
+      
+      if len(polygon_points) < 3:
+        return None
+      
+      polygon = np.array(polygon_points, dtype=np.int32)
+      
+      # Lưu trữ thông tin debug
+      self.last_danger_polygon = polygon
+      
       return polygon
     
     def _point_in_polygon(self, 
@@ -1456,7 +1550,8 @@ class TrafficSupervisor:
                image_shape: Optional[Tuple] = None,
                distance_threshold: Optional[float] = None,
                vehicle_steer: Optional[float] = None,
-               dt: float = 0.033
+               dt: float = 0.033,
+               danger_polygon: Optional[np.ndarray] = None
                ) -> float:
         """
         ┌─────────────────────────────────────────────────────────────┐
@@ -1492,9 +1587,17 @@ class TrafficSupervisor:
         Returns:
           - brake_force: 0.0 (no brake) → 1.0 (full brake)
         """
+    
+        if danger_polygon is not None:
+          self.last_danger_polygon = danger_polygon
+    
         # Layer 1: Parse + Zone classification + Zone locking
         # NEW: Now returns 3-tuple with stop_lines support
         steer_val = vehicle_steer if vehicle_steer is not None else 0.0
+        # 🔧 FIX: Build and store polygon trước parse
+        danger_polygon = self._build_obstacle_danger_polygon(image_shape, steer_val, current_speed)
+        self.last_danger_polygon = danger_polygon
+        
         red_light, obstacle, stop_lines = self._parse_detections(detections, image_shape, dt, steer_val)
         
         # Update turn phase
@@ -1603,6 +1706,9 @@ class TrafficSupervisor:
             'acc_urgency': round(self._last_acc_urgency, 3),
             'ttc_urgency': (None if self._last_ttc_urgency == float('-inf') else round(self._last_ttc_urgency, 3)),
             
+            'danger_polygon': self.last_danger_polygon,  # ← THÊM DÒNG NÀY
+            'danger_polygon_valid': self.last_danger_polygon is not None,
+
             # NEW (Layer 5): Brake force tracking
             'prev_brake_force': round(self._prev_brake_force, 3),
             

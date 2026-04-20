@@ -206,6 +206,83 @@ def _project_vehicle_to_image(
         return None
     return (int(round(u)), int(round(v)))
 
+def _draw_yellow_danger_corridor(
+    frame_bgr: Any,
+    debug_info: Dict[str, Any],
+    supervisor_debug: Dict[str, Any],
+) -> bool:
+    """
+    Vẽ Yellow Danger Corridor từ Traffic Supervisor
+    
+    Input:
+    - supervisor_debug: từ traffic_supervisor.get_debug_info()
+    - debug_info: từ yolo_detector.get_last_debug_info()
+    
+    Output:
+    - bool: True nếu vẽ thành công, False nếu không có polygon
+    """
+    if np is None or cv2 is None:
+        return False
+    
+    # Lấy polygon từ supervisor (ưu tiên)
+    danger_polygon = supervisor_debug.get("danger_polygon")
+    if danger_polygon is None or len(danger_polygon) < 3:
+        # Fallback: thử lấy từ YOLO debug info
+        obstacle_roi = debug_info.get("obstacle_danger_roi", {})
+        danger_polygon = obstacle_roi.get("polygon", [])
+        if not danger_polygon or len(danger_polygon) < 3:
+            return False
+    
+    # Vẽ polygon
+    try:
+        points = np.array(danger_polygon, dtype=np.int32).reshape((-1, 1, 2))
+        
+        # Màu vàng
+        corridor_color = (0, 255, 255)  # BGR: Yellow
+        
+        # Vẽ fill nhạt
+        overlay = frame_bgr.copy()
+        cv2.fillPoly(overlay, [points], (30, 200, 255))  # Fill màu cam nhạt
+        cv2.addWeighted(overlay, 0.25, frame_bgr, 0.75, 0.0, frame_bgr)
+        
+        # Vẽ edge đậm
+        cv2.polylines(frame_bgr, [points], True, corridor_color, 3)
+        
+        # Vẽ center line (trắng)
+        center_color = (255, 255, 255)
+        # Tính center points (trung bình của left + right)
+        center_indices = len(danger_polygon) // 2
+        center_pts = []
+        for i in range(center_indices):
+            left_idx = i
+            right_idx = len(danger_polygon) - 1 - i
+            if left_idx < len(danger_polygon) and right_idx >= 0:
+                center_x = (danger_polygon[left_idx][0] + danger_polygon[right_idx][0]) // 2
+                center_y = (danger_polygon[left_idx][1] + danger_polygon[right_idx][1]) // 2
+                center_pts.append([center_x, center_y])
+        
+        if len(center_pts) >= 2:
+            center_arr = np.array(center_pts, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(frame_bgr, [center_arr], False, center_color, 2)
+        
+        # Vẽ label
+        if len(danger_polygon) >= 2:
+            label_x = int(danger_polygon[0][0])
+            label_y = max(20, int(danger_polygon[0][1]) - 15)
+            cv2.putText(
+                frame_bgr,
+                "DANGER ZONE (Curved)",
+                (label_x, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                corridor_color,
+                2,
+            )
+        
+        return True
+    except Exception as exc:
+        logging.warning("Failed to draw yellow corridor: %s", exc)
+        return False
 
 def _draw_curved_obstacle_path(
     frame_bgr: Any,
@@ -3650,11 +3727,26 @@ class YoloDetectAgent(BaseAgent):
         return supervisor_inputs
 
     def run_step(self, step_idx: int) -> None:
+        """
+        Main detection & control loop for YOLO agent.
+        
+        Workflow:
+        1. Read frame + depth from camera
+        2. Run YOLO detection
+        3. Build danger_polygon from TrafficSupervisor
+        4. Compute supervisor brake signal
+        5. Apply control (nav_agent or TM autopilot)
+        6. Draw annotations including YELLOW CORRIDOR
+        7. Display & log
+        """
         if not self._enabled:
             if step_idx % 50 == 0:
                 logging.info("YOLO agent waiting for CARLA runtime.")
             return
 
+        # ─────────────────────────────────────────────────────────
+        # Step 1: Read Camera Frames
+        # ─────────────────────────────────────────────────────────
         frame, depth_map_m = self._read_latest_frame()
         if frame is None:
             if not self._waiting_frame_logged:
@@ -3662,9 +3754,13 @@ class YoloDetectAgent(BaseAgent):
                 self._waiting_frame_logged = True
             return
 
+        # ─────────────────────────────────────────────────────────
+        # Step 2: Get Vehicle State
+        # ─────────────────────────────────────────────────────────
         vehicle = self.session.ego_vehicle if self.session is not None else None
         current_steer = None
         speed_kmh = None
+        
         if vehicle is not None:
             try:
                 current_steer = float(vehicle.get_control().steer)
@@ -3676,6 +3772,9 @@ class YoloDetectAgent(BaseAgent):
             except Exception:
                 speed_kmh = None
 
+        # ─────────────────────────────────────────────────────────
+        # Step 3: Run YOLO Detection
+        # ─────────────────────────────────────────────────────────
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         detections, detector_emergency = self._detector.detect_and_evaluate(
             frame_bgr,
@@ -3688,10 +3787,15 @@ class YoloDetectAgent(BaseAgent):
         if hasattr(self._detector, "get_last_debug_info"):
             debug_info = self._detector.get_last_debug_info() or {}
 
+        # ─────────────────────────────────────────────────────────
+        # Step 4: Build Danger Polygon & Compute Supervisor Brake
+        # ─────────────────────────────────────────────────────────
         supervisor_brake = 0.0
         supervisor_state = "n/a"
         supervisor_reason = "n/a"
         hard_supervisor_emergency = False
+        sup_debug = {}
+        
         if self._traffic_supervisor is not None:
             now_ts = time.time()
             if self._last_control_ts is None:
@@ -3703,6 +3807,22 @@ class YoloDetectAgent(BaseAgent):
             self._last_control_ts = now_ts
 
             try:
+                # 🔧 BUILD DANGER POLYGON từ supervisor (CRITICAL!)
+                if current_steer is None:
+                    current_steer = 0.0
+                if speed_kmh is None:
+                    speed_kmh = 0.0
+                    
+                danger_polygon = self._traffic_supervisor._build_obstacle_danger_polygon(
+                    image_shape=frame_bgr.shape,
+                    vehicle_steer=float(current_steer),
+                    vehicle_speed_kmh=float(speed_kmh)
+                )
+                
+                # Store polygon để vẽ sau (cực kỳ quan trọng!)
+                self._traffic_supervisor.last_danger_polygon = danger_polygon
+                
+                # Compute supervisor brake signal
                 sup_dets = self._to_supervisor_detections(detections)
                 supervisor_brake = float(
                     self._traffic_supervisor.compute(
@@ -3712,20 +3832,27 @@ class YoloDetectAgent(BaseAgent):
                         distance_threshold=None,
                         vehicle_steer=current_steer,
                         dt=dt,
+                        danger_polygon=danger_polygon,
                     )
                 )
                 supervisor_brake = clamp(supervisor_brake, 0.0, 1.0)
-                self._last_supervisor_debug_info = self._traffic_supervisor.get_debug_info()
-                supervisor_state = str(self._last_supervisor_debug_info.get("state", "n/a"))
-                supervisor_reason = str(self._last_supervisor_debug_info.get("selected_target_type", "none"))
+                sup_debug = self._traffic_supervisor.get_debug_info()
+                self._last_supervisor_debug_info = sup_debug
+                supervisor_state = str(sup_debug.get("state", "n/a"))
+                supervisor_reason = str(sup_debug.get("selected_target_type", "none"))
                 hard_supervisor_emergency = supervisor_brake >= 0.95
+                
             except Exception as exc:
+                sup_debug = {}
                 self._last_supervisor_debug_info = {}
                 supervisor_brake = 0.0
                 logging.warning("TrafficSupervisor compute failed: %s", exc)
 
         is_emergency = bool(detector_emergency or hard_supervisor_emergency)
 
+        # ─────────────────────────────────────────────────────────
+        # Step 5: Apply Control (Navigation Agent or TM Autopilot)
+        # ─────────────────────────────────────────────────────────
         if vehicle is not None and self._nav_agent is not None:
             try:
                 if self._nav_agent.done():
@@ -3737,11 +3864,17 @@ class YoloDetectAgent(BaseAgent):
             if is_emergency or supervisor_brake > 0.0:
                 nav_control.throttle = 0.0
                 emergency_floor = 1.0 if is_emergency else 0.0
-                nav_control.brake = float(clamp(max(float(nav_control.brake), supervisor_brake, emergency_floor), 0.0, 1.0))
+                nav_control.brake = float(
+                    clamp(
+                        max(float(nav_control.brake), supervisor_brake, emergency_floor),
+                        0.0,
+                        1.0,
+                    )
+                )
             vehicle.apply_control(nav_control)
 
-        # Emergency override on top of CARLA autopilot.
-        if is_emergency and vehicle is not None and self._nav_agent is None:
+        # Emergency override on top of CARLA autopilot (TM fallback)
+        elif is_emergency and vehicle is not None and self._nav_agent is None:
             control = carla.VehicleControl()
             control.throttle = 0.0
             control.steer = float(0.0 if current_steer is None else current_steer)
@@ -3763,15 +3896,34 @@ class YoloDetectAgent(BaseAgent):
             control.hand_brake = False
             vehicle.apply_control(control)
 
+        # ─────────────────────────────────────────────────────────
+        # Step 6: Prepare Annotation Frame
+        # ─────────────────────────────────────────────────────────
         annotated_frame = frame_bgr.copy()
+
+        # ════════════════════════════════════════════════════════════════
+        # 🎨 VẼ YELLOW DANGER CORRIDOR (LUÔN HIỂN THỊ) - PHẦN QUAN TRỌNG
+        # ════════════════════════════════════════════════════════════════
+        yellow_drew = _draw_yellow_danger_corridor(
+            annotated_frame,
+            debug_info,
+            sup_debug,
+        )
+
+        if not yellow_drew:
+            logging.debug("[TICK %d] Yellow corridor not drawn (no polygon available)", step_idx)
+        else:
+            logging.debug("[TICK %d] Yellow corridor drawn successfully", step_idx)
+
+        # ─────────────────────────────────────────────────────────
+        # Vẽ ROI regions (từ YOLO detector)
+        # ─────────────────────────────────────────────────────────
         for roi_region in debug_info.get("roi_regions", []):
             x1, y1, x2, y2 = roi_region["box"]
             is_active = bool(roi_region.get("active", False))
             roi_color = (255, 180, 0) if is_active else (80, 80, 80)
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), roi_color, 2)
-            roi_label = (
-                f"ROI {roi_region['label']} < {roi_region['max_distance_m']:.0f}m"
-            )
+            roi_label = f"ROI {roi_region['label']} < {roi_region['max_distance_m']:.0f}m"
             cv2.putText(
                 annotated_frame,
                 roi_label,
@@ -3782,37 +3934,11 @@ class YoloDetectAgent(BaseAgent):
                 1,
             )
 
-        obstacle_roi = debug_info.get("obstacle_danger_roi", {})
-        drew_curved = _draw_curved_obstacle_path(
-            annotated_frame,
-            debug_info,
-            camera_fov_deg=float(self.config.camera_fov),
-            camera_mount_xyz=(1.5, 0.0, 2.2),
-            camera_pitch_deg=-8.0,
-        )
-        obstacle_polygon = obstacle_roi.get("polygon", [])
-        if (not drew_curved) and np is not None and len(obstacle_polygon) >= 3:
-            points = np.array(obstacle_polygon, dtype=np.int32).reshape((-1, 1, 2))
-            roi_color = (0, 255, 255)
-            cv2.polylines(annotated_frame, [points], True, roi_color, 2)
-            label = (
-                f"{obstacle_roi.get('label', 'Obstacle corridor')} < "
-                f"{float(obstacle_roi.get('distance_threshold_m', 5.0)):.1f}m"
-            )
-            anchor_x = int(obstacle_polygon[0][0])
-            anchor_y = max(18, int(obstacle_polygon[0][1]) - 8)
-            cv2.putText(
-                annotated_frame,
-                label,
-                (anchor_x, anchor_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                roi_color,
-                1,
-            )
-
+        # ─────────────────────────────────────────────────────────
+        # Vẽ Detection Bounding Boxes
+        # ─────────────────────────────────────────────────────────
         for det in detections:
-            x1, y1, x2, y2 = det['box']
+            x1, y1, x2, y2 = det["box"]
             class_name = det["class_name"]
             confidence = det["confidence"]
             distance = det["distance"]
@@ -3821,6 +3947,8 @@ class YoloDetectAgent(BaseAgent):
             in_danger_roi = bool(det.get("in_danger_roi", False))
             danger_match = bool(det.get("danger_match", False))
             path_check_mode = det.get("path_check_mode")
+
+            # Build label
             label = f"{class_name} {confidence:.2f} ({distance:.1f}m)"
             label = f"{label} [{distance_source}]"
             if roi_zone is not None:
@@ -3832,34 +3960,38 @@ class YoloDetectAgent(BaseAgent):
             if danger_match:
                 label = f"{label} [BRAKE]"
 
+            # Determine color
             if class_name == "traffic_light_red":
-                color = (0, 0, 255)
+                color = (0, 0, 255)  # Red
             elif class_name == "traffic_light_green":
-                color = (0, 255, 0)
+                color = (0, 255, 0)  # Green
             elif danger_match:
-                color = (0, 0, 255)
+                color = (0, 0, 255)  # Red (brake)
             elif in_danger_roi and distance < 10.0:
-                color = (0, 165, 255)
+                color = (0, 165, 255)  # Orange
             elif distance < 5.0:
-                color = (255, 200, 0)
+                color = (255, 200, 0)  # Cyan
             else:
-                color = (0, 255, 0)
+                color = (0, 255, 0)  # Green
 
             bx1, by1, bx2, by2 = int(x1), int(y1), int(x2), int(y2)
             cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), color, 2)
-            cv2.putText(annotated_frame, label, (bx1, by1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            
-            # Đánh dấu điểm chạm đất (Bottom Center) để trực quan hóa logic lọc đa giác Bước 1
+            cv2.putText(
+                annotated_frame,
+                label,
+                (bx1, by1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
+            )
+
+            # Draw ground touch point
             cv2.circle(annotated_frame, (int((bx1 + bx2) / 2), by2), 5, color, -1)
 
-        sup_debug = self._last_supervisor_debug_info or {}
-
-        # Vẽ Đa Giác Vùng Nguy Hiểm (Danger Polygon) từ Traffic Supervisor
-        danger_polygon = sup_debug.get('danger_polygon')
-        if danger_polygon is not None and len(danger_polygon) >= 3:
-            cv2.polylines(annotated_frame, [danger_polygon], True, (0, 255, 255), 2)
-            cv2.putText(annotated_frame, "Traffic Supervisor Zone", (int(danger_polygon[0][0]), int(danger_polygon[0][1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-
+        # ─────────────────────────────────────────────────────────
+        # Draw Status Text Overlays
+        # ─────────────────────────────────────────────────────────
         if supervisor_brake > 0.0:
             status_text = f"SUPERVISOR BRAKE {supervisor_brake:.2f} ({supervisor_reason})"
             status_color = (0, 0, 255)
@@ -3872,14 +4004,26 @@ class YoloDetectAgent(BaseAgent):
         else:
             status_text = "Normal"
             status_color = (0, 255, 0)
-        cv2.putText(annotated_frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+
+        cv2.putText(
+            annotated_frame,
+            status_text,
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            status_color,
+            2,
+        )
+
         lock_zone = sup_debug.get("locked_zone", debug_info.get("locked_zone"))
         if lock_zone:
             lock_text = (
-                f"LOCK={lock_zone} | immunity={sup_debug.get('green_immunity_counter', debug_info.get('green_immunity_counter', 0))}"
+                f"LOCK={lock_zone} | immunity="
+                f"{sup_debug.get('green_immunity_counter', debug_info.get('green_immunity_counter', 0))}"
             )
         else:
             lock_text = "LOCK=None"
+
         cv2.putText(
             annotated_frame,
             lock_text,
@@ -3889,6 +4033,7 @@ class YoloDetectAgent(BaseAgent):
             (255, 255, 0),
             2,
         )
+
         turn_text = (
             f"TURN={bool(sup_debug.get('in_turn_phase', debug_info.get('turn_phase_active', False)))} | "
             f"grace={int(sup_debug.get('turn_grace_counter', debug_info.get('turn_green_grace_counter', 0)))} | "
@@ -3904,18 +4049,26 @@ class YoloDetectAgent(BaseAgent):
             2,
         )
 
+        # ─────────────────────────────────────────────────────────
+        # Step 7: Display Frame
+        # ─────────────────────────────────────────────────────────
         cv2.imshow(self._window_name, annotated_frame)
         cv2.waitKey(1)
 
+        # ─────────────────────────────────────────────────────────
+        # Step 8: Log Information
+        # ─────────────────────────────────────────────────────────
         if step_idx % 20 == 0:
             logging.info(
-                "yolo_detect tick=%d detections=%d | emergency=%s | supervisor_brake=%.2f | state=%s | reason=%s",
+                "yolo_detect tick=%d detections=%d | emergency=%s | supervisor_brake=%.2f | "
+                "state=%s | reason=%s | yellow_polygon=%s",
                 step_idx,
                 len(detections),
                 is_emergency,
                 supervisor_brake,
                 supervisor_state,
                 supervisor_reason,
+                "drawn" if yellow_drew else "missing",
             )
 
     def teardown(self) -> None:
