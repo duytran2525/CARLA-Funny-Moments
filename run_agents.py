@@ -628,12 +628,11 @@ class RunConfig:
     recovery_steer_offset: float
     nav_agent_type: str
     yolo_disable_autopilot_red_light: bool
-    cil_soft_weight_smoothing: float
     cil_route_lookahead_m: float
-    cil_hybrid_lateral: bool
-    cil_residual_steer_gain: float
-    cil_pure_pursuit_wheelbase_m: float
-    cil_pure_pursuit_max_steer_deg: float
+    cil_command_prep_time_s: float
+    cil_command_trigger_min_m: float
+    cil_command_trigger_max_m: float
+    cil_command_retarget_window_s: float
 
 class BaseSession:
     """Shared interface for CARLA and dry-run sessions."""
@@ -1706,6 +1705,18 @@ class LaneFollowAgent(BaseAgent):
 class CILAgent(BaseAgent):
     name = "cil"
     CIL_MAX_SPEED_KMH = 120.0
+    COMMAND_PREP_TIME_S = 1.8
+    COMMAND_TRIGGER_MIN_M = 8.0
+    COMMAND_TRIGGER_MAX_M = 25.0
+    COMMAND_WARMUP_DISTANCE_M = 32.0
+    COMMAND_RESET_CLEAR_FRAMES = 5
+    COMMAND_MAX_LATCH_FRAMES = 220
+    CIL_STEER_DEADBAND = 0.01
+    CIL_MAX_STEER_RATE_PER_S = 1.05
+    CIL_TURN_SPEED_CAP_KMH = 9.0
+    CIL_STRAIGHT_JUNCTION_SPEED_CAP_KMH = 13.0
+    CIL_CLEAR_PHASE_SPEED_CAP_KMH = 16.0
+    CIL_ROUTE_FALLBACK_MIN_VALID = 0.55
 
     def __init__(self, config: RunConfig) -> None:
         super().__init__(config)
@@ -1735,17 +1746,20 @@ class CILAgent(BaseAgent):
         self._destination_reached_logged = False
         self._last_speed_kmh = 0.0
         self._last_speed_plan: Dict[str, float] = {}
-        self._enable_soft_command_blend = True
-        self._last_soft_command_weights = [1.0, 0.0, 0.0, 0.0]
-        self._soft_weight_smoothing = float(config.cil_soft_weight_smoothing)
         self._route_lookahead_m = float(config.cil_route_lookahead_m)
-        self._hybrid_lateral_enabled = bool(config.cil_hybrid_lateral)
-        self._residual_steer_gain = float(config.cil_residual_steer_gain)
-        self._pure_pursuit_wheelbase_m = float(config.cil_pure_pursuit_wheelbase_m)
-        self._pure_pursuit_max_steer_deg = float(config.cil_pure_pursuit_max_steer_deg)
+        self._command_prep_time_s = float(config.cil_command_prep_time_s)
+        self._command_trigger_min_m = float(config.cil_command_trigger_min_m)
+        self._command_trigger_max_m = float(config.cil_command_trigger_max_m)
+        self._command_retarget_window_s = float(config.cil_command_retarget_window_s)
+        self._active_navigation_command = 0
+        self._active_command_source = "none"
+        self._command_phase = "cruise"
+        self._command_latch_frames = 0
+        self._command_entered_junction = False
+        self._command_clear_frames = 0
+        self._last_command_debug: Dict[str, Any] = {}
         self._last_route_context: Dict[str, float] = {}
         self._last_replan_tick = -10000
-        self._cil_checkpoint_compatible = True
         self._route_planner = CILRoutePlanner(
             route_lookahead_m=self._route_lookahead_m,
             arrival_distance_m=self._arrival_distance_m,
@@ -2057,7 +2071,7 @@ class CILAgent(BaseAgent):
         except Exception as exc:
             self._nav_agent = None
             logging.warning(
-                "CIL route planner unavailable, soft route-blend will fall back to lane-follow bias. Reason: %s",
+                "CIL navigation planner unavailable; command injection will stay at follow-lane (0). Reason: %s",
                 exc,
             )
 
@@ -2093,6 +2107,17 @@ class CILAgent(BaseAgent):
 
     def _distance_to_destination(self, vehicle_location: Any) -> Optional[float]:
         return self._route_planner.distance_to_destination(vehicle_location)
+
+    def _distance_from_route_start_m(self) -> float:
+        if self._route_start_location is None:
+            return float("inf")
+        if self.session is None or self.session.ego_vehicle is None:
+            return float("inf")
+        ego_loc = self.session.ego_vehicle.get_location()
+        return math.hypot(
+            float(ego_loc.x - self._route_start_location.x),
+            float(ego_loc.y - self._route_start_location.y),
+        )
 
     def _current_waypoint(self):
         if self.session is None or self.session.world is None or self.session.ego_vehicle is None:
@@ -2177,39 +2202,375 @@ class CILAgent(BaseAgent):
             return item[0]
         return None
 
-    def _distance_to_next_junction_m(self, route_locations: list[Any], max_probe_m: float = 60.0) -> float:
-        if self._is_in_junction():
-            return 0.0
-        if self.session is None or self.session.world is None or self.session.ego_vehicle is None:
-            return float("inf")
-        if not route_locations:
-            return float("inf")
+    @staticmethod
+    def _road_option_to_turn_command(road_option: Any) -> int:
+        if road_option is None:
+            return 0
 
-        vehicle_loc = self.session.ego_vehicle.get_location()
-        world_map = self.session.world.get_map()
-        travelled = 0.0
-        prev_loc = vehicle_loc
+        raw_value = getattr(road_option, "value", road_option)
+        try:
+            numeric_value = int(raw_value)
+            if numeric_value in (5, 6):
+                # Ignore lane-change hints for CIL command injection.
+                return 0
+        except (TypeError, ValueError):
+            pass
 
-        for idx, loc in enumerate(route_locations[:80]):
-            seg = math.hypot(float(loc.x - prev_loc.x), float(loc.y - prev_loc.y))
-            prev_loc = loc
-            if seg < 0.15:
-                continue
+        option_name = getattr(road_option, "name", str(road_option)).lower().replace(" ", "")
+        if "change_lane" in option_name or "changelane" in option_name:
+            return 0
 
-            travelled += seg
-            if travelled > max_probe_m:
-                break
-            if idx % 3 != 0 and travelled > 4.0:
-                continue
+        command = map_road_option_to_command(road_option)
+        return int(command) if command in (1, 2, 3) else 0
 
+    def _extract_upcoming_turn_signal(self) -> tuple[int, float]:
+        if self._nav_agent is None:
+            return 0, float("inf")
+        planner = None
+        if hasattr(self._nav_agent, "get_local_planner"):
+            planner = self._nav_agent.get_local_planner()
+        if planner is None:
+            return 0, float("inf")
+
+        distance_to_junction_m = self._distance_to_next_junction_m()
+        if not math.isfinite(distance_to_junction_m):
+            distance_to_junction_m = float("inf")
+
+        vehicle_loc = None
+        if self.session is not None and self.session.ego_vehicle is not None:
+            vehicle_loc = self.session.ego_vehicle.get_location()
+
+        direct_road_option = getattr(planner, "target_road_option", None)
+        command = self._road_option_to_turn_command(direct_road_option)
+        if command != 0:
+            return command, float(distance_to_junction_m)
+
+        direct_road_option = getattr(planner, "_target_road_option", None)
+        command = self._road_option_to_turn_command(direct_road_option)
+        if command != 0:
+            return command, float(distance_to_junction_m)
+
+        queue_attr = getattr(planner, "_waypoints_queue", None)
+        if queue_attr:
             try:
-                waypoint = world_map.get_waypoint(loc, project_to_road=True)
+                planner_items = list(queue_attr)
             except Exception:
-                waypoint = None
-            if waypoint is not None and getattr(waypoint, "is_junction", False):
+                planner_items = []
+            cumulative_distance_m = 0.0
+            prev_loc = vehicle_loc
+            for item in planner_items[:96]:
+                waypoint = self._planner_item_to_waypoint(item)
+                wp_loc = waypoint.transform.location if waypoint is not None else None
+                if wp_loc is not None and prev_loc is not None:
+                    cumulative_distance_m += math.hypot(
+                        float(wp_loc.x - prev_loc.x),
+                        float(wp_loc.y - prev_loc.y),
+                    )
+                if wp_loc is not None:
+                    prev_loc = wp_loc
+
+                if not isinstance(item, (tuple, list)) or len(item) < 2:
+                    continue
+                command = self._road_option_to_turn_command(item[1])
+                if command != 0:
+                    command_distance_m = float(cumulative_distance_m)
+                    if not math.isfinite(command_distance_m) or command_distance_m <= 0.0:
+                        command_distance_m = float(distance_to_junction_m)
+                    return command, command_distance_m
+        return 0, float("inf")
+
+    def _extract_upcoming_turn_command(self) -> int:
+        command, _ = self._extract_upcoming_turn_signal()
+        return int(command)
+
+    def _distance_to_next_junction_m(self, max_probe_m: float = 70.0, step_m: float = 1.5) -> float:
+        waypoint = self._current_waypoint()
+        if waypoint is None:
+            return float("inf")
+        if getattr(waypoint, "is_junction", False):
+            return 0.0
+
+        travelled = 0.0
+        probe_wp = waypoint
+        step = max(0.5, float(step_m))
+        max_steps = max(1, int(max_probe_m / step))
+
+        for _ in range(max_steps):
+            try:
+                next_wps = probe_wp.next(step)
+            except Exception:
+                next_wps = []
+            if not next_wps:
+                break
+
+            if len(next_wps) == 1:
+                probe_wp = next_wps[0]
+            else:
+                base_yaw = float(probe_wp.transform.rotation.yaw)
+                probe_wp = min(
+                    next_wps,
+                    key=lambda wp: abs(
+                        self._normalize_angle_deg(float(wp.transform.rotation.yaw) - base_yaw)
+                    ),
+                )
+
+            travelled += step
+            if getattr(probe_wp, "is_junction", False):
                 return float(travelled)
 
         return float("inf")
+
+    def _command_trigger_distance_m(self, speed_kmh: float) -> float:
+        speed_mps = max(0.0, float(speed_kmh)) / 3.6
+        return clamp(
+            speed_mps * self._command_prep_time_s,
+            self._command_trigger_min_m,
+            self._command_trigger_max_m,
+        )
+
+    def _fallback_command_from_route_context(
+        self,
+        route_context: Optional[Dict[str, float]],
+        in_junction: bool,
+        distance_to_junction_m: float,
+        trigger_distance_m: float,
+    ) -> int:
+        if not isinstance(route_context, dict):
+            return 0
+
+        route_valid = float(route_context.get("route_valid", 0.0))
+        heading_error_deg = float(route_context.get("heading_error_deg", 0.0))
+        curvature_1pm = float(route_context.get("curvature_1pm", 0.0))
+        target_x_m = float(route_context.get("target_x_m", self._route_lookahead_m))
+        target_y_m = float(route_context.get("target_y_m", 0.0))
+        turn_urgency = float(route_context.get("turn_urgency", 0.0))
+        distance_to_turn_m = float(route_context.get("distance_to_turn_m", 90.0))
+        junction_proximity = float(route_context.get("junction_proximity", 0.0))
+
+        heading_abs = abs(heading_error_deg)
+        lateral_abs = abs(target_y_m)
+        near_junction_from_map = (
+            math.isfinite(distance_to_junction_m)
+            and distance_to_junction_m <= (trigger_distance_m + 4.0)
+        )
+        near_for_fallback = in_junction or near_junction_from_map
+        emergency_recovery_case = (
+            route_valid < 0.75
+            and heading_abs >= 55.0
+            and lateral_abs >= 10.0
+            and distance_to_turn_m <= 8.0
+        )
+
+        if route_valid < self.CIL_ROUTE_FALLBACK_MIN_VALID and not emergency_recovery_case:
+            return 0
+        if not near_for_fallback and not emergency_recovery_case:
+            return 0
+
+        inferred_from_route = int(self._route_planner.command_from_context(route_context))
+        if inferred_from_route in (1, 2, 3):
+            if inferred_from_route in (1, 2):
+                if abs(heading_error_deg) < 14.0 and distance_to_turn_m > max(8.0, 1.15 * trigger_distance_m):
+                    return 0
+            return inferred_from_route
+
+        lateral_ratio = clamp(target_y_m / max(3.0, abs(target_x_m)), -1.0, 1.0)
+        signed_turn = heading_error_deg + math.degrees(math.atan(curvature_1pm * 8.0)) + 10.0 * lateral_ratio
+
+        if turn_urgency >= 0.35 and distance_to_turn_m <= max(10.0, 1.35 * trigger_distance_m):
+            if signed_turn > 8.0:
+                return 1
+            if signed_turn < -8.0:
+                return 2
+
+        if in_junction and turn_urgency >= 0.50 and distance_to_turn_m <= 10.0 and abs(signed_turn) <= 8.0:
+            return 3
+
+        if turn_urgency >= 0.35 and signed_turn > 11.0:
+            return 1
+        if turn_urgency >= 0.35 and signed_turn < -11.0:
+            return 2
+        return 0
+
+    def _update_distance_based_command(
+        self,
+        speed_kmh: float,
+        route_context: Optional[Dict[str, float]] = None,
+    ) -> tuple[int, Dict[str, Any]]:
+        in_junction = self._is_in_junction()
+        upcoming_command, distance_to_upcoming_turn_m = self._extract_upcoming_turn_signal()
+        command_source = "planner" if upcoming_command in (1, 2, 3) else "none"
+        distance_to_junction_m = self._distance_to_next_junction_m()
+        trigger_distance_m = self._command_trigger_distance_m(speed_kmh)
+        reset_distance_m = max(8.0, 0.55 * trigger_distance_m)
+        if not math.isfinite(distance_to_upcoming_turn_m):
+            distance_to_upcoming_turn_m = float("inf")
+        route_distance_to_turn_m = float("inf")
+        if isinstance(route_context, dict):
+            route_distance_to_turn_m = float(route_context.get("distance_to_turn_m", float("inf")))
+            if not math.isfinite(route_distance_to_turn_m):
+                route_distance_to_turn_m = float("inf")
+        if in_junction:
+            command_distance_m = min(distance_to_upcoming_turn_m, route_distance_to_turn_m)
+        else:
+            command_distance_m = min(distance_to_upcoming_turn_m, distance_to_junction_m)
+            if math.isfinite(route_distance_to_turn_m):
+                command_distance_m = min(command_distance_m, route_distance_to_turn_m)
+
+        distance_from_start_m = self._distance_from_route_start_m()
+        warmup_block_commands = (
+            math.isfinite(distance_from_start_m)
+            and distance_from_start_m < self.COMMAND_WARMUP_DISTANCE_M
+        )
+        if warmup_block_commands:
+            upcoming_command = 0
+            command_source = "none"
+            if self._active_navigation_command != 0:
+                self._active_navigation_command = 0
+                self._active_command_source = "none"
+                self._command_phase = "cruise"
+                self._command_latch_frames = 0
+                self._command_entered_junction = False
+                self._command_clear_frames = 0
+
+        if self._nav_agent is not None and upcoming_command == 0 and not warmup_block_commands:
+            inferred_command = self._fallback_command_from_route_context(
+                route_context=route_context,
+                in_junction=in_junction,
+                distance_to_junction_m=distance_to_junction_m,
+                trigger_distance_m=trigger_distance_m,
+            )
+            if inferred_command in (1, 2, 3):
+                upcoming_command = inferred_command
+                command_source = "route_fallback"
+                command_distance_m = (
+                    route_distance_to_turn_m
+                    if in_junction
+                    else min(distance_to_junction_m, route_distance_to_turn_m)
+                )
+
+        command_retargeted = False
+        if self._active_navigation_command != 0 and upcoming_command in (1, 2, 3):
+            dt_s = max(1e-3, float(self.config.fixed_delta))
+            retarget_window_frames = max(
+                20,
+                int(self._command_retarget_window_s / max(1e-3, float(self.config.fixed_delta))),
+            )
+            in_junction_swap_window = max(8, int(0.9 / dt_s))
+            if (
+                upcoming_command != self._active_navigation_command
+                and self._command_latch_frames <= retarget_window_frames
+            ):
+                if not self._command_entered_junction:
+                    self._active_navigation_command = int(upcoming_command)
+                    self._active_command_source = command_source
+                    command_retargeted = True
+                elif (
+                    self._active_navigation_command in (1, 2)
+                    and upcoming_command in (1, 2)
+                    and self._command_latch_frames <= in_junction_swap_window
+                ):
+                    # If we latched the wrong left/right direction right at
+                    # junction entry, allow one quick swap to avoid locking
+                    # into the opposite turn.
+                    self._active_navigation_command = int(upcoming_command)
+                    self._active_command_source = command_source
+                    command_retargeted = True
+                elif self._active_navigation_command == 3 and upcoming_command in (1, 2):
+                    # Upgrade a previously ambiguous straight command to a clear
+                    # left/right decision once route context becomes reliable.
+                    self._active_navigation_command = int(upcoming_command)
+                    self._active_command_source = command_source
+                    command_retargeted = True
+
+        if self._active_navigation_command == 0:
+            self._command_phase = "cruise"
+            self._command_latch_frames = 0
+            self._command_clear_frames = 0
+            self._command_entered_junction = False
+
+            near_enough_for_latch = command_distance_m <= max(14.0, 1.55 * trigger_distance_m)
+            in_junction_with_near_turn = in_junction and command_distance_m <= max(14.0, 1.60 * trigger_distance_m)
+            fallback_latch_distance = max(
+                16.0,
+                (1.80 if in_junction else 1.65) * trigger_distance_m,
+            )
+            allow_source_latch = command_source == "planner" or (
+                command_source == "route_fallback"
+                and command_distance_m <= fallback_latch_distance
+            )
+            should_latch = allow_source_latch and upcoming_command in (1, 2, 3) and (
+                near_enough_for_latch or in_junction_with_near_turn
+            )
+            if should_latch:
+                self._active_navigation_command = int(upcoming_command)
+                self._active_command_source = str(command_source)
+                self._command_phase = "in_junction" if in_junction else "armed"
+                self._command_latch_frames = 1
+                self._command_entered_junction = bool(in_junction)
+        else:
+            self._command_latch_frames += 1
+            if in_junction:
+                self._command_phase = "in_junction"
+                self._command_entered_junction = True
+                self._command_clear_frames = 0
+            else:
+                if self._command_entered_junction:
+                    self._command_phase = "clear"
+                    self._command_clear_frames += 1
+                elif command_distance_m > trigger_distance_m + 20.0:
+                    # If we armed too early but never entered a junction, release command.
+                    self._active_navigation_command = 0
+                    self._active_command_source = "none"
+                    self._command_phase = "cruise"
+                    self._command_latch_frames = 0
+                    self._command_clear_frames = 0
+
+            should_reset = False
+            stale_fallback_frames = max(8, int(1.0 / max(1e-3, float(self.config.fixed_delta))))
+            if (
+                self._active_command_source == "route_fallback"
+                and command_source == "none"
+                and (not self._command_entered_junction)
+                and route_distance_to_turn_m > (trigger_distance_m + 16.0)
+                and self._command_latch_frames >= stale_fallback_frames
+            ):
+                should_reset = True
+            if self._command_entered_junction and not in_junction:
+                if (
+                    self._command_clear_frames >= self.COMMAND_RESET_CLEAR_FRAMES
+                    and distance_to_junction_m > reset_distance_m
+                ):
+                    should_reset = True
+            if self._command_latch_frames >= self.COMMAND_MAX_LATCH_FRAMES:
+                should_reset = True
+
+            if should_reset:
+                self._active_navigation_command = 0
+                self._active_command_source = "none"
+                self._command_phase = "cruise"
+                self._command_latch_frames = 0
+                self._command_entered_junction = False
+                self._command_clear_frames = 0
+
+        command_debug: Dict[str, Any] = {
+            "phase": self._command_phase,
+            "upcoming_command": int(upcoming_command),
+            "active_command": int(self._active_navigation_command),
+            "active_source": str(self._active_command_source),
+            "upcoming_source": command_source,
+            "retargeted": bool(command_retargeted),
+            "in_junction": bool(in_junction),
+            "distance_to_turn_m": float(command_distance_m),
+            "route_distance_to_turn_m": float(route_distance_to_turn_m),
+            "distance_to_junction_m": float(distance_to_junction_m),
+            "trigger_distance_m": float(trigger_distance_m),
+            "reset_distance_m": float(reset_distance_m),
+            "latch_frames": int(self._command_latch_frames),
+            "distance_from_start_m": float(distance_from_start_m),
+            "warmup_block_commands": bool(warmup_block_commands),
+        }
+        self._last_command_debug = command_debug
+        return int(self._active_navigation_command), command_debug
 
     def _fallback_route_context_from_destination(
         self,
@@ -2294,32 +2655,6 @@ class CILAgent(BaseAgent):
         )
         self._last_route_context = context
         return context
-
-    def _route_target_angle_deg(self, lookahead_m: float = 10.0) -> Optional[float]:
-        route_context = self._compute_route_context(lookahead_m=lookahead_m)
-        if route_context.get("route_valid", 0.0) < 0.5:
-            return None
-        return float(route_context.get("heading_error_deg", 0.0))
-
-    def _pure_pursuit_steer(self, route_context: Dict[str, float]) -> float:
-        if route_context.get("route_valid", 0.0) < 0.5:
-            return 0.0
-
-        target_x = float(route_context.get("target_x_m", self._route_lookahead_m))
-        target_y = float(route_context.get("target_y_m", 0.0))
-        if target_x <= 0.5:
-            heading_error_deg = float(route_context.get("heading_error_deg", 0.0))
-            return clamp(-(heading_error_deg / 65.0), -1.0, 1.0)
-
-        target_x = max(1.5, target_x)
-        lookahead = max(2.0, math.hypot(target_x, target_y))
-
-        curvature = (2.0 * target_y) / max(1e-6, lookahead * lookahead)
-        steer_rad = math.atan(self._pure_pursuit_wheelbase_m * curvature)
-        max_steer_rad = math.radians(max(10.0, self._pure_pursuit_max_steer_deg))
-
-        # CARLA steer is typically negative for left and positive for right.
-        return clamp(-(steer_rad / max(1e-6, max_steer_rad)), -1.0, 1.0)
 
     def _is_near_junction(self, lookahead_m: float = 12.0) -> bool:
         waypoint = self._current_waypoint()
@@ -2468,90 +2803,6 @@ class CILAgent(BaseAgent):
         except Exception:
             pass
 
-    def _compute_soft_command_weights(self, route_context: Optional[Dict[str, float]] = None):
-        if torch is None:
-            return None
-
-        if route_context is None:
-            route_context = self._compute_route_context()
-        heading_error_deg = float(route_context.get("heading_error_deg", 0.0))
-        curvature_1pm = float(route_context.get("curvature_1pm", 0.0))
-        target_x_m = float(route_context.get("target_x_m", self._route_lookahead_m))
-        target_y_m = float(route_context.get("target_y_m", 0.0))
-        turn_urgency = clamp(float(route_context.get("turn_urgency", 0.0)), 0.0, 1.0)
-        junction_proximity = clamp(float(route_context.get("junction_proximity", 0.0)), 0.0, 1.0)
-
-        heading_urgency = clamp((abs(heading_error_deg) - 3.0) / 16.0, 0.0, 1.0)
-        near_factor = clamp(max(turn_urgency, junction_proximity, 0.85 * heading_urgency), 0.0, 1.0)
-        lateral_ratio = clamp(target_y_m / max(3.0, abs(target_x_m)), -1.0, 1.0)
-        curvature_as_angle_deg = math.degrees(math.atan(curvature_1pm * 8.0))
-
-        turn_signal = heading_error_deg + curvature_as_angle_deg + 10.0 * lateral_ratio
-        left_raw = 1.0 / (1.0 + math.exp(-((turn_signal - 3.0) / 3.8)))
-        right_raw = 1.0 / (1.0 + math.exp(-(((-turn_signal) - 3.0) / 3.8)))
-
-        straight_from_heading = math.exp(-((turn_signal / 10.5) ** 2))
-        straight_from_curvature = math.exp(-((abs(curvature_1pm) / 0.10) ** 1.20))
-        straight_raw = max(0.03, straight_from_heading * straight_from_curvature)
-
-        turn_sum = max(1e-6, left_raw + right_raw + straight_raw)
-        left = left_raw / turn_sum
-        right = right_raw / turn_sum
-        straight = straight_raw / turn_sum
-
-        lane_weight = (1.0 - near_factor) * (0.55 + 0.45 * straight)
-        weights = [
-            lane_weight,
-            near_factor * left,
-            near_factor * right,
-            near_factor * straight,
-        ]
-
-        total = max(1e-6, sum(weights))
-        weights = [value / total for value in weights]
-
-        prev_weights = self._last_soft_command_weights if len(self._last_soft_command_weights) == 4 else [1.0, 0.0, 0.0, 0.0]
-        alpha = clamp(float(self._soft_weight_smoothing), 0.0, 0.98)
-        if near_factor > 0.60:
-            # React faster near turn/junction to avoid staying lane-follow too long.
-            alpha = min(alpha, 0.55)
-        weights = [
-            alpha * float(prev_weights[idx]) + (1.0 - alpha) * float(weights[idx])
-            for idx in range(4)
-        ]
-        total = max(1e-6, sum(weights))
-        weights = [value / total for value in weights]
-
-        self._last_soft_command_weights = [float(w) for w in weights]
-        return torch.tensor(weights, dtype=torch.float32, device=self._device)
-
-    def _command_from_soft_weights(self, weights) -> int:
-        route_context = self._last_route_context if isinstance(self._last_route_context, dict) else {}
-        return self._route_planner.command_from_context(route_context, blend_weights=weights)
-
-    def _predict_cil_head_outputs(self, image_tensor, speed_tensor):
-        if self._model is None:
-            return None
-        if not hasattr(self._model, "conv_layers"):
-            return None
-        if not hasattr(self._model, "speed_branch"):
-            return None
-        if not hasattr(self._model, "command_heads"):
-            return None
-
-        command_heads = getattr(self._model, "command_heads", None)
-        if command_heads is None or len(command_heads) < 4:
-            return None
-
-        try:
-            vis_feat = self._model.conv_layers(image_tensor)
-            spd_feat = self._model.speed_branch(speed_tensor.unsqueeze(1).float())
-            features = torch.cat([vis_feat, spd_feat], dim=1)
-            head_outputs = torch.stack([head(features) for head in command_heads], dim=1)
-            return head_outputs.squeeze(0).squeeze(-1)[:4]
-        except Exception:
-            return None
-
     def _load_cil_model(self):
         if torch is None:
             raise RuntimeError("PyTorch is required for CIL agent.")
@@ -2597,39 +2848,7 @@ class CILAgent(BaseAgent):
             }
 
         model = CIL_NvidiaCNN().to(self._device)
-        self._cil_checkpoint_compatible = True
-        try:
-            model.load_state_dict(state_dict, strict=True)
-        except RuntimeError as exc:
-            has_lane_dense = any(key.startswith("dense_layers.") for key in state_dict.keys())
-            has_cil_heads = any(key.startswith("command_heads.") for key in state_dict.keys())
-            if has_lane_dense and not has_cil_heads:
-                # Allow quick smoke testing when user passes a lane-follow checkpoint by mistake.
-                # Only shared conv layers are transferred; CIL-specific heads remain randomly initialized.
-                model_state = model.state_dict()
-                transferable = {
-                    key: value
-                    for key, value in state_dict.items()
-                    if key.startswith("conv_layers.")
-                    and key in model_state
-                    and model_state[key].shape == value.shape
-                }
-                if not transferable:
-                    raise RuntimeError(
-                        "Incompatible checkpoint for CIL model: no transferable conv_layers were found. "
-                        "Provide a checkpoint trained with CIL_NvidiaCNN."
-                    ) from exc
-
-                model.load_state_dict(transferable, strict=False)
-                self._cil_checkpoint_compatible = False
-                logging.warning(
-                    "Checkpoint %s appears to be a lane-follow model (dense_layers.* found). "
-                    "Loaded only shared conv_layers into CIL model; speed_branch/command_heads are randomly initialized. "
-                    "Use a CIL_NvidiaCNN checkpoint for production-quality driving.",
-                    model_path,
-                )
-            else:
-                raise
+        model.load_state_dict(state_dict, strict=True)
         model.eval()
         logging.info("Loaded CIL model from %s on %s", model_path, self._device)
         return model
@@ -2738,6 +2957,8 @@ class CILAgent(BaseAgent):
         speed_kmh: float,
         route_context: Dict[str, float],
         destination_distance_m: Optional[float],
+        command: int = 0,
+        command_phase: str = "cruise",
     ) -> tuple[float, float, float, Dict[str, float]]:
         """Compute throttle/brake from PID with adaptive target-speed planning."""
         adaptive_target_kmh, speed_plan = self._route_planner.compute_adaptive_target_speed_kmh(
@@ -2747,6 +2968,50 @@ class CILAgent(BaseAgent):
             destination_distance_m=destination_distance_m,
             dt_s=(self.config.fixed_delta if self.config.sync else (1.0 / 20.0)),
         )
+
+        phase = str(command_phase).lower()
+        command_cap_kmh: Optional[float] = None
+        if int(command) in (1, 2):
+            if phase in {"armed", "in_junction"}:
+                command_cap_kmh = self.CIL_TURN_SPEED_CAP_KMH
+            elif phase == "clear":
+                command_cap_kmh = self.CIL_CLEAR_PHASE_SPEED_CAP_KMH
+        elif int(command) == 3:
+            if phase in {"armed", "in_junction"}:
+                command_cap_kmh = self.CIL_STRAIGHT_JUNCTION_SPEED_CAP_KMH
+            elif phase == "clear":
+                command_cap_kmh = max(
+                    self.CIL_CLEAR_PHASE_SPEED_CAP_KMH,
+                    self.CIL_STRAIGHT_JUNCTION_SPEED_CAP_KMH + 2.0,
+                )
+
+        if command_cap_kmh is not None:
+            adaptive_target_kmh = min(float(adaptive_target_kmh), float(command_cap_kmh))
+            speed_plan["command_cap_kmh"] = float(command_cap_kmh)
+        else:
+            speed_plan["command_cap_kmh"] = float(adaptive_target_kmh)
+
+        heading_abs = abs(float(route_context.get("heading_error_deg", 0.0)))
+        lateral_abs = abs(float(route_context.get("target_y_m", 0.0)))
+        turn_urgency = clamp(float(route_context.get("turn_urgency", 0.0)), 0.0, 1.0)
+        route_valid = clamp(float(route_context.get("route_valid", 0.0)), 0.0, 1.0)
+        recovery_cap_kmh = float(adaptive_target_kmh)
+        if heading_abs >= 20.0 or lateral_abs >= 3.0 or turn_urgency >= 0.70:
+            recovery_severity = max(
+                clamp((heading_abs - 20.0) / 80.0, 0.0, 1.0),
+                clamp((lateral_abs - 3.0) / 14.0, 0.0, 1.0),
+                clamp((turn_urgency - 0.55) / 0.45, 0.0, 1.0),
+            )
+            if route_valid < 0.85:
+                recovery_severity = clamp(
+                    recovery_severity + clamp((0.85 - route_valid) / 0.35, 0.0, 1.0) * 0.35,
+                    0.0,
+                    1.0,
+                )
+            recovery_cap_kmh = clamp(24.0 - 12.0 * recovery_severity, 10.0, 24.0)
+            adaptive_target_kmh = min(float(adaptive_target_kmh), float(recovery_cap_kmh))
+        speed_plan["recovery_cap_kmh"] = float(recovery_cap_kmh)
+
         self._speed_controller.set_target_speed(adaptive_target_kmh)
         throttle, brake = self._speed_controller.compute(speed_kmh)
 
@@ -2760,7 +3025,7 @@ class CILAgent(BaseAgent):
         self._last_speed_plan = speed_plan
         return throttle, brake, float(adaptive_target_kmh), speed_plan
 
-    def _predict_cil_steering(self, rgb_frame, speed_kmh: float, command: int, blend_weights=None) -> float:
+    def _predict_cil_steering(self, rgb_frame, speed_kmh: float, command: int) -> float:
         height = rgb_frame.shape[0]
         cropped = rgb_frame[int(height * 0.45) :, :, :]
         resized = cv2.resize(cropped, (200, 66), interpolation=cv2.INTER_AREA)
@@ -2780,16 +3045,7 @@ class CILAgent(BaseAgent):
         command_tensor = command_tensor.to(self._device, non_blocking=True)
 
         with torch.inference_mode():
-            steering_value = None
-            if self._enable_soft_command_blend and blend_weights is not None:
-                head_outputs = self._predict_cil_head_outputs(image_tensor, speed_tensor)
-                if head_outputs is not None and head_outputs.numel() >= 4:
-                    if blend_weights.numel() >= 4:
-                        steering_value = float(torch.sum(head_outputs[:4] * blend_weights[:4]).item())
-
-            if steering_value is None:
-                steering_value = float(self._model(image_tensor, speed_tensor, command_tensor).item())
-                self._last_soft_command_weights = [1.0 if idx == command_idx else 0.0 for idx in range(4)]
+            steering_value = float(self._model(image_tensor, speed_tensor, command_tensor).item())
         return clamp(steering_value, -1.0, 1.0)
 
     def run_step(self, step_idx: int) -> None:
@@ -2833,28 +3089,82 @@ class CILAgent(BaseAgent):
             self._maybe_replan_route(step_idx, vehicle)
 
         route_context = self._compute_route_context()
-        blend_weights = self._compute_soft_command_weights(route_context=route_context) if self._enable_soft_command_blend else None
-        command = self._command_from_soft_weights(blend_weights)
-        model_steer = self._predict_cil_steering(frame, speed_kmh, command, blend_weights=blend_weights)
-        pure_pursuit_steer = self._pure_pursuit_steer(route_context)
-        residual_gain = self._residual_steer_gain if self._cil_checkpoint_compatible else 0.0
-        if self._hybrid_lateral_enabled:
+        command, command_debug = self._update_distance_based_command(
+            speed_kmh=speed_kmh,
+            route_context=route_context,
+        )
+        model_steer = self._predict_cil_steering(frame, speed_kmh, command)
+        route_heading_abs = abs(float(route_context.get("heading_error_deg", 0.0)))
+        route_lateral_abs = abs(float(route_context.get("target_y_m", 0.0)))
+        route_turn_urgency = clamp(float(route_context.get("turn_urgency", 0.0)), 0.0, 1.0)
+        route_valid = clamp(float(route_context.get("route_valid", 0.0)), 0.0, 1.0)
+        command_active_source = str(command_debug.get("active_source", "none"))
+        command_distance_to_turn = float(command_debug.get("distance_to_turn_m", float("inf")))
+        steer_gain = 1.0
+        steer_gain += 0.45 * clamp((route_heading_abs - 14.0) / 70.0, 0.0, 1.0)
+        steer_gain += 0.35 * clamp((route_lateral_abs - 2.0) / 14.0, 0.0, 1.0)
+        if command in (1, 2, 3):
+            steer_gain += 0.20 * route_turn_urgency
+        if command in (1, 2) and command_active_source == "planner":
+            if command_distance_to_turn <= 8.0:
+                steer_gain += 0.45
+            elif command_distance_to_turn <= 14.0:
+                steer_gain += 0.25
+        if route_valid < 0.8:
+            steer_gain += 0.20 * clamp((0.8 - route_valid) / 0.3, 0.0, 1.0)
+        steer_gain_limit = 2.0 if command_active_source == "planner" else 1.5
+        steer_gain = clamp(steer_gain, 1.0, steer_gain_limit)
+        steering_raw = clamp(model_steer * steer_gain, -1.0, 1.0)
+
+        target_x_m = float(route_context.get("target_x_m", self._route_lookahead_m))
+        target_y_m = float(route_context.get("target_y_m", 0.0))
+        lateral_ratio = clamp(target_y_m / max(4.0, abs(target_x_m)), -1.0, 1.0)
+        route_steer_correction = clamp(
+            -(float(route_context.get("heading_error_deg", 0.0)) / 55.0) - 0.45 * lateral_ratio,
+            -0.85,
+            0.85,
+        )
+        route_assist_weight = 0.0
+        if route_valid >= 0.55:
+            route_assist_weight = max(
+                clamp((route_heading_abs - 18.0) / 70.0, 0.0, 0.35),
+                clamp((route_lateral_abs - 2.5) / 14.0, 0.0, 0.35),
+            )
+            if command in (1, 2):
+                route_assist_weight += 0.12
+                if command_active_source == "planner" and command_distance_to_turn <= 10.0:
+                    route_assist_weight += 0.18
+        if route_valid < 0.70:
+            route_assist_weight = max(route_assist_weight, 0.25)
+        route_assist_weight = clamp(route_assist_weight, 0.0, 0.55)
+        if route_assist_weight > 0.0:
             steering_raw = clamp(
-                pure_pursuit_steer + residual_gain * model_steer,
+                (1.0 - route_assist_weight) * steering_raw
+                + route_assist_weight * route_steer_correction,
                 -1.0,
                 1.0,
             )
-        else:
-            steering_raw = model_steer if self._cil_checkpoint_compatible else pure_pursuit_steer
 
-        alpha = clamp(self.config.steer_smoothing, 0.0, 0.99)
-        steering = alpha * self._last_steer + (1.0 - alpha) * steering_raw
+        steering_target = 0.0 if abs(steering_raw) < self.CIL_STEER_DEADBAND else steering_raw
+        alpha_base = clamp(self.config.steer_smoothing, 0.0, 0.99)
+        speed_ratio = clamp(speed_kmh / 50.0, 0.0, 1.0)
+        alpha = clamp(alpha_base + 0.12 * speed_ratio, 0.0, 0.985)
+        steering_smooth = alpha * self._last_steer + (1.0 - alpha) * steering_target
+        dt_s = self.config.fixed_delta if self.config.sync else (1.0 / 20.0)
+        max_steer_step = clamp(self.CIL_MAX_STEER_RATE_PER_S * dt_s, 0.01, 0.12)
+        steering = clamp(
+            steering_smooth,
+            self._last_steer - max_steer_step,
+            self._last_steer + max_steer_step,
+        )
         self._last_steer = steering
 
         throttle, brake, adaptive_target_kmh, speed_plan = self._longitudinal_control(
             speed_kmh=speed_kmh,
             route_context=route_context,
             destination_distance_m=destination_distance_m,
+            command=command,
+            command_phase=str(command_debug.get("phase", "cruise")),
         )
         control = carla.VehicleControl(
             throttle=float(throttle),
@@ -2896,12 +3206,14 @@ class CILAgent(BaseAgent):
             if destination_distance_m is not None:
                 extra_lines.append(f"Dist to D: {destination_distance_m:.1f} m")
             extra_lines.append(
-                "Speed plan base/adapt/dest/turn/junc: "
+                "Speed plan base/adapt/dest/turn/junc/cmd/recover: "
                 f"{self.config.target_speed_kmh:.1f}/"
                 f"{adaptive_target_kmh:.1f}/"
                 f"{float(speed_plan.get('dest_cap_kmh', self.config.target_speed_kmh)):.1f}/"
                 f"{float(speed_plan.get('turn_cap_kmh', self.config.target_speed_kmh)):.1f}/"
-                f"{float(speed_plan.get('junction_cap_kmh', self.config.target_speed_kmh)):.1f} km/h"
+                f"{float(speed_plan.get('junction_cap_kmh', self.config.target_speed_kmh)):.1f}/"
+                f"{float(speed_plan.get('command_cap_kmh', adaptive_target_kmh)):.1f}/"
+                f"{float(speed_plan.get('recovery_cap_kmh', adaptive_target_kmh)):.1f} km/h"
             )
             heading_error = float(route_context.get("heading_error_deg", 0.0))
             curvature_1pm = float(route_context.get("curvature_1pm", 0.0))
@@ -2923,17 +3235,48 @@ class CILAgent(BaseAgent):
             extra_lines.append(
                 f"Target vf x={target_x_m:.1f}m y={target_y_m:+.1f}m turn_u={turn_urgency:.2f} junc_u={junction_proximity:.2f}"
             )
-            if self._enable_soft_command_blend and len(self._last_soft_command_weights) == 4:
-                w0, w1, w2, w3 = self._last_soft_command_weights
-                extra_lines.append(
-                    f"Cmd mix LF/L/R/S: {w0:.2f}/{w1:.2f}/{w2:.2f}/{w3:.2f}"
-                )
-            if self._hybrid_lateral_enabled:
-                extra_lines.append(
-                    f"Steer hybrid pp={pure_pursuit_steer:+.2f} model={model_steer:+.2f} gain={residual_gain:.2f}"
-                )
-            if not self._cil_checkpoint_compatible:
-                extra_lines.append("Checkpoint mode: lane-follow fallback (PP priority)")
+            command_phase = str(command_debug.get("phase", "cruise"))
+            upcoming_command = int(command_debug.get("upcoming_command", 0))
+            upcoming_source = str(command_debug.get("upcoming_source", "none"))
+            active_source = str(command_debug.get("active_source", "none"))
+            command_retargeted = bool(command_debug.get("retargeted", False))
+            command_distance_to_turn = float(command_debug.get("distance_to_turn_m", float("inf")))
+            command_route_distance_to_turn = float(command_debug.get("route_distance_to_turn_m", float("inf")))
+            command_distance_to_junction = float(command_debug.get("distance_to_junction_m", float("inf")))
+            command_trigger_distance = float(command_debug.get("trigger_distance_m", 0.0))
+            command_clear_frames = int(command_debug.get("latch_frames", 0))
+            command_warmup = bool(command_debug.get("warmup_block_commands", False))
+            command_s_from_start = float(command_debug.get("distance_from_start_m", float("inf")))
+            if math.isfinite(command_distance_to_turn):
+                cmd_turn_text = f"{command_distance_to_turn:.1f}"
+            else:
+                cmd_turn_text = "inf"
+            if math.isfinite(command_distance_to_junction):
+                cmd_junction_text = f"{command_distance_to_junction:.1f}"
+            else:
+                cmd_junction_text = "inf"
+            if math.isfinite(command_route_distance_to_turn):
+                cmd_route_turn_text = f"{command_route_distance_to_turn:.1f}"
+            else:
+                cmd_route_turn_text = "inf"
+            extra_lines.append(
+                "Cmd inject "
+                f"phase={command_phase} next={upcoming_command} src={upcoming_source} active={command}({active_source}) "
+                f"d_turn={cmd_turn_text}m d_route={cmd_route_turn_text}m d_junc={cmd_junction_text}m trigger={command_trigger_distance:.1f}m "
+                f"hold={command_clear_frames}"
+            )
+            if command_warmup:
+                if math.isfinite(command_s_from_start):
+                    extra_lines.append(
+                        f"Cmd warmup block: on (s_from_start={command_s_from_start:.1f}m / {self.COMMAND_WARMUP_DISTANCE_M:.1f}m)"
+                    )
+                else:
+                    extra_lines.append("Cmd warmup block: on")
+            if command_retargeted:
+                extra_lines.append("Cmd retargeted: true")
+            extra_lines.append(
+                f"Steer CNN={model_steer:+.2f} gain={steer_gain:.2f} assist={route_assist_weight:.2f} raw={steering_raw:+.2f}"
+            )
             self._visualizer.show_rgb(
                 frame,
                 {
@@ -2964,14 +3307,25 @@ class CILAgent(BaseAgent):
 
         if step_idx % 20 == 0:
             logging.info(
-                "cil tick=%d speed=%.1f km/h target=%.1f cmd=%d steer=%.3f model=%.3f pp=%.3f throttle=%.2f brake=%.2f",
+                "cil tick=%d speed=%.1f km/h target=%.1f cmd=%d phase=%s next=%d src=%s retarget=%s warmup=%s s_from_start=%.1f d_turn=%.1f d_route=%.1f d_junc=%.1f trigger=%.1f steer=%.3f model=%.3f gain=%.2f assist=%.2f throttle=%.2f brake=%.2f",
                 step_idx,
                 speed_kmh,
                 adaptive_target_kmh,
                 command,
+                str(command_debug.get("phase", "cruise")),
+                int(command_debug.get("upcoming_command", 0)),
+                str(command_debug.get("upcoming_source", "none")),
+                str(command_debug.get("retargeted", False)),
+                str(command_debug.get("warmup_block_commands", False)),
+                float(command_debug.get("distance_from_start_m", float("inf"))),
+                float(command_debug.get("distance_to_turn_m", float("inf"))),
+                float(command_debug.get("route_distance_to_turn_m", float("inf"))),
+                float(command_debug.get("distance_to_junction_m", float("inf"))),
+                float(command_debug.get("trigger_distance_m", 0.0)),
                 control.steer,
                 model_steer,
-                pure_pursuit_steer,
+                steer_gain,
+                route_assist_weight,
                 control.throttle,
                 control.brake,
             )
@@ -3005,6 +3359,13 @@ class CILAgent(BaseAgent):
         self._route_planner.reset_runtime_state()
         self._last_route_context = {}
         self._last_speed_plan = {}
+        self._active_navigation_command = 0
+        self._active_command_source = "none"
+        self._command_phase = "cruise"
+        self._command_latch_frames = 0
+        self._command_entered_junction = False
+        self._command_clear_frames = 0
+        self._last_command_debug = {}
         if self._visualizer is not None:
             self._visualizer.close()
             self._visualizer = None
@@ -3805,47 +4166,10 @@ def parse_args() -> argparse.Namespace:
         default="INFO",
     )
     parser.add_argument(
-        "--cil-soft-weight-smoothing",
-        type=float,
-        default=0.82,
-        help="Temporal smoothing for soft command weights (0..0.98).",
-    )
-    parser.add_argument(
         "--cil-route-lookahead-m",
         type=float,
         default=9.0,
-        help="Nominal route lookahead used for CIL soft command conditioning.",
-    )
-    parser.add_argument(
-        "--cil-hybrid-lateral",
-        dest="cil_hybrid_lateral",
-        action="store_true",
-        default=None,
-        help="Enable hybrid lateral control (Pure Pursuit base + model residual).",
-    )
-    parser.add_argument(
-        "--no-cil-hybrid-lateral",
-        dest="cil_hybrid_lateral",
-        action="store_false",
-        help="Disable hybrid lateral control and use model steering directly.",
-    )
-    parser.add_argument(
-        "--cil-residual-steer-gain",
-        type=float,
-        default=0.32,
-        help="Residual gain applied to model steering in hybrid lateral mode.",
-    )
-    parser.add_argument(
-        "--cil-pp-wheelbase-m",
-        type=float,
-        default=2.8,
-        help="Wheelbase used by Pure Pursuit lateral baseline (meters).",
-    )
-    parser.add_argument(
-        "--cil-pp-max-steer-deg",
-        type=float,
-        default=35.0,
-        help="Steering normalization angle for Pure Pursuit baseline (degrees).",
+        help="Nominal route lookahead used for route context and speed planning in CIL mode.",
     )
     return parser.parse_args()
 
@@ -3954,36 +4278,27 @@ def build_config(args: argparse.Namespace) -> RunConfig:
             destination_point_cfg,
         )
 
-    cil_soft_weight_smoothing = (
-        args.cil_soft_weight_smoothing
-        if args.cil_soft_weight_smoothing != 0.82
-        else float(_cfg_get(env_cfg, "cil", "soft_weight_smoothing", args.cil_soft_weight_smoothing))
-    )
     cil_route_lookahead_m = (
         args.cil_route_lookahead_m
         if args.cil_route_lookahead_m != 9.0
         else float(_cfg_get(env_cfg, "cil", "route_lookahead_m", args.cil_route_lookahead_m))
     )
-    cil_hybrid_lateral = (
-        args.cil_hybrid_lateral
-        if args.cil_hybrid_lateral is not None
-        else bool(_cfg_get(env_cfg, "cil", "hybrid_lateral", True))
+    cil_command_prep_time_s = float(
+        _cfg_get(env_cfg, "cil", "command_prep_time_s", CILAgent.COMMAND_PREP_TIME_S)
     )
-    cil_residual_steer_gain = (
-        args.cil_residual_steer_gain
-        if args.cil_residual_steer_gain != 0.32
-        else float(_cfg_get(env_cfg, "cil", "residual_steer_gain", args.cil_residual_steer_gain))
+    cil_command_trigger_min_m = float(
+        _cfg_get(env_cfg, "cil", "command_trigger_min_m", CILAgent.COMMAND_TRIGGER_MIN_M)
     )
-    cil_pure_pursuit_wheelbase_m = (
-        args.cil_pp_wheelbase_m
-        if args.cil_pp_wheelbase_m != 2.8
-        else float(_cfg_get(env_cfg, "cil", "pure_pursuit_wheelbase_m", args.cil_pp_wheelbase_m))
+    cil_command_trigger_max_m = float(
+        _cfg_get(env_cfg, "cil", "command_trigger_max_m", CILAgent.COMMAND_TRIGGER_MAX_M)
     )
-    cil_pure_pursuit_max_steer_deg = (
-        args.cil_pp_max_steer_deg
-        if args.cil_pp_max_steer_deg != 35.0
-        else float(_cfg_get(env_cfg, "cil", "pure_pursuit_max_steer_deg", args.cil_pp_max_steer_deg))
+    cil_command_retarget_window_s = float(
+        _cfg_get(env_cfg, "cil", "command_retarget_window_s", 3.0)
     )
+    cil_command_trigger_min_m = max(3.0, cil_command_trigger_min_m)
+    cil_command_trigger_max_m = max(cil_command_trigger_min_m + 1.0, cil_command_trigger_max_m)
+    cil_command_prep_time_s = max(0.8, cil_command_prep_time_s)
+    cil_command_retarget_window_s = max(0.8, cil_command_retarget_window_s)
     yolo_disable_autopilot_red_light = (
         args.yolo_disable_autopilot_red_light
         if args.yolo_disable_autopilot_red_light is not None
@@ -4065,12 +4380,11 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         recovery_steer_offset=abs(args.recovery_steer_offset),
         nav_agent_type=args.nav_agent_type,
         yolo_disable_autopilot_red_light=bool(yolo_disable_autopilot_red_light),
-        cil_soft_weight_smoothing=clamp(cil_soft_weight_smoothing, 0.0, 0.98),
         cil_route_lookahead_m=max(4.0, cil_route_lookahead_m),
-        cil_hybrid_lateral=bool(cil_hybrid_lateral),
-        cil_residual_steer_gain=clamp(cil_residual_steer_gain, 0.0, 1.0),
-        cil_pure_pursuit_wheelbase_m=max(1.5, cil_pure_pursuit_wheelbase_m),
-        cil_pure_pursuit_max_steer_deg=clamp(cil_pure_pursuit_max_steer_deg, 10.0, 50.0),
+        cil_command_prep_time_s=cil_command_prep_time_s,
+        cil_command_trigger_min_m=cil_command_trigger_min_m,
+        cil_command_trigger_max_m=cil_command_trigger_max_m,
+        cil_command_retarget_window_s=cil_command_retarget_window_s,
     )
 
 

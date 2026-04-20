@@ -1,7 +1,7 @@
 param(
     [string]$CarlaRoot = "E:\Carla",
     [string]$Config = "configs/carla_env.yaml",
-    [string]$Model = "D:\AI\CARLA-Funny-Moments\models\cnn_steering Train Loss 0.0063 Val Loss 0.0033.pth",
+    [string]$Model = "auto",
     [double]$TargetSpeedKmh = 50,
     [double]$MaxThrottle = 0.6,
     [double]$MaxBrake = 0.80,
@@ -72,31 +72,46 @@ if ($LASTEXITCODE -ne 0) {
     Write-Warning "Install dependency in venv if needed: .\\.venv\\Scripts\\python.exe -m pip install shapely"
 }
 
-$args = @(
-    "run_agents.py",
-    "--agent", "cil",
-    "--config", $configPath,
-    "--cil-model-path", $modelPath,
-    "--device", $Device,
-    "--target-speed-kmh", $TargetSpeedKmh,
-    "--max-throttle", $MaxThrottle,
-    "--max-brake", $MaxBrake,
-    "--npc-vehicle-count", $NpcVehicleCount,
-    "--npc-bike-count", $NpcBikeCount,
-    "--npc-motorbike-count", $NpcMotorbikeCount,
-    "--npc-pedestrian-count", $NpcPedestrianCount,
-    "--ticks", $Ticks
-)
-
-if ($NoRandomWeather) {
-    $args += "--no-random-weather"
-}
-
 Write-Host "Python: $pythonExe"
 Write-Host "Config: $configPath"
-Write-Host "Model : $modelPath"
+if ($modelPath -eq "auto") {
+    Write-Host "Model : auto (run_agents.py will auto-select a checkpoint)"
+}
+else {
+    Write-Host "Model : $modelPath"
+}
 Write-Host "CARLA : $CarlaRoot"
 Write-Host "----- Running CIL agent -----"
 
-& $pythonExe @args
+if ($NoRandomWeather) {
+    & $pythonExe "run_agents.py" `
+        "--agent" "cil" `
+        "--config" $configPath `
+        "--cil-model-path" $modelPath `
+        "--device" $Device `
+        "--target-speed-kmh" $TargetSpeedKmh `
+        "--max-throttle" $MaxThrottle `
+        "--max-brake" $MaxBrake `
+        "--npc-vehicle-count" $NpcVehicleCount `
+        "--npc-bike-count" $NpcBikeCount `
+        "--npc-motorbike-count" $NpcMotorbikeCount `
+        "--npc-pedestrian-count" $NpcPedestrianCount `
+        "--ticks" $Ticks `
+        "--no-random-weather"
+}
+else {
+    & $pythonExe "run_agents.py" `
+        "--agent" "cil" `
+        "--config" $configPath `
+        "--cil-model-path" $modelPath `
+        "--device" $Device `
+        "--target-speed-kmh" $TargetSpeedKmh `
+        "--max-throttle" $MaxThrottle `
+        "--max-brake" $MaxBrake `
+        "--npc-vehicle-count" $NpcVehicleCount `
+        "--npc-bike-count" $NpcBikeCount `
+        "--npc-motorbike-count" $NpcMotorbikeCount `
+        "--npc-pedestrian-count" $NpcPedestrianCount `
+        "--ticks" $Ticks
+}
 exit $LASTEXITCODE

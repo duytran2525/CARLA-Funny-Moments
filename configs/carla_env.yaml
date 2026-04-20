@@ -33,12 +33,11 @@ weather:
   preset: "ClearNoon"
 
 cil:
-  soft_weight_smoothing: 0.68
   route_lookahead_m: 11.0
-  hybrid_lateral: true
-  residual_steer_gain: 0.24
-  pure_pursuit_wheelbase_m: 2.8
-  pure_pursuit_max_steer_deg: 28.0
+  command_prep_time_s: 2.6
+  command_trigger_min_m: 9.0
+  command_trigger_max_m: 30.0
+  command_retarget_window_s: 3.0
 
 yolo:
   disable_autopilot_red_light: true
