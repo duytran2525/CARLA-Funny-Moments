@@ -113,6 +113,18 @@ class TrafficSupervisor:
         self.config = config
         self.state = SupervisorState.CRUISING
 
+        # ─────────────────────────────────────────────────────────
+        # PATH CORRIDOR PARAMETERS (for trapezoid drawing)
+        # ─────────────────────────────────────────────────────────
+        self.path_wheelbase_m = 2.7
+        self.path_max_steer_angle_deg = 70.0
+        self.path_base_half_width_m = 1.1
+        self.path_width_growth_per_m = 0.035
+        self.path_curve_width_gain = 0.55
+        self.path_max_half_width_m = 2.8
+        self.path_min_forward_m = 0.8
+        self.path_max_forward_m = 40.0
+
         # Merge V10 defaults (can be overridden by external config)
         self.config.setdefault('acc_time_gap', 1.5)
         self.config.setdefault('acc_standstill_dist', 2.0)
@@ -216,6 +228,119 @@ class TrafficSupervisor:
     # LAYER 1: PERCEPTION PROCESSING + ZONE CLASSIFICATION
     # ═══════════════════════════════════════════════════════════════
     
+    def _clamp(self, value: float, low: float, high: float) -> float:
+        """Clamp value between low and high."""
+        return max(low, min(high, value))
+    
+    def _steer_to_curvature(self, vehicle_steer: Optional[float]) -> float:
+        """
+        Chuyển steering angle (-1 to 1) thành curvature (1/meters).
+        
+        Công thức: curvature = tan(wheel_angle) / wheelbase
+        """
+        if vehicle_steer is None:
+            return 0.0
+        steer = self._clamp(float(vehicle_steer), -1.0, 1.0)
+        wheel_angle = steer * math.radians(self.path_max_steer_angle_deg)
+        curvature = math.tan(wheel_angle) / max(self.path_wheelbase_m, 1e-3)
+        return float(self._clamp(curvature, -0.45, 0.45))
+    
+    def _curved_path_center_lateral(self, forward_m: float, vehicle_steer: Optional[float]) -> float:
+        """
+        Tính lateral offset (y) từ center line dựa trên curvature.
+        
+        Công thức: center_y = 0.5 * curvature * forward_m²
+        (This creates a parabolic trajectory)
+        """
+        curvature = self._steer_to_curvature(vehicle_steer)
+        return 0.5 * curvature * float(forward_m) * float(forward_m)
+    
+    def _curved_path_half_width(self, forward_m: float, vehicle_steer: Optional[float]) -> float:
+        """
+        Tính nửa chiều rộng của corridor dựa trên forward distance.
+        
+        Bao gồm:
+        - base: Chiều rộng cơ bản
+        - growth: Tăng thêm dựa trên forward distance
+        - curve_bonus: Tăng thêm khi có curvature
+        """
+        curvature = abs(self._steer_to_curvature(vehicle_steer))
+        base = self.path_base_half_width_m + self.path_width_growth_per_m * max(0.0, forward_m)
+        curve_bonus = self.path_curve_width_gain * curvature * max(0.0, forward_m)
+        return float(min(self.path_max_half_width_m, base + curve_bonus))
+    
+    def _camera_to_vehicle_rotation(self, camera_pitch_deg: float) -> np.ndarray:
+        """
+        Tính rotation matrix từ camera frame sang vehicle frame.
+        
+        Camera pitch: độ dốc của camera (âm = hướng xuống)
+        """
+        pitch_rad = math.radians(-float(camera_pitch_deg))
+        rot_y = np.array(
+            [
+                [math.cos(pitch_rad), 0.0, math.sin(pitch_rad)],
+                [0.0, 1.0, 0.0],
+                [-math.sin(pitch_rad), 0.0, math.cos(pitch_rad)],
+            ],
+            dtype=np.float32,
+        )
+        # Base transformation: camera Y → vehicle Z, camera Z → vehicle -Y
+        base = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        return rot_y @ base
+    
+    def _project_vehicle_to_image(self,
+                                   point_vehicle: np.ndarray,
+                                   frame_width: int,
+                                   frame_height: int,
+                                   camera_fov_deg: float,
+                                   camera_mount_xyz: Tuple[float, float, float],
+                                   camera_pitch_deg: float) -> Optional[Tuple[int, int]]:
+        """
+        Project 3D point từ vehicle frame sang image frame (pixel coordinates).
+        
+        Args:
+            point_vehicle: 3D point trong vehicle frame [x, y, z]
+            frame_width, frame_height: Kích thước frame (pixel)
+            camera_fov_deg: Field of view của camera (độ)
+            camera_mount_xyz: Vị trí camera trong vehicle frame
+            camera_pitch_deg: Góc pitch của camera
+        
+        Returns:
+            (u, v) pixel coordinates, hoặc None nếu point ở phía sau camera
+        """
+        if np is None:
+            return None
+
+        fx = (frame_width / 2.0) / max(math.tan(math.radians(camera_fov_deg) / 2.0), 1e-6)
+        fy = fx
+        cx = frame_width / 2.0
+        cy = frame_height / 2.0
+
+        r_c2v = self._camera_to_vehicle_rotation(camera_pitch_deg)
+        r_v2c = r_c2v.T
+        t = np.array(camera_mount_xyz, dtype=np.float32)
+        p_rel = point_vehicle.astype(np.float32) - t
+        p_cam = r_v2c @ p_rel
+        
+        # Point phải ở phía trước camera (z > 0.15m)
+        if p_cam[2] <= 0.15:
+            return None
+
+        u = fx * (p_cam[0] / p_cam[2]) + cx
+        v = fy * (p_cam[1] / p_cam[2]) + cy
+        
+        if not np.isfinite(u) or not np.isfinite(v):
+            return None
+        
+        return (int(round(u)), int(round(v)))
+    
     def _classify_traffic_light_zone(self, 
                                     bbox: Tuple[int, int, int, int],
                                     image_shape: Optional[Tuple] = None
@@ -263,115 +388,146 @@ class TrafficSupervisor:
     def _build_obstacle_danger_polygon(self,
                        image_shape: Optional[Tuple] = None,
                        vehicle_steer: float = 0.0,
-                       vehicle_speed_kmh: float = 0.0
+                       vehicle_speed_kmh: float = 0.0,
+                       camera_fov_deg: float = 90.0,
+                       camera_mount_xyz: Tuple[float, float, float] = (1.5, 0.0, 2.2),
+                       camera_pitch_deg: float = -8.0
                        ) -> Optional[np.ndarray]:
       """
-      Tạo vùng hành lang hình thang CÓ BẼ CONG theo góc lái + curvature thực tế
+      ┌────────────────────────────────────────────────────────────────┐
+      │ Tạo hình thang danger corridor dính trên mặt đất + bẻ cong     │
+      │ theo góc lái của xe                                             │
+      └────────────────────────────────────────────────────────────────┘
       
-      Cải tiến:
-      1. Tính toán curvature từ vehicle_steer + speed
-      2. Bẻ cong đa giác theo trajectory parabol (v² * curvature)
-      3. Trả về polygon đã bẻ cong chính xác
+      Cách tiếp cận:
+      1. Xác định vehicle-space coordinates (forward, lateral)
+      2. Tính curvature từ steering angle
+      3. Tính center lateral offset từ parabolic trajectory
+      4. Tính corridor half-width dựa trên forward distance
+      5. Tính 3D points trên road plane (z = 0)
+      6. Project sang image frame để lấy pixel coordinates
+      7. Tạo closed polygon từ left + right points
+      
+      Args:
+          image_shape: (height, width, channels) - default (480, 640, 3)
+          vehicle_steer: Steering angle (-1 to 1)
+          vehicle_speed_kmh: Tốc độ (km/h)
+          camera_fov_deg: Camera field of view (độ)
+          camera_mount_xyz: Camera mount position trong vehicle frame (meters)
+          camera_pitch_deg: Camera pitch angle (độ, âm = hướng xuống)
+      
+      Returns:
+          np.ndarray: Polygon (N, 2) trong image coordinates, hoặc None nếu không valid
       """
       if image_shape is None:
           image_shape = (480, 640, 3)
+      
+      if np is None:
+          return None
 
-      h, w = image_shape[0], image_shape[1]
+      frame_h, frame_w = image_shape[0], image_shape[1]
       
       # ─────────────────────────────────────────────────────────
-      # Bước 1: Tính Curvature từ Steering + Speed
+      # Bước 1: Tính Curvature từ Steering
       # ─────────────────────────────────────────────────────────
-      # Công thức: curvature = tan(steer) / wheelbase
-      # wheelbase CARLA ≈ 2.7m, nhưng để đơn giản dùng hệ số tỉ lệ
-      wheelbase_m = 2.7
-      max_steer_angle_deg = 70.0
-      
-      # Chuyển steering (-1 to 1) thành góc lái thực tế (degrees)
-      steer_angle_deg = float(vehicle_steer) * max_steer_angle_deg
-      steer_angle_rad = math.radians(steer_angle_deg)
-      
-      # Curvature = tan(steer_angle) / wheelbase (1/meters)
-      if abs(steer_angle_rad) > 1e-4:
-        curvature_1pm = math.tan(steer_angle_rad) / wheelbase_m
-      else:
-        curvature_1pm = 0.0
-      
-      # Hạn chế curvature cực trị
-      curvature_1pm = np.clip(curvature_1pm, -0.15, 0.15)
+      curvature = self._steer_to_curvature(vehicle_steer)
       
       # ─────────────────────────────────────────────────────────
-      # Bước 2: Thiết lập Keyframe Points (theo Y - chiều rộng)
+      # Bước 2: Xác định Horizon dựa trên Speed
       # ─────────────────────────────────────────────────────────
-      # Horizon thường ở ~55% của chiều cao
-      horizon_ratio = 0.55
-      bottom_v = int(h)
-      horizon_v = int(h * horizon_ratio)
-      
-      # Tham số hành lang (corridor)
-      corridor_bottom_width_ratio = 0.50  # 50% chiều rộng ở đáy
-      corridor_horizon_width_ratio = 0.15  # 15% chiều rộng ở chân trời
+      # Horizon = base + speed-dependent term
+      horizon_m = max(self.path_min_forward_m + 2.0, 12.0)
+      if vehicle_speed_kmh is not None:
+          speed_mps = max(0.0, float(vehicle_speed_kmh) / 3.6)
+          horizon_m = max(horizon_m, speed_mps * 2.2 + 8.0)
+      horizon_m = min(horizon_m, self.path_max_forward_m)
       
       # ─────────────────────────────────────────────────────────
-      # Bước 3: Xây dựng Polyline với Curvature
+      # Bước 3: Sample Points trong Vehicle-Space
       # ─────────────────────────────────────────────────────────
-      # Chúng ta sẽ sample nhiều điểm từ dưới lên (bottom → horizon)
-      sample_count = 40  # Số điểm sample để tạo đường cong mịn
+      # Sample nhiều điểm từ min_forward đến horizon
+      sample_count = max(28, int(horizon_m * 2.5))
+      forward_values = np.linspace(
+          self.path_min_forward_m, 
+          horizon_m, 
+          sample_count, 
+          dtype=np.float32
+      )
       
-      left_points: List[Tuple[int, int]] = []
-      center_points: List[Tuple[int, int]] = []
-      right_points: List[Tuple[int, int]] = []
+      left_pixels: List[Tuple[int, int]] = []
+      right_pixels: List[Tuple[int, int]] = []
       
-      # v = từ bottom_v đến horizon_v (Y screen space)
-      # Tính toán x offset dựa trên curvature
-      v_values = np.linspace(bottom_v, horizon_v, sample_count, dtype=np.float32)
-      
-      for v in v_values:
-        # Khoảng cách từ camera mount về phía trước (meters)
-        # Với camera pitch = -8°, v → distance_forward (xấp xỉ)
-        # Normalize v từ [horizon_v, bottom_v] → [0, max_forward]
-        forward_distance = (1.0 - (v - horizon_v) / (bottom_v - horizon_v)) * 30.0  # 30m horizon
-        
-        # Tính lateral offset từ curvature
-        # x_lateral = 0.5 * curvature * forward_distance²
-        if abs(curvature_1pm) > 1e-6:
-          lateral_offset_m = 0.5 * curvature_1pm * (forward_distance ** 2)
-        else:
-          lateral_offset_m = 0.0
-        
-        # Chuyển lateral_offset (meters) thành pixel offset
-        # Focal length ≈ 800 pixels (với FOV 90°)
-        focal_length = 800.0
-        pixel_x_offset = lateral_offset_m * focal_length / max(forward_distance, 0.1)
-        
-        # Tính width của corridor ở vị trí này (linear interpolation)
-        ratio_forward = (forward_distance / 30.0)  # 0 at horizon, 1 at 30m
-        corridor_width = (
-          corridor_horizon_width_ratio * (1.0 - ratio_forward) +
-          corridor_bottom_width_ratio * ratio_forward
-        ) * w
-        
-        # Center point (chính giữa với offset curvature)
-        center_x = int(w / 2.0 + pixel_x_offset)
-        center_points.append((center_x, int(v)))
-        
-        # Left & Right points
-        half_width = corridor_width / 2.0
-        left_x = int(center_x - half_width)
-        right_x = int(center_x + half_width)
-        
-        left_points.append((left_x, int(v)))
-        right_points.append((right_x, int(v)))
+      for forward_m in forward_values:
+          # ───────────────────────────────────────────────
+          # Tính Center Lateral Offset (bẻ cong từ curvature)
+          # ───────────────────────────────────────────────
+          center_lateral = self._curved_path_center_lateral(forward_m, vehicle_steer)
+          
+          # ───────────────────────────────────────────────
+          # Tính Half-Width của Corridor
+          # ───────────────────────────────────────────────
+          half_width = self._curved_path_half_width(forward_m, vehicle_steer)
+          
+          # ───────────────────────────────────────────────
+          # Tính Left & Right Lateral Positions
+          # ───────────────────────────────────────────────
+          y_left = center_lateral - half_width
+          y_right = center_lateral + half_width
+          
+          # ───────────────────────────────────────────────
+          # Tạo 3D Points trên Road Plane (z = 0, giả sử)
+          # ───────────────────────────────────────────────
+          # Vehicle frame: (x=forward, y=lateral, z=vertical)
+          p_left = np.array([float(forward_m), float(y_left), 0.0], dtype=np.float32)
+          p_right = np.array([float(forward_m), float(y_right), 0.0], dtype=np.float32)
+          
+          # ───────────────────────────────────────────────
+          # Project sang Image Frame (pixel coordinates)
+          # ───────────────────────────────────────────────
+          left_uv = self._project_vehicle_to_image(
+              p_left, 
+              frame_w, 
+              frame_h, 
+              camera_fov_deg,
+              camera_mount_xyz,
+              camera_pitch_deg
+          )
+          right_uv = self._project_vehicle_to_image(
+              p_right, 
+              frame_w, 
+              frame_h, 
+              camera_fov_deg,
+              camera_mount_xyz,
+              camera_pitch_deg
+          )
+          
+          # Chỉ thêm nếu cả hai điểm hợp lệ (trong camera view)
+          if left_uv is not None:
+              left_pixels.append(left_uv)
+          if right_uv is not None:
+              right_pixels.append(right_uv)
       
       # ─────────────────────────────────────────────────────────
-      # Bước 4: Kết hợp Left + Right để tạo Polygon Kín
+      # Bước 4: Kiểm tra có đủ điểm để tạo polygon
+      # ─────────────────────────────────────────────────────────
+      if len(left_pixels) < 4 or len(right_pixels) < 4:
+          return None
+      
+      # ─────────────────────────────────────────────────────────
+      # Bước 5: Tạo Closed Polygon
       # ─────────────────────────────────────────────────────────
       # Polygon = left_points + reversed(right_points)
-      polygon_points = left_points + list(reversed(right_points))
+      # Tạo hình thang kín
+      polygon_points = left_pixels + list(reversed(right_pixels))
       
       if len(polygon_points) < 3:
-        return None
+          return None
       
       polygon = np.array(polygon_points, dtype=np.int32)
+      
+      # Clip polygon points to image bounds to avoid out-of-bounds projections
+      polygon[:, 0] = np.clip(polygon[:, 0], 0, frame_w - 1)
+      polygon[:, 1] = np.clip(polygon[:, 1], 0, frame_h - 1)
       
       # Lưu trữ thông tin debug
       self.last_danger_polygon = polygon
