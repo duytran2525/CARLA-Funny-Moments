@@ -34,9 +34,9 @@ weather:
 
 cil:
   route_lookahead_m: 11.0
-  command_prep_time_s: 2.6
+  command_prep_time_s: 1.8
   command_trigger_min_m: 9.0
-  command_trigger_max_m: 30.0
+  command_trigger_max_m: 24.0
   command_retarget_window_s: 3.0
 
 yolo:

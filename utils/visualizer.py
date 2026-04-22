@@ -183,29 +183,14 @@ class DrivingVisualizer:
 		reason = str(metrics.get("reason", "")).strip()
 
 		lines: list[tuple[str, tuple[int, int, int]]] = [
-			(f"Agent: {agent} | Tick: {tick}", (255, 255, 255)),
+			(f"Agent: {agent} | Tick: {tick} | FPS: {fps:.0f}", (255, 255, 255)),
 			(
 				f"Speed: {speed_kmh:5.1f} km/h | Target: {target_speed_kmh:5.1f} km/h",
 				(255, 255, 255),
 			),
+			(f"Steering: {steer:+.3f}", (40, 220, 255)),
+			(f"Throttle: {throttle:.2f} | Brake: {brake:.2f}", (210, 255, 210)),
 		]
-
-		if steer_raw is None:
-			lines.append((f"Steering: {steer:+.3f}", (40, 220, 255)))
-		else:
-			lines.append(
-				(
-					f"Steering: {steer:+.3f} | Raw: {_clamp(_to_float(steer_raw), -1.0, 1.0):+.3f}",
-					(40, 220, 255),
-				)
-			)
-
-		lines.append((f"Throttle: {throttle:.2f} | Brake: {brake:.2f}", (210, 255, 210)))
-		if yaw_deg is None:
-			lines.append((f"FPS: {fps:5.1f}", (235, 235, 235)))
-		else:
-			yaw = _to_float(yaw_deg, 0.0)
-			lines.append((f"FPS: {fps:5.1f} | Heading Yaw: {yaw:+6.1f} deg", (235, 235, 235)))
 
 		if command is not None:
 			command_id = _to_int(command)
@@ -290,6 +275,7 @@ class RouteMapVisualizer:
 		self.window_name = window_name
 		self.canvas_size = max(320, int(canvas_size))
 		self.enabled = cv2 is not None and np is not None
+		self._stable_bounds: Optional[tuple[float, float, float, float]] = None
 
 	def show(
 		self,
@@ -333,7 +319,14 @@ class RouteMapVisualizer:
 			cv2.waitKey(1)
 			return
 
-		bounds = self._compute_bounds(all_xy)
+		bounds_points = list(route_xy)
+		for pt in (start_xy, dest_xy):
+			if pt is not None:
+				bounds_points.append(pt)
+		if len(bounds_points) < 2:
+			bounds_points = all_xy
+
+		bounds = self._update_stable_bounds(bounds_points)
 		proj = self._build_projector(bounds, self.canvas_size, padding)
 
 		# Draw light grid for orientation.
@@ -394,10 +387,36 @@ class RouteMapVisualizer:
 	def close(self) -> None:
 		if not self.enabled or cv2 is None:
 			return
+		self._stable_bounds = None
 		try:
 			cv2.destroyWindow(self.window_name)
 		except Exception:
 			pass
+
+	def _update_stable_bounds(
+		self,
+		points_xy: Iterable[tuple[float, float]],
+	) -> tuple[float, float, float, float]:
+		new_bounds = self._compute_bounds(points_xy)
+		if self._stable_bounds is None:
+			self._stable_bounds = new_bounds
+			return new_bounds
+
+		min_x, max_x, min_y, max_y = self._stable_bounds
+		new_min_x, new_max_x, new_min_y, new_max_y = new_bounds
+
+		expand_margin = 1.0
+		if new_min_x < (min_x + expand_margin):
+			min_x = new_min_x
+		if new_max_x > (max_x - expand_margin):
+			max_x = new_max_x
+		if new_min_y < (min_y + expand_margin):
+			min_y = new_min_y
+		if new_max_y > (max_y - expand_margin):
+			max_y = new_max_y
+
+		self._stable_bounds = (min_x, max_x, min_y, max_y)
+		return self._stable_bounds
 
 	def _collect_xy(self, points: Optional[Iterable[Any]]) -> list[tuple[float, float]]:
 		result: list[tuple[float, float]] = []
