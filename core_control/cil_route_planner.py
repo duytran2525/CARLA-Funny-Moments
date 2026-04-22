@@ -20,6 +20,7 @@ class CILRoutePlanner:
         self.route_history_xy: list[tuple[float, float]] = []
         self.last_route_context: Dict[str, float] = {
             "route_valid": 0.0,
+            "is_fallback": 0.0,
             "target_x_m": self.route_lookahead_m,
             "target_y_m": 0.0,
             "heading_error_deg": 0.0,
@@ -35,6 +36,7 @@ class CILRoutePlanner:
         self._last_adaptive_target_kmh = None
         self.last_route_context = {
             "route_valid": 0.0,
+            "is_fallback": 0.0,
             "target_x_m": self.route_lookahead_m,
             "target_y_m": 0.0,
             "heading_error_deg": 0.0,
@@ -56,6 +58,60 @@ class CILRoutePlanner:
         if isinstance(item, (tuple, list)) and len(item) >= 1 and hasattr(item[0], "transform"):
             return item[0]
         return None
+
+    def _nearest_route_index(
+        self,
+        route_locations: list[Any],
+        anchor_location: Any,
+        max_probe: int = 120,
+    ) -> int:
+        if not route_locations:
+            return 0
+        if anchor_location is None:
+            return 0
+
+        probe_count = max(1, min(int(max_probe), len(route_locations)))
+        best_idx = 0
+        best_dist = float("inf")
+        for idx, loc in enumerate(route_locations[:probe_count]):
+            dist = self._xy_distance(loc, anchor_location)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        return best_idx
+
+    def _sanitize_route_polyline(
+        self,
+        route_locations: list[Any],
+        anchor_location: Any,
+        max_gap_m: float = 35.0,
+    ) -> list[Any]:
+        if not route_locations:
+            return []
+
+        start_idx = self._nearest_route_index(route_locations, anchor_location)
+
+        sanitized: list[Any] = [route_locations[start_idx]]
+        for loc in route_locations[start_idx + 1 :]:
+            seg = self._xy_distance(loc, sanitized[-1])
+            if seg < 0.10:
+                continue
+            if seg > float(max_gap_m):
+                break
+            sanitized.append(loc)
+
+        # If nearest-start branch is too short, fallback to queue head branch.
+        if len(sanitized) < 3 and start_idx > 0:
+            sanitized = [route_locations[0]]
+            for loc in route_locations[1:]:
+                seg = self._xy_distance(loc, sanitized[-1])
+                if seg < 0.10:
+                    continue
+                if seg > float(max_gap_m):
+                    break
+                sanitized.append(loc)
+
+        return sanitized
 
     @staticmethod
     def _normalize_angle_deg(angle_deg: float) -> float:
@@ -211,18 +267,20 @@ class CILRoutePlanner:
         queue_attr = getattr(planner, "_waypoints_queue", None)
         append_from(queue_attr, max_points)
 
+        if route_locations:
+            route_locations = self._sanitize_route_polyline(
+                route_locations,
+                anchor_location=anchor_location,
+                max_gap_m=35.0,
+            )
+
         # Keep planner polyline pure to avoid distorting route context/command logic.
         # S/D are rendered separately via markers in the map overlay.
         if anchor_location is not None and not route_locations:
             route_locations.append(anchor_location)
 
         if max_points > 0 and len(route_locations) > max_points:
-            if self.destination_location is not None:
-                trimmed = route_locations[: max_points - 1]
-                trimmed.append(self.destination_location)
-                route_locations = trimmed
-            else:
-                route_locations = route_locations[:max_points]
+            route_locations = route_locations[:max_points]
 
         return route_locations
 
@@ -259,8 +317,8 @@ class CILRoutePlanner:
 
         target_x = float(forward.x) * dx + float(forward.y) * dy
         target_y = -(float(right.x) * dx + float(right.y) * dy)
-        target_x = clamp(target_x, -80.0, 80.0)
-        target_y = clamp(target_y, -40.0, 40.0)
+        target_x = clamp(target_x, 3.0, 80.0)
+        target_y = clamp(target_y, -12.0, 12.0)
 
         x_for_heading = target_x if abs(target_x) > 1e-3 else (1e-3 if target_y >= 0.0 else -1e-3)
         heading_error_deg = math.degrees(math.atan2(target_y, x_for_heading))
@@ -273,7 +331,8 @@ class CILRoutePlanner:
         fallback = dict(base_context)
         fallback.update(
             {
-                "route_valid": 0.6,
+                "route_valid": 0.35,
+                "is_fallback": 1.0,
                 "target_x_m": float(target_x),
                 "target_y_m": float(target_y),
                 "heading_error_deg": float(heading_error_deg),
@@ -335,6 +394,7 @@ class CILRoutePlanner:
 
         context: Dict[str, float] = {
             "route_valid": 0.0,
+            "is_fallback": 0.0,
             "target_x_m": float(lookahead_m),
             "target_y_m": 0.0,
             "heading_error_deg": 0.0,
@@ -363,12 +423,21 @@ class CILRoutePlanner:
             )
 
         nearest_idx = -1
-        nearest_dist = float("inf")
+        nearest_score = float("inf")
         for idx, loc in enumerate(route_locations):
-            dist = self._xy_distance(loc, vehicle_location)
-            if dist < nearest_dist:
+            dx = float(loc.x - vehicle_location.x)
+            dy = float(loc.y - vehicle_location.y)
+            dist = math.hypot(dx, dy)
+            x_forward = float(forward.x) * dx + float(forward.y) * dy
+            y_right = float(right.x) * dx + float(right.y) * dy
+
+            behind_penalty = 0.0 if x_forward >= -0.5 else min(18.0, (-x_forward) * 2.0)
+            lateral_penalty = clamp(abs(y_right) - 8.0, 0.0, 20.0) * 0.15
+            score = dist + behind_penalty + lateral_penalty
+
+            if score < nearest_score:
                 nearest_idx = idx
-                nearest_dist = dist
+                nearest_score = score
 
         if nearest_idx < 0:
             return self._fallback_route_context_from_destination(
@@ -380,7 +449,7 @@ class CILRoutePlanner:
                 near_junction=near_junction,
             )
 
-        start_idx = max(0, nearest_idx - 2)
+        start_idx = max(0, nearest_idx - 1)
         route_local_world = route_locations[start_idx : min(len(route_locations), start_idx + 90)]
         if len(route_local_world) < 2:
             return self._fallback_route_context_from_destination(
@@ -399,7 +468,7 @@ class CILRoutePlanner:
             x_forward = float(forward.x) * dx + float(forward.y) * dy
             y_right = float(right.x) * dx + float(right.y) * dy
             y_left = -y_right
-            if x_forward < -5.0:
+            if x_forward < -3.0:
                 continue
             points_xy.append((x_forward, y_left))
 
@@ -485,7 +554,7 @@ class CILRoutePlanner:
             heading_prev = heading_now
             if s < 1.5:
                 continue
-            if abs(heading_delta) > 7.0 or abs(local_curvature) > 0.065 or abs(filtered_points[idx][1]) > 2.0:
+            if abs(heading_delta) > 8.0 or abs(local_curvature) > 0.080:
                 distance_to_turn_m = float(s)
                 break
 
@@ -496,8 +565,11 @@ class CILRoutePlanner:
             max_probe_m=60.0,
         )
 
-        if near_junction:
-            distance_to_junction_m = min(distance_to_junction_m, 0.0)
+        if near_junction and math.isfinite(distance_to_junction_m):
+            distance_to_junction_m = min(
+                distance_to_junction_m,
+                max(4.0, 0.55 * lookahead_m),
+            )
 
         if math.isfinite(distance_to_junction_m):
             junction_proximity = math.exp(-distance_to_junction_m / 14.0)
@@ -511,8 +583,19 @@ class CILRoutePlanner:
         curvature_urgency = clamp(abs(curvature_1pm) / 0.10, 0.0, 1.0)
         turn_urgency = max(turn_urgency, heading_urgency, curvature_urgency)
 
+        route_valid = 1.0
+        route_valid -= clamp((abs(target_y) - 2.2) / 20.0, 0.0, 0.45)
+        route_valid -= clamp((abs(heading_error_deg) - 12.0) / 80.0, 0.0, 0.30)
+        route_valid -= clamp((nearest_score - 6.0) / 30.0, 0.0, 0.25)
+        if target_x < 6.0 and abs(target_y) > 6.0:
+            route_valid -= 0.25
+        if path_len < max(6.0, 0.85 * lookahead_m):
+            route_valid -= 0.20
+        route_valid = clamp(route_valid, 0.0, 1.0)
+
         context = {
-            "route_valid": 1.0,
+            "route_valid": float(route_valid),
+            "is_fallback": 0.0,
             "target_x_m": target_x,
             "target_y_m": target_y,
             "heading_error_deg": float(heading_error_deg),
@@ -600,10 +683,19 @@ class CILRoutePlanner:
 
         far_destination = distance_m is None or distance_m > 28.0
 
+        route_valid = clamp(float(route_context.get("route_valid", 0.0)), 0.0, 1.0)
+        confidence_scale = clamp((route_valid - 0.35) / 0.55, 0.0, 1.0)
+
         turn_urgency = clamp(float(route_context.get("turn_urgency", 0.0)), 0.0, 1.0)
         distance_to_turn_m = max(0.0, float(route_context.get("distance_to_turn_m", 90.0)))
         curvature_abs = abs(float(route_context.get("curvature_1pm", 0.0)))
         junction_proximity = clamp(float(route_context.get("junction_proximity", 0.0)), 0.0, 1.0)
+
+        turn_urgency *= confidence_scale
+        junction_proximity *= confidence_scale
+        curvature_abs *= max(0.45, confidence_scale)
+        if confidence_scale < 0.25:
+            distance_to_turn_m = max(distance_to_turn_m, 35.0)
 
         turn_cap = base_target
         if turn_urgency > 0.05 or distance_to_turn_m < 40.0:
@@ -620,7 +712,7 @@ class CILRoutePlanner:
             junction_cap = clamp(base_target * (1.0 - 0.24 * junction_proximity), junction_floor, base_target)
             adaptive_target = min(adaptive_target, junction_cap)
 
-        if far_destination and turn_urgency < 0.35 and distance_to_turn_m > 10.0 and junction_proximity < 0.45:
+        if far_destination and turn_urgency < 0.35 and distance_to_turn_m > 10.0 and junction_proximity < 0.45 and curvature_abs < 0.04:
             recovery_floor = max(20.0, 0.74 * base_target)
             adaptive_target = max(adaptive_target, recovery_floor)
 
@@ -644,6 +736,7 @@ class CILRoutePlanner:
             "turn_cap_kmh": float(turn_cap),
             "junction_cap_kmh": float(junction_cap),
             "overspeed_kmh": float(overspeed_kmh),
+            "route_valid": float(route_valid),
             "far_destination": 1.0 if far_destination else 0.0,
         }
         return float(adaptive_target), speed_plan

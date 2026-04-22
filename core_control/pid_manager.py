@@ -34,7 +34,7 @@ class SpeedPIDController:
         # Brake PID parameters (responsive deceleration)
         kp_brake: float = 0.8,
         ki_brake: float = 0.01,
-        kd_brake: float = 0.2,
+        kd_brake: float = 0.01,
         # Control limits
         max_throttle: float = 1.0,
         max_brake: float = 1.0,
@@ -260,7 +260,11 @@ class SpeedPIDController:
             i_term = self.ki_brake * self.integral_b
             
             # Derivative term (with filter)
-            derivative = (abs(error) - abs(self.prev_error)) / self.dt
+            # Only allow positive derivative (error increasing = car still accelerating)
+            # Clamp to >= 0 to prevent D-term from cancelling brake when car is
+            # successfully decelerating (which caused 20Hz brake chattering)
+            raw_derivative = (abs(error) - abs(self.prev_error)) / self.dt if self.dt > 0 else 0.0
+            derivative = max(raw_derivative, 0.0)
             self.prev_derivative = (
                 self.derivative_filter_alpha * derivative +
                 (1.0 - self.derivative_filter_alpha) * self.prev_derivative
