@@ -1049,7 +1049,8 @@ class TrafficSupervisor:
 
         candidates: List[Tuple[float, DetectionResult, str]] = []
 
-        if stop_lines:
+        # ✅ FIX: Stop line chỉ được dùng khi có red_light (phải có tín hiệu đèn đỏ)
+        if stop_lines and (red_light is not None):
             nearest_stop = min(stop_lines, key=lambda s: s.distance)
             candidates.append((float(nearest_stop.distance), nearest_stop, 'stop_line'))
 
