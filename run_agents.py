@@ -701,6 +701,12 @@ class RunConfig:
     video_codec: str
     random_weather: bool
     weather_preset: str  # Weather preset from config (e.g., ClearNoon)
+    fps_log_interval_ticks: int
+    cil_enable_hud: bool
+    cil_enable_route_map: bool
+    cil_enable_telemetry_csv: bool
+    cil_profile_tick_timing: bool
+    cil_profile_log_interval_ticks: int
     recovery_interval_frames: int
     recovery_duration_frames: int
     recovery_steer_offset: float
@@ -731,6 +737,66 @@ class BaseSession:
     @property
     def world(self):
         return None
+
+
+class TickFpsProfiler:
+    """Aggregate runtime FPS and per-stage timing to locate bottlenecks."""
+
+    def __init__(self, sync: bool, fixed_delta: float, log_interval_ticks: int) -> None:
+        self.sync = bool(sync)
+        self.fixed_delta = float(fixed_delta)
+        self.log_interval_ticks = max(1, int(log_interval_ticks))
+        self._target_fps = (1.0 / self.fixed_delta) if (self.sync and self.fixed_delta > 0.0) else 0.0
+        self._reset_window()
+
+    def _reset_window(self) -> None:
+        self._count = 0
+        self._sum_total_s = 0.0
+        self._sum_session_s = 0.0
+        self._sum_agent_s = 0.0
+        self._max_tick_s = 0.0
+
+    def record(self, step_idx: int, session_s: float, agent_s: float, total_s: float) -> None:
+        session_s = max(0.0, float(session_s))
+        agent_s = max(0.0, float(agent_s))
+        total_s = max(1e-9, float(total_s))
+
+        self._count += 1
+        self._sum_session_s += session_s
+        self._sum_agent_s += agent_s
+        self._sum_total_s += total_s
+        self._max_tick_s = max(self._max_tick_s, total_s)
+
+        if self._count >= self.log_interval_ticks:
+            self._log_window(step_idx)
+
+    def flush(self, step_idx: int) -> None:
+        if self._count > 0:
+            self._log_window(step_idx)
+
+    def _log_window(self, step_idx: int) -> None:
+        avg_tick_s = self._sum_total_s / max(1, self._count)
+        avg_session_s = self._sum_session_s / max(1, self._count)
+        avg_agent_s = self._sum_agent_s / max(1, self._count)
+        avg_fps = self._count / max(self._sum_total_s, 1e-9)
+        session_share = 100.0 * self._sum_session_s / max(self._sum_total_s, 1e-9)
+        agent_share = 100.0 * self._sum_agent_s / max(self._sum_total_s, 1e-9)
+
+        target_text = f"{self._target_fps:.2f}" if self._target_fps > 0.0 else "unbounded"
+        logging.info(
+            "[FPS] tick=%d avg_fps=%.2f target_fps=%s avg_tick=%.2fms avg_session=%.2fms(%.1f%%) avg_agent=%.2fms(%.1f%%) worst_tick=%.2fms",
+            step_idx,
+            avg_fps,
+            target_text,
+            avg_tick_s * 1000.0,
+            avg_session_s * 1000.0,
+            session_share,
+            avg_agent_s * 1000.0,
+            agent_share,
+            self._max_tick_s * 1000.0,
+        )
+
+        self._reset_window()
 
 
 class CarlaSession(BaseSession):
@@ -1789,12 +1855,6 @@ class CILAgent(BaseAgent):
     COMMAND_WARMUP_DISTANCE_M = 32.0
     COMMAND_RESET_CLEAR_FRAMES = 5
     COMMAND_MAX_LATCH_FRAMES = 220
-    CIL_STEER_DEADBAND = 0.01
-    CIL_MAX_STEER_RATE_PER_S = 2.5
-    CIL_TURN_SPEED_CAP_KMH = 12.0
-    CIL_STRAIGHT_JUNCTION_SPEED_CAP_KMH = 18.0
-    CIL_CLEAR_PHASE_SPEED_CAP_KMH = 22.0
-    CIL_ROUTE_FALLBACK_MIN_VALID = 0.55
 
     def __init__(self, config: RunConfig) -> None:
         super().__init__(config)
@@ -1804,7 +1864,6 @@ class CILAgent(BaseAgent):
         self._camera = None
         self._latest_rgb = None
         self._frame_lock = threading.Lock()
-        self._last_steer = 0.0
         self._waiting_frame_logged = False
         self._collector: Optional[DataCollector] = None
         self._data_cameras = []
@@ -1839,16 +1898,26 @@ class CILAgent(BaseAgent):
         self._command_latch_frames = 0
         self._command_entered_junction = False
         self._command_clear_frames = 0
-        self._last_completed_turn_command = 0
-        self._last_completed_turn_tick = -10000
-        self._last_completed_turn_location = None
         self._last_command_debug: Dict[str, Any] = {}
-        self._last_route_context: Dict[str, float] = {}
         self._last_replan_tick = -10000
         self._route_planner = CILRoutePlanner(
             route_lookahead_m=self._route_lookahead_m,
             arrival_distance_m=self._arrival_distance_m,
         )
+        self._timing_window_ticks = 0
+        self._timing_sums: Dict[str, float] = {
+            "read": 0.0,
+            "nav": 0.0,
+            "model": 0.0,
+            "control": 0.0,
+            "viz": 0.0,
+            "telemetry": 0.0,
+            "total": 0.0,
+        }
+        # HUD debug drawing
+        self._hud_ema_fps: Optional[float] = None
+        self._hud_last_tick_time: Optional[float] = None
+        self._route_overlay_bounds: Optional[tuple[float, float, float, float]] = None
         # Speed control (PID)
         self._speed_controller = SpeedPIDController(
             target_speed_kmh=config.target_speed_kmh,
@@ -1858,6 +1927,7 @@ class CILAgent(BaseAgent):
 
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
+        self._route_overlay_bounds = None
         vehicle = session.ego_vehicle
         world = session.world
         if vehicle is None or world is None:
@@ -1880,14 +1950,16 @@ class CILAgent(BaseAgent):
         self._collector.start()
         self._start_data_collection_cameras(world, vehicle)
         self._init_video_writer()
-        if DrivingVisualizer is not None:
-            self._visualizer = DrivingVisualizer(window_name="CIL Driving HUD")
-        if RouteMapVisualizer is not None:
-            self._route_map = RouteMapVisualizer(window_name="CIL Route Map")
-        self._init_telemetry_logger()
+        if self.config.cil_enable_telemetry_csv:
+            self._init_telemetry_logger()
 
         self._enabled = True
-        logging.info("CIL agent is ready.")
+        logging.info(
+            "CIL agent is ready (hud=%s, route_map=%s, telemetry_csv=%s).",
+            self.config.cil_enable_hud,
+            self.config.cil_enable_route_map,
+            self.config.cil_enable_telemetry_csv,
+        )
 
     def _init_telemetry_logger(self) -> None:
         telemetry_path = (Path(__file__).resolve().parent / "outputs" / "cil_route_debug.csv")
@@ -1899,22 +1971,56 @@ class CILAgent(BaseAgent):
                 "tick",
                 "speed_kmh",
                 "target_speed_kmh",
-                "route_valid",
-                "target_x_m",
-                "target_y_m",
                 "distance_to_turn_m",
                 "distance_to_junction_m",
-                "turn_urgency",
                 "command",
                 "command_phase",
                 "command_source",
+                "upcoming_command",
+                "warmup_block_commands",
                 "steer",
                 "throttle",
                 "brake",
-                "low_confidence_limit",
             ]
         )
         self._telemetry_fp.flush()
+
+    def _accumulate_tick_timing(self, stage_s: Dict[str, float], step_idx: int) -> None:
+        if not self.config.cil_profile_tick_timing:
+            return
+        for key in self._timing_sums.keys():
+            self._timing_sums[key] += float(stage_s.get(key, 0.0))
+        self._timing_window_ticks += 1
+
+        report_every = max(1, int(self.config.cil_profile_log_interval_ticks))
+        if self._timing_window_ticks < report_every:
+            return
+
+        n = float(max(1, self._timing_window_ticks))
+        avg_total_s = self._timing_sums["total"] / n
+        avg_fps = 1.0 / max(1e-9, avg_total_s)
+        nav_share = 100.0 * self._timing_sums["nav"] / max(1e-9, self._timing_sums["total"])
+        model_share = 100.0 * self._timing_sums["model"] / max(1e-9, self._timing_sums["total"])
+        viz_share = 100.0 * self._timing_sums["viz"] / max(1e-9, self._timing_sums["total"])
+
+        logging.info(
+            "[CIL profile] tick=%d avg_fps=%.2f read=%.2fms nav=%.2fms(%.1f%%) model=%.2fms(%.1f%%) control=%.2fms viz=%.2fms(%.1f%%) telemetry=%.2fms",
+            step_idx,
+            avg_fps,
+            1000.0 * self._timing_sums["read"] / n,
+            1000.0 * self._timing_sums["nav"] / n,
+            nav_share,
+            1000.0 * self._timing_sums["model"] / n,
+            model_share,
+            1000.0 * self._timing_sums["control"] / n,
+            1000.0 * self._timing_sums["viz"] / n,
+            viz_share,
+            1000.0 * self._timing_sums["telemetry"] / n,
+        )
+
+        self._timing_window_ticks = 0
+        for key in self._timing_sums.keys():
+            self._timing_sums[key] = 0.0
 
     def _zero_vehicle_motion(self, vehicle) -> None:
         if carla is None:
@@ -2218,43 +2324,6 @@ class CILAgent(BaseAgent):
             self._last_replan_tick = int(step_idx)
             logging.debug("CIL replan attempt failed: %s", exc)
 
-    def _maybe_replan_route_from_context(
-        self,
-        step_idx: int,
-        vehicle,
-        route_context: Optional[Dict[str, float]],
-    ) -> None:
-        if self._nav_agent is None or self._route_destination_location is None:
-            return
-        if not isinstance(route_context, dict):
-            return
-        if step_idx - int(self._last_replan_tick) < 12:
-            return
-
-        route_valid = clamp(float(route_context.get("route_valid", 0.0)), 0.0, 1.0)
-        lateral_abs = abs(float(route_context.get("target_y_m", 0.0)))
-        heading_abs = abs(float(route_context.get("heading_error_deg", 0.0)))
-
-        is_fallback = float(route_context.get("is_fallback", 0.0))
-
-        # CHỈ REPLAN KHI THỰC SỰ CẦN THIẾT (Không replan khi đang ở chế độ dự phòng)
-        if (route_valid >= 0.20 and lateral_abs <= 5.0) or is_fallback > 0.5:
-            return
-
-        try:
-            current_loc = vehicle.get_location()
-            set_navigation_destination(self._nav_agent, current_loc, self._route_destination_location)
-            self._last_replan_tick = int(step_idx)
-            logging.info(
-                "CIL replanned route (unstable context: valid=%.2f lateral=%.1fm heading=%.1fdeg).",
-                route_valid,
-                lateral_abs,
-                heading_abs,
-            )
-        except Exception as exc:
-            self._last_replan_tick = int(step_idx)
-            logging.debug("CIL context-based replan failed: %s", exc)
-
     def _distance_to_destination(self, vehicle_location: Any) -> Optional[float]:
         return self._route_planner.distance_to_destination(vehicle_location)
 
@@ -2267,17 +2336,6 @@ class CILAgent(BaseAgent):
         return math.hypot(
             float(ego_loc.x - self._route_start_location.x),
             float(ego_loc.y - self._route_start_location.y),
-        )
-
-    def _distance_from_last_completed_turn_m(self) -> float:
-        if self._last_completed_turn_location is None:
-            return float("inf")
-        if self.session is None or self.session.ego_vehicle is None:
-            return float("inf")
-        ego_loc = self.session.ego_vehicle.get_location()
-        return math.hypot(
-            float(ego_loc.x - self._last_completed_turn_location.x),
-            float(ego_loc.y - self._last_completed_turn_location.y),
         )
 
     def _current_waypoint(self):
@@ -2294,74 +2352,10 @@ class CILAgent(BaseAgent):
         waypoint = self._current_waypoint()
         return bool(waypoint is not None and getattr(waypoint, "is_junction", False))
 
-    def _command_lookahead_m(self) -> float:
-        speed = max(0.0, float(self._last_speed_kmh))
-        return clamp(4.0 + 0.22 * speed, 4.0, 12.0)
-
-    @staticmethod
-    def _sample_polyline_point(
-        points_xy: list[tuple[float, float]],
-        cumulative_s: list[float],
-        target_s: float,
-    ) -> Optional[tuple[float, float]]:
-        if not points_xy or not cumulative_s:
-            return None
-        if len(points_xy) == 1:
-            return points_xy[0]
-
-        target = max(0.0, float(target_s))
-        if target <= cumulative_s[0]:
-            return points_xy[0]
-        if target >= cumulative_s[-1]:
-            return points_xy[-1]
-
-        for idx in range(1, len(cumulative_s)):
-            if cumulative_s[idx] < target:
-                continue
-            s0 = cumulative_s[idx - 1]
-            s1 = cumulative_s[idx]
-            p0 = points_xy[idx - 1]
-            p1 = points_xy[idx]
-            ratio = (target - s0) / max(1e-6, s1 - s0)
-            x = p0[0] + ratio * (p1[0] - p0[0])
-            y = p0[1] + ratio * (p1[1] - p0[1])
-            return (float(x), float(y))
-        return points_xy[-1]
-
-    @staticmethod
-    def _signed_curvature_3pts(
-        p0: tuple[float, float],
-        p1: tuple[float, float],
-        p2: tuple[float, float],
-    ) -> float:
-        ax = float(p1[0] - p0[0])
-        ay = float(p1[1] - p0[1])
-        bx = float(p2[0] - p1[0])
-        by = float(p2[1] - p1[1])
-        cx = float(p2[0] - p0[0])
-        cy = float(p2[1] - p0[1])
-
-        a = math.hypot(ax, ay)
-        b = math.hypot(bx, by)
-        c = math.hypot(cx, cy)
-        if a <= 1e-4 or b <= 1e-4 or c <= 1e-4:
-            return 0.0
-
-        cross = ax * cy - ay * cx
-        return float((2.0 * cross) / max(1e-6, a * b * c))
-
     @staticmethod
     def _normalize_angle_deg(angle_deg: float) -> float:
         wrapped = (float(angle_deg) + 180.0) % 360.0 - 180.0
         return float(wrapped)
-
-    @staticmethod
-    def _planner_item_to_waypoint(item: Any):
-        if hasattr(item, "transform"):
-            return item
-        if isinstance(item, (tuple, list)) and len(item) >= 1 and hasattr(item[0], "transform"):
-            return item[0]
-        return None
 
     @staticmethod
     def _road_option_to_turn_command(road_option: Any) -> int:
@@ -2397,10 +2391,6 @@ class CILAgent(BaseAgent):
         if not math.isfinite(distance_to_junction_m):
             distance_to_junction_m = float("inf")
 
-        vehicle_loc = None
-        if self.session is not None and self.session.ego_vehicle is not None:
-            vehicle_loc = self.session.ego_vehicle.get_location()
-
         direct_road_option = getattr(planner, "target_road_option", None)
         command = self._road_option_to_turn_command(direct_road_option)
         if command != 0:
@@ -2417,32 +2407,13 @@ class CILAgent(BaseAgent):
                 planner_items = list(queue_attr)
             except Exception:
                 planner_items = []
-            cumulative_distance_m = 0.0
-            prev_loc = vehicle_loc
             for item in planner_items[:96]:
-                waypoint = self._planner_item_to_waypoint(item)
-                wp_loc = waypoint.transform.location if waypoint is not None else None
-                if wp_loc is not None and prev_loc is not None:
-                    cumulative_distance_m += math.hypot(
-                        float(wp_loc.x - prev_loc.x),
-                        float(wp_loc.y - prev_loc.y),
-                    )
-                if wp_loc is not None:
-                    prev_loc = wp_loc
-
                 if not isinstance(item, (tuple, list)) or len(item) < 2:
                     continue
                 command = self._road_option_to_turn_command(item[1])
                 if command != 0:
-                    command_distance_m = float(cumulative_distance_m)
-                    if not math.isfinite(command_distance_m) or command_distance_m <= 0.0:
-                        command_distance_m = float(distance_to_junction_m)
-                    return command, command_distance_m
+                    return command, float(distance_to_junction_m)
         return 0, float("inf")
-
-    def _extract_upcoming_turn_command(self) -> int:
-        command, _ = self._extract_upcoming_turn_signal()
-        return int(command)
 
     def _distance_to_next_junction_m(self, max_probe_m: float = 70.0, step_m: float = 1.5) -> float:
         waypoint = self._current_waypoint()
@@ -2489,76 +2460,11 @@ class CILAgent(BaseAgent):
             self._command_trigger_max_m,
         )
 
-    def _fallback_command_from_route_context(
-        self,
-        route_context: Optional[Dict[str, float]],
-        in_junction: bool,
-        distance_to_junction_m: float,
-        trigger_distance_m: float,
-    ) -> int:
-        if not isinstance(route_context, dict):
-            return 0
-
-        route_valid = float(route_context.get("route_valid", 0.0))
-        heading_error_deg = float(route_context.get("heading_error_deg", 0.0))
-        curvature_1pm = float(route_context.get("curvature_1pm", 0.0))
-        target_x_m = float(route_context.get("target_x_m", self._route_lookahead_m))
-        target_y_m = float(route_context.get("target_y_m", 0.0))
-        turn_urgency = float(route_context.get("turn_urgency", 0.0))
-        distance_to_turn_m = float(route_context.get("distance_to_turn_m", 90.0))
-        junction_proximity = float(route_context.get("junction_proximity", 0.0))
-
-        heading_abs = abs(heading_error_deg)
-        lateral_abs = abs(target_y_m)
-        near_junction_from_map = (
-            math.isfinite(distance_to_junction_m)
-            and distance_to_junction_m <= (trigger_distance_m + 4.0)
-        )
-        near_for_fallback = in_junction or near_junction_from_map
-        emergency_recovery_case = (
-            route_valid < 0.75
-            and heading_abs >= 55.0
-            and lateral_abs >= 10.0
-            and distance_to_turn_m <= 8.0
-        )
-
-        if route_valid < self.CIL_ROUTE_FALLBACK_MIN_VALID and not emergency_recovery_case:
-            return 0
-        if not near_for_fallback and not emergency_recovery_case:
-            return 0
-
-        inferred_from_route = int(self._route_planner.command_from_context(route_context))
-        if inferred_from_route in (1, 2, 3):
-            if inferred_from_route in (1, 2):
-                if abs(heading_error_deg) < 14.0 and distance_to_turn_m > max(8.0, 1.15 * trigger_distance_m):
-                    return 0
-            return inferred_from_route
-
-        lateral_ratio = clamp(target_y_m / max(3.0, abs(target_x_m)), -1.0, 1.0)
-        signed_turn = heading_error_deg + math.degrees(math.atan(curvature_1pm * 8.0)) + 10.0 * lateral_ratio
-
-        if turn_urgency >= 0.35 and distance_to_turn_m <= max(10.0, 1.35 * trigger_distance_m):
-            if signed_turn > 8.0:
-                return 1
-            if signed_turn < -8.0:
-                return 2
-
-        if in_junction and turn_urgency >= 0.50 and distance_to_turn_m <= 10.0 and abs(signed_turn) <= 8.0:
-            return 3
-
-        if turn_urgency >= 0.35 and signed_turn > 11.0:
-            return 1
-        if turn_urgency >= 0.35 and signed_turn < -11.0:
-            return 2
-        return 0
-
     def _update_distance_based_command(
         self,
         speed_kmh: float,
-        route_context: Optional[Dict[str, float]] = None,
         step_idx: Optional[int] = None,
     ) -> tuple[int, Dict[str, Any]]:
-        current_step = int(step_idx) if step_idx is not None else -1
         in_junction = self._is_in_junction()
         upcoming_command, distance_to_upcoming_turn_m = self._extract_upcoming_turn_signal()
         command_source = "planner" if upcoming_command in (1, 2, 3) else "none"
@@ -2567,49 +2473,9 @@ class CILAgent(BaseAgent):
         reset_distance_m = max(8.0, 0.55 * trigger_distance_m)
         if not math.isfinite(distance_to_upcoming_turn_m):
             distance_to_upcoming_turn_m = float("inf")
-        route_distance_to_turn_m = float("inf")
-        if isinstance(route_context, dict):
-            route_distance_to_turn_m = float(route_context.get("distance_to_turn_m", float("inf")))
-            if not math.isfinite(route_distance_to_turn_m):
-                route_distance_to_turn_m = float("inf")
-        if in_junction:
-            command_distance_m = min(distance_to_upcoming_turn_m, route_distance_to_turn_m)
-        else:
-            command_distance_m = distance_to_upcoming_turn_m
-            if math.isfinite(route_distance_to_turn_m):
-                command_distance_m = min(command_distance_m, route_distance_to_turn_m)
-
-        route_valid = 0.0
-        route_heading_abs = 0.0
-        route_lateral_abs = 0.0
-        route_turn_urgency = 0.0
-        route_inferred_command = 0
-        planner_command_suppressed = False
-        planner_suppression_reason = "none"
-        if isinstance(route_context, dict):
-            route_valid = clamp(float(route_context.get("route_valid", 0.0)), 0.0, 1.0)
-            route_heading_abs = abs(float(route_context.get("heading_error_deg", 0.0)))
-            route_lateral_abs = abs(float(route_context.get("target_y_m", 0.0)))
-            route_turn_urgency = clamp(float(route_context.get("turn_urgency", 0.0)), 0.0, 1.0)
-            route_inferred_command = int(self._route_planner.command_from_context(route_context))
-
-        if command_source == "planner" and upcoming_command in (1, 2):
-            planner_conflict = (
-                route_inferred_command in (1, 2)
-                and route_inferred_command != upcoming_command
-                and route_heading_abs >= 16.0
-                and route_lateral_abs >= 3.0
-            )
-            low_confidence_planner = (
-                route_valid < 0.55
-                and not in_junction
-                and command_distance_m > max(10.0, 0.95 * trigger_distance_m)
-            )
-            if planner_conflict or low_confidence_planner:
-                planner_command_suppressed = True
-                planner_suppression_reason = "conflict" if planner_conflict else "low_confidence"
-                upcoming_command = 0
-                command_source = "planner_suppressed"
+        command_distance_m = distance_to_upcoming_turn_m
+        if (not math.isfinite(command_distance_m)) and math.isfinite(distance_to_junction_m):
+            command_distance_m = float(distance_to_junction_m)
 
         distance_from_start_m = self._distance_from_route_start_m()
         warmup_block_commands = (
@@ -2627,55 +2493,16 @@ class CILAgent(BaseAgent):
                 self._command_entered_junction = False
                 self._command_clear_frames = 0
 
-        if self._nav_agent is not None and upcoming_command == 0 and not warmup_block_commands:
-            inferred_command = self._fallback_command_from_route_context(
-                route_context=route_context,
-                in_junction=in_junction,
-                distance_to_junction_m=distance_to_junction_m,
-                trigger_distance_m=trigger_distance_m,
-            )
-            if inferred_command in (1, 2, 3):
-                upcoming_command = inferred_command
-                command_source = "route_fallback"
-                command_distance_m = (
-                    route_distance_to_turn_m
-                    if in_junction
-                    else min(distance_to_junction_m, route_distance_to_turn_m)
-                )
-
         command_retargeted = False
         if self._active_navigation_command != 0 and upcoming_command in (1, 2, 3):
-            dt_s = max(1e-3, float(self.config.fixed_delta))
-            retarget_window_frames = max(
-                20,
-                int(self._command_retarget_window_s / max(1e-3, float(self.config.fixed_delta))),
-            )
-            in_junction_swap_window = max(8, int(0.9 / dt_s))
             if (
                 upcoming_command != self._active_navigation_command
-                and self._command_latch_frames <= retarget_window_frames
+                and not self._command_entered_junction
+                and command_distance_m <= max(10.0, 1.15 * trigger_distance_m)
             ):
-                if not self._command_entered_junction:
-                    self._active_navigation_command = int(upcoming_command)
-                    self._active_command_source = command_source
-                    command_retargeted = True
-                elif (
-                    self._active_navigation_command in (1, 2)
-                    and upcoming_command in (1, 2)
-                    and self._command_latch_frames <= in_junction_swap_window
-                ):
-                    # If we latched the wrong left/right direction right at
-                    # junction entry, allow one quick swap to avoid locking
-                    # into the opposite turn.
-                    self._active_navigation_command = int(upcoming_command)
-                    self._active_command_source = command_source
-                    command_retargeted = True
-                elif self._active_navigation_command == 3 and upcoming_command in (1, 2):
-                    # Upgrade a previously ambiguous straight command to a clear
-                    # left/right decision once route context becomes reliable.
-                    self._active_navigation_command = int(upcoming_command)
-                    self._active_command_source = command_source
-                    command_retargeted = True
+                self._active_navigation_command = int(upcoming_command)
+                self._active_command_source = command_source
+                command_retargeted = True
 
         if self._active_navigation_command == 0:
             self._command_phase = "cruise"
@@ -2683,41 +2510,14 @@ class CILAgent(BaseAgent):
             self._command_clear_frames = 0
             self._command_entered_junction = False
 
-            near_enough_for_latch = command_distance_m <= max(10.0, 1.10 * trigger_distance_m)
-            in_junction_with_near_turn = in_junction and command_distance_m <= max(12.0, 1.30 * trigger_distance_m)
-            fallback_latch_distance = max(
-                14.0,
-                (1.40 if in_junction else 1.20) * trigger_distance_m,
-            )
-            allow_source_latch = command_source == "planner" or (
-                command_source == "route_fallback"
-                and command_distance_m <= fallback_latch_distance
-            )
-            recent_opposite_turn_block = False
-            if (
-                upcoming_command in (1, 2)
-                and self._last_completed_turn_command in (1, 2)
-                and upcoming_command != self._last_completed_turn_command
-            ):
-                elapsed_frames = (
-                    current_step - int(self._last_completed_turn_tick)
-                    if current_step >= 0
-                    else 10**9
+            should_latch = (
+                upcoming_command in (1, 2, 3)
+                and command_source == "planner"
+                and (
+                    command_distance_m <= max(10.0, 1.10 * trigger_distance_m)
+                    or (in_junction and command_distance_m <= max(12.0, 1.30 * trigger_distance_m))
                 )
-                moved_since_turn_m = self._distance_from_last_completed_turn_m()
-                if (
-                    elapsed_frames < 180
-                    and moved_since_turn_m < 42.0
-                    and not in_junction
-                    and route_turn_urgency < 0.90
-                ):
-                    recent_opposite_turn_block = True
-
-            should_latch = allow_source_latch and upcoming_command in (1, 2, 3) and (
-                near_enough_for_latch or in_junction_with_near_turn
             )
-            if recent_opposite_turn_block:
-                should_latch = False
             if should_latch:
                 self._active_navigation_command = int(upcoming_command)
                 self._active_command_source = str(command_source)
@@ -2743,25 +2543,11 @@ class CILAgent(BaseAgent):
                     self._command_clear_frames = 0
 
             should_reset = False
-            stale_fallback_frames = max(8, int(1.0 / max(1e-3, float(self.config.fixed_delta))))
-            if (
-                self._active_command_source == "route_fallback"
-                and command_source == "none"
-                and (not self._command_entered_junction)
-                and route_distance_to_turn_m > (trigger_distance_m + 16.0)
-                and self._command_latch_frames >= stale_fallback_frames
-            ):
-                should_reset = True
             if self._command_entered_junction and not in_junction:
                 if (
                     self._command_clear_frames >= self.COMMAND_RESET_CLEAR_FRAMES
                     and distance_to_junction_m > reset_distance_m
                 ):
-                    if self._active_navigation_command in (1, 2):
-                        self._last_completed_turn_command = int(self._active_navigation_command)
-                        self._last_completed_turn_tick = int(current_step)
-                        if self.session is not None and self.session.ego_vehicle is not None:
-                            self._last_completed_turn_location = self.session.ego_vehicle.get_location()
                     should_reset = True
             if self._command_latch_frames >= self.COMMAND_MAX_LATCH_FRAMES:
                 should_reset = True
@@ -2783,128 +2569,19 @@ class CILAgent(BaseAgent):
             "retargeted": bool(command_retargeted),
             "in_junction": bool(in_junction),
             "distance_to_turn_m": float(command_distance_m),
-            "route_distance_to_turn_m": float(route_distance_to_turn_m),
+            "route_distance_to_turn_m": float("inf"),
             "distance_to_junction_m": float(distance_to_junction_m),
             "trigger_distance_m": float(trigger_distance_m),
             "reset_distance_m": float(reset_distance_m),
             "latch_frames": int(self._command_latch_frames),
             "distance_from_start_m": float(distance_from_start_m),
             "warmup_block_commands": bool(warmup_block_commands),
-            "route_inferred_command": int(route_inferred_command),
-            "planner_command_suppressed": bool(planner_command_suppressed),
-            "planner_suppression_reason": planner_suppression_reason,
+            "route_inferred_command": 0,
+            "planner_command_suppressed": False,
+            "planner_suppression_reason": "none",
         }
         self._last_command_debug = command_debug
         return int(self._active_navigation_command), command_debug
-
-    def _fallback_route_context_from_destination(
-        self,
-        base_context: Dict[str, float],
-        vehicle_loc: Any,
-        forward: Any,
-        right: Any,
-        lookahead_m: float,
-    ) -> Dict[str, float]:
-        if self._route_destination_location is None:
-            self._last_route_context = base_context
-            return base_context
-
-        dx = float(self._route_destination_location.x - vehicle_loc.x)
-        dy = float(self._route_destination_location.y - vehicle_loc.y)
-        dist_xy = math.hypot(dx, dy)
-
-        target_x = float(forward.x) * dx + float(forward.y) * dy
-        target_y = -(float(right.x) * dx + float(right.y) * dy)
-        target_x = clamp(target_x, -80.0, 80.0)
-        target_y = clamp(target_y, -40.0, 40.0)
-
-        x_for_heading = target_x if abs(target_x) > 1e-3 else (1e-3 if target_y >= 0.0 else -1e-3)
-        heading_error_deg = math.degrees(math.atan2(target_y, x_for_heading))
-        curvature_1pm = math.tan(math.radians(heading_error_deg)) / max(6.0, float(lookahead_m))
-
-        heading_urgency = clamp((abs(heading_error_deg) - 4.0) / 22.0, 0.0, 1.0)
-        turn_urgency = max(heading_urgency, clamp(abs(curvature_1pm) / 0.10, 0.0, 1.0))
-        junction_proximity = 0.45 if self._is_near_junction(lookahead_m=lookahead_m) else 0.0
-
-        fallback = dict(base_context)
-        fallback.update(
-            {
-                "route_valid": 0.6,
-                "target_x_m": float(target_x),
-                "target_y_m": float(target_y),
-                "heading_error_deg": float(heading_error_deg),
-                "curvature_1pm": float(curvature_1pm),
-                "distance_to_turn_m": float(max(2.0, min(90.0, 0.35 * dist_xy))),
-                "distance_to_junction_m": float(12.0 if junction_proximity > 0.0 else 90.0),
-                "turn_urgency": float(turn_urgency),
-                "junction_proximity": float(junction_proximity),
-            }
-        )
-        self._last_route_context = fallback
-        return fallback
-
-    def _compute_route_context(self, lookahead_m: Optional[float] = None) -> Dict[str, float]:
-        if lookahead_m is None:
-            lookahead_m = max(self._command_lookahead_m(), self._route_lookahead_m)
-        context: Dict[str, float] = {
-            "route_valid": 0.0,
-            "target_x_m": float(max(4.0, lookahead_m)),
-            "target_y_m": 0.0,
-            "heading_error_deg": 0.0,
-            "curvature_1pm": 0.0,
-            "distance_to_turn_m": 90.0,
-            "distance_to_junction_m": 90.0,
-            "turn_urgency": 0.0,
-            "junction_proximity": 0.0,
-        }
-
-        if self.session is None or self.session.ego_vehicle is None:
-            self._last_route_context = context
-            self._route_planner.last_route_context = context
-            return context
-
-        vehicle = self.session.ego_vehicle
-        vehicle_loc = vehicle.get_location()
-        transform = vehicle.get_transform()
-        route_locations = self._collect_route_locations(max_points=80)
-        world_map = self.session.world.get_map() if self.session is not None and self.session.world is not None else None
-        near_junction = self._is_near_junction(lookahead_m=float(lookahead_m))
-
-        context = self._route_planner.compute_route_context(
-            vehicle_location=vehicle_loc,
-            vehicle_transform=transform,
-            route_locations=route_locations,
-            world_map=world_map,
-            lookahead_m=float(lookahead_m),
-            near_junction=near_junction,
-        )
-        self._last_route_context = context
-        return context
-
-    def _is_near_junction(self, lookahead_m: float = 12.0) -> bool:
-        waypoint = self._current_waypoint()
-        if waypoint is None:
-            return False
-        if waypoint.is_junction:
-            return True
-
-        probe_dists = sorted(
-            {
-                max(3.0, 0.35 * float(lookahead_m)),
-                max(5.0, 0.65 * float(lookahead_m)),
-                max(8.0, float(lookahead_m)),
-            }
-        )
-
-        for probe_dist in probe_dists:
-            try:
-                next_wps = waypoint.next(probe_dist)
-            except Exception:
-                next_wps = []
-            for wp in next_wps:
-                if getattr(wp, "is_junction", False):
-                    return True
-        return False
 
     def _request_stop_at_destination(self, reason: str, distance_m: Optional[float] = None) -> None:
         if self._stop_requested:
@@ -2979,44 +2656,345 @@ class CILAgent(BaseAgent):
             return list(self._cached_route_locations[: max(1, int(max_points))])
         return []
 
-    def _build_lane_center_hint(self, vehicle_location: Any, vehicle_transform: Any) -> Dict[str, float]:
-        if self.session is None or self.session.world is None:
-            return {"valid": 0.0}
-        if vehicle_location is None or vehicle_transform is None:
-            return {"valid": 0.0}
-
-        try:
-            waypoint = self.session.world.get_map().get_waypoint(vehicle_location, project_to_road=True)
-        except Exception:
-            waypoint = None
-        if waypoint is None:
-            return {"valid": 0.0}
-
-        lane_center = waypoint.transform.location
-        forward = vehicle_transform.get_forward_vector()
-        right = vehicle_transform.get_right_vector()
-        dx = float(lane_center.x - vehicle_location.x)
-        dy = float(lane_center.y - vehicle_location.y)
-        target_x = float(forward.x) * dx + float(forward.y) * dy
-        target_y_left = -(float(right.x) * dx + float(right.y) * dy)
-
-        heading_error = self._normalize_angle_deg(
-            float(waypoint.transform.rotation.yaw) - float(vehicle_transform.rotation.yaw)
-        )
-        lane_width = float(getattr(waypoint, "lane_width", 3.5))
-        lane_half_width = max(1.2, 0.5 * lane_width)
-
-        return {
-            "valid": 1.0,
-            "target_x_m": float(clamp(target_x, 2.5, 30.0)),
-            "target_y_m": float(clamp(target_y_left, -12.0, 12.0)),
-            "heading_error_deg": float(heading_error),
-            "lane_half_width_m": float(lane_half_width),
-        }
-
     def _update_route_history(self, location: Any) -> None:
         self._route_planner.update_route_history(location)
         self._route_history_xy = list(self._route_planner.route_history_xy)
+
+    @staticmethod
+    def _overlay_xy(value: Optional[Any]) -> Optional[tuple[float, float]]:
+        if value is None:
+            return None
+        try:
+            return (float(value.x), float(value.y))
+        except Exception:
+            pass
+        if isinstance(value, (tuple, list)) and len(value) >= 2:
+            try:
+                return (float(value[0]), float(value[1]))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    @staticmethod
+    def _downsample_overlay_points(
+        points_xy: list[tuple[float, float]],
+        max_points: int,
+    ) -> list[tuple[float, float]]:
+        if max_points <= 1 or len(points_xy) <= max_points:
+            return list(points_xy)
+        step = max(1, int(math.ceil(len(points_xy) / float(max_points))))
+        sampled = list(points_xy[::step])
+        if sampled[-1] != points_xy[-1]:
+            sampled.append(points_xy[-1])
+        return sampled
+
+    @staticmethod
+    def _compute_route_overlay_bounds(
+        points_xy: list[tuple[float, float]],
+    ) -> tuple[float, float, float, float]:
+        x_values = [pt[0] for pt in points_xy]
+        y_values = [pt[1] for pt in points_xy]
+        min_x, max_x = min(x_values), max(x_values)
+        min_y, max_y = min(y_values), max(y_values)
+        span_x = max(1.0, max_x - min_x)
+        span_y = max(1.0, max_y - min_y)
+        margin_x = max(4.0, span_x * 0.15)
+        margin_y = max(4.0, span_y * 0.15)
+        return (min_x - margin_x, max_x + margin_x, min_y - margin_y, max_y + margin_y)
+
+    def _update_route_overlay_bounds(
+        self,
+        points_xy: list[tuple[float, float]],
+    ) -> tuple[float, float, float, float]:
+        new_bounds = self._compute_route_overlay_bounds(points_xy)
+        if self._route_overlay_bounds is None:
+            self._route_overlay_bounds = new_bounds
+            return new_bounds
+
+        min_x, max_x, min_y, max_y = self._route_overlay_bounds
+        new_min_x, new_max_x, new_min_y, new_max_y = new_bounds
+        expand_margin = 1.0
+        if new_min_x < (min_x + expand_margin):
+            min_x = new_min_x
+        if new_max_x > (max_x - expand_margin):
+            max_x = new_max_x
+        if new_min_y < (min_y + expand_margin):
+            min_y = new_min_y
+        if new_max_y > (max_y - expand_margin):
+            max_y = new_max_y
+        self._route_overlay_bounds = (min_x, max_x, min_y, max_y)
+        return self._route_overlay_bounds
+
+    def _get_spectator_overlay_basis(self) -> Optional[Dict[str, Any]]:
+        if self.session is None or self.session.world is None or carla is None:
+            return None
+        try:
+            spectator_tf = self.session.world.get_spectator().get_transform()
+        except Exception:
+            return None
+
+        rot = spectator_tf.rotation
+        pitch_rad = math.radians(float(rot.pitch))
+        yaw_rad = math.radians(float(rot.yaw))
+        cos_p = math.cos(pitch_rad)
+        sin_p = math.sin(pitch_rad)
+        cos_y = math.cos(yaw_rad)
+        sin_y = math.sin(yaw_rad)
+
+        return {
+            "origin": spectator_tf.location,
+            "vfwd": (cos_p * cos_y, cos_p * sin_y, sin_p),
+            "vup": (-sin_p * cos_y, -sin_p * sin_y, cos_p),
+            "vright": (-sin_y, cos_y, 0.0),
+        }
+
+    def _overlay_plane_location(
+        self,
+        basis: Dict[str, Any],
+        dist_s: float,
+        offset_right: float,
+        offset_up: float,
+    ) -> Any:
+        origin = basis["origin"]
+        fx, fy, fz = basis["vfwd"]
+        rx, ry, rz = basis["vright"]
+        ux, uy, uz = basis["vup"]
+        return carla.Location(
+            x=float(origin.x) + fx * dist_s + rx * offset_right + ux * offset_up,
+            y=float(origin.y) + fy * dist_s + ry * offset_right + uy * offset_up,
+            z=float(origin.z) + fz * dist_s + rz * offset_right + uz * offset_up,
+        )
+
+    def _draw_overlay_panel(
+        self,
+        debug: Any,
+        basis: Dict[str, Any],
+        dist_s: float,
+        left: float,
+        top: float,
+        width: float,
+        height: float,
+        life_time: float,
+        fill_color: Any,
+        border_color: Any,
+        fill_rows: int = 14,
+    ) -> None:
+        if carla is None:
+            return
+        bottom = top - height
+        rows = max(4, int(fill_rows))
+        fill_thickness = max(0.02, min(0.05, height / max(8.0, float(rows))))
+        for idx in range(rows + 1):
+            y = bottom + (height * idx / rows)
+            p0 = self._overlay_plane_location(basis, dist_s, left, y)
+            p1 = self._overlay_plane_location(basis, dist_s, left + width, y)
+            debug.draw_line(
+                p0,
+                p1,
+                thickness=fill_thickness,
+                color=fill_color,
+                life_time=life_time,
+                persistent_lines=False,
+            )
+
+        border_pts = [
+            self._overlay_plane_location(basis, dist_s, left, top),
+            self._overlay_plane_location(basis, dist_s, left + width, top),
+            self._overlay_plane_location(basis, dist_s, left + width, bottom),
+            self._overlay_plane_location(basis, dist_s, left, bottom),
+        ]
+        for idx in range(4):
+            debug.draw_line(
+                border_pts[idx],
+                border_pts[(idx + 1) % 4],
+                thickness=0.03,
+                color=border_color,
+                life_time=life_time,
+                persistent_lines=False,
+            )
+
+    def _draw_route_map_overlay(
+        self,
+        debug: Any,
+        basis: Dict[str, Any],
+        vehicle_location: Any,
+        heading_yaw_deg: float,
+        route_locations: list[Any],
+        command: int,
+        life_time: float,
+    ) -> None:
+        if carla is None:
+            return
+
+        route_xy = [pt for pt in (self._overlay_xy(loc) for loc in route_locations) if pt is not None]
+        trajectory_xy = [pt for pt in (self._overlay_xy(loc) for loc in self._route_history_xy[-180:]) if pt is not None]
+        start_xy = self._overlay_xy(self._route_start_location)
+        dest_xy = self._overlay_xy(self._route_destination_location)
+        current_xy = self._overlay_xy(vehicle_location)
+
+        bounds_points = list(route_xy)
+        bounds_points.extend(trajectory_xy[-45:])
+        for pt in (start_xy, dest_xy, current_xy):
+            if pt is not None:
+                bounds_points.append(pt)
+        if len(bounds_points) < 2:
+            return
+
+        min_x, max_x, min_y, max_y = self._update_route_overlay_bounds(bounds_points)
+        span_x = max(1e-3, max_x - min_x)
+        span_y = max(1e-3, max_y - min_y)
+
+        panel_left = 0.90
+        panel_top = 2.05
+        panel_width = 2.75
+        panel_height = 2.02
+        panel_bottom = panel_top - panel_height
+        dist_s = 4.25
+        self._draw_overlay_panel(
+            debug=debug,
+            basis=basis,
+            dist_s=dist_s,
+            left=panel_left,
+            top=panel_top,
+            width=panel_width,
+            height=panel_height,
+            life_time=life_time,
+            fill_color=carla.Color(r=18, g=18, b=18),
+            border_color=carla.Color(r=105, g=105, b=105),
+            fill_rows=18,
+        )
+
+        command_labels = {0: "LANE_FOLLOW", 1: "LEFT", 2: "RIGHT", 3: "STRAIGHT"}
+        legend_lines = [
+            ("Route Map (Navigator vs Vehicle)", (230, 230, 230), panel_top - 0.12),
+            ("Cyan: planner | Orange: trail", (205, 205, 205), panel_top - 0.30),
+            (f"Command: {command_labels.get(int(command), f'CMD_{command}')}", (255, 230, 120), panel_top - 0.48),
+        ]
+        for text, (r, g, b), y in legend_lines:
+            debug.draw_string(
+                self._overlay_plane_location(basis, dist_s, panel_left + 0.08, y),
+                text,
+                False,
+                carla.Color(r=r, g=g, b=b),
+                life_time,
+                False,
+            )
+
+        plot_left = panel_left + 0.10
+        plot_right = panel_left + panel_width - 0.10
+        plot_bottom = panel_bottom + 0.10
+        plot_top = panel_top - 0.62
+        plot_width = plot_right - plot_left
+        plot_height = plot_top - plot_bottom
+
+        def project_to_overlay(pt_xy: tuple[float, float]) -> Any:
+            u = clamp((pt_xy[0] - min_x) / span_x, 0.0, 1.0)
+            v = clamp((pt_xy[1] - min_y) / span_y, 0.0, 1.0)
+            return self._overlay_plane_location(
+                basis,
+                dist_s,
+                plot_left + u * plot_width,
+                plot_bottom + v * plot_height,
+            )
+
+        for ratio in (0.0, 0.25, 0.50, 0.75, 1.0):
+            y = plot_bottom + ratio * plot_height
+            p0 = self._overlay_plane_location(basis, dist_s, plot_left, y)
+            p1 = self._overlay_plane_location(basis, dist_s, plot_right, y)
+            debug.draw_line(
+                p0,
+                p1,
+                thickness=0.02,
+                color=carla.Color(r=42, g=42, b=42),
+                life_time=life_time,
+                persistent_lines=False,
+            )
+            x = plot_left + ratio * plot_width
+            p2 = self._overlay_plane_location(basis, dist_s, x, plot_bottom)
+            p3 = self._overlay_plane_location(basis, dist_s, x, plot_top)
+            debug.draw_line(
+                p2,
+                p3,
+                thickness=0.02,
+                color=carla.Color(r=42, g=42, b=42),
+                life_time=life_time,
+                persistent_lines=False,
+            )
+
+        def draw_polyline(
+            points_xy: list[tuple[float, float]],
+            color: Any,
+            max_points: int,
+            thickness: float,
+        ) -> None:
+            sampled = self._downsample_overlay_points(points_xy, max_points=max_points)
+            if len(sampled) < 2:
+                return
+            prev_loc = project_to_overlay(sampled[0])
+            for pt_xy in sampled[1:]:
+                cur_loc = project_to_overlay(pt_xy)
+                debug.draw_line(
+                    prev_loc,
+                    cur_loc,
+                    thickness=thickness,
+                    color=color,
+                    life_time=life_time,
+                    persistent_lines=False,
+                )
+                prev_loc = cur_loc
+
+        draw_polyline(route_xy, carla.Color(r=0, g=220, b=255), max_points=48, thickness=0.035)
+        draw_polyline(trajectory_xy, carla.Color(r=255, g=165, b=0), max_points=36, thickness=0.032)
+
+        def offset_loc(base_loc: Any, dx: float, dy: float) -> Any:
+            rx, ry, rz = basis["vright"]
+            ux, uy, uz = basis["vup"]
+            return carla.Location(
+                x=float(base_loc.x) + rx * dx + ux * dy,
+                y=float(base_loc.y) + ry * dx + uy * dy,
+                z=float(base_loc.z) + rz * dx + uz * dy,
+            )
+
+        def draw_marker(pt_xy: Optional[tuple[float, float]], label: str, color: Any, size: float) -> None:
+            if pt_xy is None:
+                return
+            loc = project_to_overlay(pt_xy)
+            debug.draw_point(loc, size=size, color=color, life_time=life_time, persistent_lines=False)
+            debug.draw_string(
+                offset_loc(loc, 0.06, 0.06),
+                label,
+                False,
+                color,
+                life_time,
+                False,
+            )
+
+        draw_marker(start_xy, "S", carla.Color(r=40, g=220, b=40), 0.07)
+        draw_marker(dest_xy, "D", carla.Color(r=255, g=40, b=40), 0.07)
+
+        if current_xy is not None:
+            current_loc = project_to_overlay(current_xy)
+            debug.draw_point(
+                current_loc,
+                size=0.08,
+                color=carla.Color(r=255, g=255, b=0),
+                life_time=life_time,
+                persistent_lines=False,
+            )
+            yaw_rad = math.radians(float(heading_yaw_deg))
+            heading_xy = (
+                current_xy[0] + 4.0 * math.cos(yaw_rad),
+                current_xy[1] + 4.0 * math.sin(yaw_rad),
+            )
+            heading_loc = project_to_overlay(heading_xy)
+            debug.draw_line(
+                current_loc,
+                heading_loc,
+                thickness=0.03,
+                color=carla.Color(r=255, g=255, b=0),
+                life_time=life_time,
+                persistent_lines=False,
+            )
 
     def _draw_route_debug_overlay(self, step_idx: int, route_locations: list[Any], vehicle_location: Any) -> None:
         if self.session is None or self.session.world is None or carla is None:
@@ -3221,88 +3199,45 @@ class CILAgent(BaseAgent):
         speed_mps = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
         return speed_mps * 3.6
 
-    def _longitudinal_control(
+    def _longitudinal_control_command_only(
         self,
         speed_kmh: float,
-        route_context: Dict[str, float],
         destination_distance_m: Optional[float],
         command: int = 0,
         command_phase: str = "cruise",
+        distance_to_turn_m: float = float("inf"),
     ) -> tuple[float, float, float, Dict[str, float]]:
-        """Compute throttle/brake from PID with adaptive target-speed planning."""
-        adaptive_target_kmh, speed_plan = self._route_planner.compute_adaptive_target_speed_kmh(
-            base_target_speed_kmh=self.config.target_speed_kmh,
-            current_speed_kmh=speed_kmh,
-            route_context=route_context,
-            destination_distance_m=destination_distance_m,
-            dt_s=(self.config.fixed_delta if self.config.sync else (1.0 / 20.0)),
-        )
-
-        route_turn_urgency = clamp(float(route_context.get("turn_urgency", 0.0)), 0.0, 1.0)
-        route_junction_proximity = clamp(float(route_context.get("junction_proximity", 0.0)), 0.0, 1.0)
-
+        adaptive_target_kmh = max(5.0, float(self.config.target_speed_kmh))
         phase = str(command_phase).lower()
-        command_cap_kmh: Optional[float] = None
+        distance_to_turn_m = float(distance_to_turn_m)
+
+        command_cap_kmh = adaptive_target_kmh
         if int(command) in (1, 2):
             if phase in {"armed", "in_junction"}:
-                command_cap_kmh = clamp(27.0 - 15.0 * route_turn_urgency, 12.0, 25.0)
+                command_cap_kmh = clamp(12.0 + 0.90 * distance_to_turn_m, 12.0, adaptive_target_kmh)
             elif phase == "clear":
-                command_cap_kmh = clamp(30.0 - 10.0 * route_turn_urgency, self.CIL_CLEAR_PHASE_SPEED_CAP_KMH, 30.0)
+                command_cap_kmh = clamp(18.0 + 0.80 * distance_to_turn_m, 18.0, adaptive_target_kmh)
         elif int(command) == 3:
             if phase in {"armed", "in_junction"}:
-                command_cap_kmh = clamp(30.0 - 8.0 * route_junction_proximity, self.CIL_STRAIGHT_JUNCTION_SPEED_CAP_KMH, 30.0)
+                command_cap_kmh = clamp(16.0 + 0.95 * distance_to_turn_m, 16.0, adaptive_target_kmh)
             elif phase == "clear":
-                command_cap_kmh = clamp(31.0 - 8.0 * route_junction_proximity, self.CIL_CLEAR_PHASE_SPEED_CAP_KMH, 31.0)
+                command_cap_kmh = clamp(20.0 + 0.80 * distance_to_turn_m, 20.0, adaptive_target_kmh)
+        adaptive_target_kmh = min(adaptive_target_kmh, command_cap_kmh)
 
-        if command_cap_kmh is not None:
-            adaptive_target_kmh = min(float(adaptive_target_kmh), float(command_cap_kmh))
-            speed_plan["command_cap_kmh"] = float(command_cap_kmh)
-        else:
-            speed_plan["command_cap_kmh"] = float(adaptive_target_kmh)
-
-        heading_abs = abs(float(route_context.get("heading_error_deg", 0.0)))
-        lateral_abs = abs(float(route_context.get("target_y_m", 0.0)))
-        turn_urgency = route_turn_urgency
-        route_valid = clamp(float(route_context.get("route_valid", 0.0)), 0.0, 1.0)
-        is_fallback = float(route_context.get("is_fallback", 0.0)) > 0.5
-        recovery_cap_kmh = float(adaptive_target_kmh)
-        has_reliable_route = route_valid >= 0.72 and not is_fallback
-        if has_reliable_route:
-            if int(command) == 0:
-                should_limit_lane_follow = (
-                    heading_abs >= 26.0 or lateral_abs >= 5.5 or turn_urgency >= 0.75
-                )
-                if should_limit_lane_follow:
-                    recovery_severity = max(
-                        clamp((heading_abs - 26.0) / 70.0, 0.0, 1.0),
-                        clamp((lateral_abs - 5.5) / 16.0, 0.0, 1.0),
-                        clamp((turn_urgency - 0.75) / 0.35, 0.0, 1.0),
-                    )
-                    recovery_cap_kmh = clamp(36.0 - 10.0 * recovery_severity, 24.0, 38.0)
-                    adaptive_target_kmh = min(float(adaptive_target_kmh), float(recovery_cap_kmh))
-            elif heading_abs >= 20.0 or lateral_abs >= 3.0 or turn_urgency >= 0.70:
-                recovery_severity = max(
-                    clamp((heading_abs - 20.0) / 80.0, 0.0, 1.0),
-                    clamp((lateral_abs - 3.0) / 14.0, 0.0, 1.0),
-                    clamp((turn_urgency - 0.55) / 0.45, 0.0, 1.0),
-                )
-                if route_valid < 0.85:
-                    recovery_severity = clamp(
-                        recovery_severity + clamp((0.85 - route_valid) / 0.35, 0.0, 1.0) * 0.35,
-                        0.0,
-                        1.0,
-                    )
-                recovery_cap_kmh = clamp(24.0 - 12.0 * recovery_severity, 10.0, 24.0)
-                adaptive_target_kmh = min(float(adaptive_target_kmh), float(recovery_cap_kmh))
-        # Emergency speed cap when route is completely lost
-        elif route_valid < 0.30 and not is_fallback and (heading_abs > 30.0 or lateral_abs > 10.0):
-            lost_severity = max(
-                clamp((heading_abs - 30.0) / 50.0, 0.0, 1.0),
-                clamp((lateral_abs - 10.0) / 20.0, 0.0, 1.0),
-            )
-            recovery_cap_kmh = clamp(15.0 - 10.0 * lost_severity, 5.0, 15.0)
-            adaptive_target_kmh = min(float(adaptive_target_kmh), float(recovery_cap_kmh))
-        speed_plan["recovery_cap_kmh"] = float(recovery_cap_kmh)
+        dest_cap_kmh = adaptive_target_kmh
+        if destination_distance_m is not None and math.isfinite(float(destination_distance_m)):
+            distance_m = max(0.0, float(destination_distance_m))
+            stop_buffer = max(3.6, self._arrival_distance_m + 0.8)
+            if distance_m <= 45.0:
+                comfort_decel_ms2 = 2.8
+                available = max(0.0, distance_m - stop_buffer)
+                v_stop_kmh = math.sqrt(max(0.0, 2.0 * comfort_decel_ms2 * available)) * 3.6
+                dest_cap_kmh = clamp(v_stop_kmh, 9.0, adaptive_target_kmh)
+                adaptive_target_kmh = min(adaptive_target_kmh, dest_cap_kmh)
+            if distance_m < 18.0:
+                near_dest_cap = clamp(4.5 + 0.65 * distance_m, 4.0, adaptive_target_kmh)
+                dest_cap_kmh = min(dest_cap_kmh, near_dest_cap)
+                adaptive_target_kmh = min(adaptive_target_kmh, near_dest_cap)
 
         self._speed_controller.set_target_speed(adaptive_target_kmh)
         throttle, brake = self._speed_controller.compute(speed_kmh)
@@ -3314,39 +3249,14 @@ class CILAgent(BaseAgent):
                 brake = float(feedforward_brake)
                 throttle = 0.0
 
-        # Emergency full stop when car is completely lost (any command)
-        completely_lost = (
-            route_valid < 0.15
-            and not is_fallback
-            and (heading_abs > 45.0 or lateral_abs > 20.0)
-            and speed_kmh < 8.0
-        )
-        if completely_lost:
-            throttle = 0.0
-            lost_brake = clamp(
-                max((heading_abs - 40.0) / 40.0, (lateral_abs - 15.0) / 25.0),
-                0.3,
-                self.config.max_brake,
-            )
-            brake = max(float(brake), float(lost_brake))
-
-        # In low-confidence route fallback, avoid pushing hard throttle into walls.
-        # Applies regardless of active command when route is unreliable
-        low_confidence_risk = (
-            route_valid < 0.55
-            and not is_fallback
-            and (heading_abs > 25.0 or lateral_abs > 8.0)
-        )
-        if low_confidence_risk:
-            risk_severity = max(
-                clamp((heading_abs - 25.0) / 55.0, 0.0, 1.0),
-                clamp((lateral_abs - 8.0) / 12.0, 0.0, 1.0),
-            )
-            throttle = min(float(throttle), 0.35 - 0.25 * risk_severity)
-            if speed_kmh > 12.0:
-                brake = max(float(brake), 0.05 + 0.20 * risk_severity)
-        speed_plan["low_confidence_limit"] = 1.0 if (low_confidence_risk or completely_lost) else 0.0
-
+        speed_plan = {
+            "base_target_kmh": float(self.config.target_speed_kmh),
+            "adaptive_target_kmh": float(adaptive_target_kmh),
+            "command_cap_kmh": float(command_cap_kmh),
+            "dest_cap_kmh": float(dest_cap_kmh),
+            "overspeed_kmh": float(overspeed_kmh),
+            "distance_to_turn_m": float(distance_to_turn_m),
+        }
         self._last_speed_plan = speed_plan
         return throttle, brake, float(adaptive_target_kmh), speed_plan
 
@@ -3373,11 +3283,189 @@ class CILAgent(BaseAgent):
             steering_value = float(self._model(image_tensor, speed_tensor, command_tensor).item())
         return clamp(steering_value, -1.0, 1.0)
 
+    def _update_hud_fps(self) -> float:
+        """Track HUD FPS using exponential moving average."""
+        now = time.perf_counter()
+        if self._hud_last_tick_time is None:
+            self._hud_last_tick_time = now
+            return 0.0
+        dt = now - self._hud_last_tick_time
+        self._hud_last_tick_time = now
+        if dt <= 1e-6:
+            return float(self._hud_ema_fps) if self._hud_ema_fps is not None else 0.0
+        instant_fps = 1.0 / dt
+        if self._hud_ema_fps is None:
+            self._hud_ema_fps = instant_fps
+        else:
+            self._hud_ema_fps = 0.90 * self._hud_ema_fps + 0.10 * instant_fps
+        return self._hud_ema_fps
+
+    def _draw_hud_on_screen(
+        self,
+        step_idx: int,
+        speed_kmh: float,
+        target_speed_kmh: float,
+        steer: float,
+        throttle: float,
+        brake: float,
+        command: int,
+        fps: float,
+        destination_distance_m: Optional[float],
+        route_locations: list,
+    ) -> None:
+        """Draw telemetry HUD and route lines directly in the CARLA viewport."""
+        if self.session is None or self.session.world is None or carla is None:
+            return
+        if self.session.ego_vehicle is None:
+            return
+        show_hud = bool(self.config.cil_enable_hud)
+        show_route_map = bool(self.config.cil_enable_route_map)
+        if not show_hud and not show_route_map:
+            return
+
+        vehicle = self.session.ego_vehicle
+        world = self.session.world
+        debug = world.debug
+        life_time = max(0.08, self.config.fixed_delta * 2.5 if self.config.sync else 0.12)
+
+        transform = vehicle.get_transform()
+        loc = transform.location
+        basis = self._get_spectator_overlay_basis()
+        if basis is None:
+            return
+
+        command_labels = {0: "LANE_FOLLOW", 1: "LEFT", 2: "RIGHT", 3: "STRAIGHT"}
+        cmd_label = command_labels.get(int(command), f"CMD_{command}")
+        dist_text = f"{destination_distance_m:.1f}m" if destination_distance_m is not None else "N/A"
+
+        hud_lines = [
+            f"Speed: {speed_kmh:.1f} / {target_speed_kmh:.1f} km/h",
+            f"Steer: {steer:+.3f}",
+            f"Thr: {throttle:.2f}  Brk: {brake:.2f}",
+            f"Cmd: {cmd_label}  FPS: {fps:.0f}",
+            f"Dist: {dist_text}",
+        ]
+
+        hud_dist = 4.25
+        left_off = -3.55
+        top_off = 2.02
+        line_h = 0.23
+        hud_life_time = max(
+            0.015,
+            min(0.05, (0.70 * self.config.fixed_delta) if self.config.sync else 0.05),
+        )
+        if show_hud:
+            self._draw_overlay_panel(
+                debug=debug,
+                basis=basis,
+                dist_s=hud_dist,
+                left=left_off - 0.16,
+                top=top_off + 0.10,
+                width=2.05,
+                height=1.30,
+                life_time=hud_life_time,
+                fill_color=carla.Color(r=20, g=20, b=20),
+                border_color=carla.Color(r=92, g=92, b=92),
+                fill_rows=12,
+            )
+
+            for i, line in enumerate(hud_lines):
+                debug.draw_string(
+                    self._overlay_plane_location(basis, hud_dist, left_off, top_off - i * line_h),
+                    line,
+                    False,
+                    carla.Color(r=255, g=255, b=0),
+                    hud_life_time,
+                    False,
+                )
+
+        # ── Route visualization (3D lines in the world) ──
+        if show_route_map and route_locations and len(route_locations) >= 2:
+            lift = 0.40
+            step = max(1, len(route_locations) // 40)
+            for idx in range(0, len(route_locations) - step, step):
+                loc_a = route_locations[idx]
+                loc_b = route_locations[min(idx + step, len(route_locations) - 1)]
+                p0 = carla.Location(x=float(loc_a.x), y=float(loc_a.y), z=float(loc_a.z) + lift)
+                p1 = carla.Location(x=float(loc_b.x), y=float(loc_b.y), z=float(loc_b.z) + lift)
+                debug.draw_line(
+                    p0, p1,
+                    thickness=0.08,
+                    color=carla.Color(r=0, g=220, b=255),
+                    life_time=life_time,
+                    persistent_lines=False,
+                )
+
+        if show_route_map and route_locations:
+            self._draw_route_map_overlay(
+                debug=debug,
+                basis=basis,
+                vehicle_location=loc,
+                heading_yaw_deg=float(transform.rotation.yaw),
+                route_locations=route_locations,
+                command=command,
+                life_time=hud_life_time,
+            )
+
+        # Draw destination marker
+        if show_route_map and self._route_destination_location is not None:
+            d_loc = self._route_destination_location
+            d_point = carla.Location(
+                x=float(d_loc.x), y=float(d_loc.y), z=float(d_loc.z) + 2.0,
+            )
+            debug.draw_point(d_point, size=0.20, color=carla.Color(r=255, g=50, b=50), life_time=life_time, persistent_lines=False)
+            debug.draw_string(d_point, "  DEST", False, carla.Color(r=255, g=50, b=50), life_time, False)
+
+    def _update_spectator_follow(self) -> None:
+        """Lock the spectator camera to follow behind the ego vehicle each tick."""
+        if self.session is None or self.session.world is None or self.session.ego_vehicle is None:
+            return
+        if carla is None:
+            return
+
+        vehicle = self.session.ego_vehicle
+        transform = vehicle.get_transform()
+        forward = transform.get_forward_vector()
+        loc = transform.location
+
+        follow_dist = float(self.config.spectator_follow_distance)
+        height = float(self.config.spectator_height)
+        pitch = float(self.config.spectator_pitch)
+
+        spectator_loc = carla.Location(
+            x=float(loc.x) - float(forward.x) * follow_dist,
+            y=float(loc.y) - float(forward.y) * follow_dist,
+            z=float(loc.z) + height,
+        )
+        spectator_rot = carla.Rotation(
+            pitch=pitch,
+            yaw=float(transform.rotation.yaw),
+            roll=0.0,
+        )
+        try:
+            self.session.world.get_spectator().set_transform(
+                carla.Transform(spectator_loc, spectator_rot)
+            )
+        except Exception:
+            pass
+
     def run_step(self, step_idx: int) -> None:
         if not self._enabled:
             if step_idx % 50 == 0:
                 logging.info("CIL agent waiting for CARLA runtime.")
             return
+
+        tick_t0 = time.perf_counter()
+        stage_times = {
+            "read": 0.0,
+            "nav": 0.0,
+            "model": 0.0,
+            "control": 0.0,
+            "viz": 0.0,
+            "telemetry": 0.0,
+            "total": 0.0,
+        }
+        read_t0 = tick_t0
 
         frame = self._read_latest_frame()
         if frame is None:
@@ -3392,6 +3480,7 @@ class CILAgent(BaseAgent):
 
         speed_kmh = self._current_speed_kmh()
         self._last_speed_kmh = speed_kmh
+        stage_times["read"] = time.perf_counter() - read_t0
 
         self._write_video_frame(frame)
         if self._stop_requested:
@@ -3403,6 +3492,8 @@ class CILAgent(BaseAgent):
             self._request_stop_at_destination("distance_threshold", destination_distance_m)
             return
 
+        nav_t0 = time.perf_counter()
+
         if self._nav_agent is not None:
             try:
                 if self._nav_agent.done():
@@ -3413,141 +3504,26 @@ class CILAgent(BaseAgent):
             self._refresh_planner_state()
             self._maybe_replan_route(step_idx, vehicle)
 
-        route_context = self._compute_route_context()
-        self._maybe_replan_route_from_context(step_idx, vehicle, route_context)
         command, command_debug = self._update_distance_based_command(
             speed_kmh=speed_kmh,
-            route_context=route_context,
             step_idx=step_idx,
         )
-        lane_hint = self._build_lane_center_hint(
-            vehicle_location=vehicle.get_location(),
-            vehicle_transform=vehicle.get_transform(),
-        )
+
+        stage_times["nav"] = time.perf_counter() - nav_t0
+
+        model_t0 = time.perf_counter()
         model_steer = self._predict_cil_steering(frame, speed_kmh, command)
-        route_heading_abs = abs(float(route_context.get("heading_error_deg", 0.0)))
-        route_lateral_abs = abs(float(route_context.get("target_y_m", 0.0)))
-        route_turn_urgency = clamp(float(route_context.get("turn_urgency", 0.0)), 0.0, 1.0)
-        route_valid = clamp(float(route_context.get("route_valid", 0.0)), 0.0, 1.0)
-        is_fallback = float(route_context.get("is_fallback", 0.0)) > 0.5
-        command_active_source = str(command_debug.get("active_source", "none"))
-        command_distance_to_turn = float(command_debug.get("distance_to_turn_m", float("inf")))
-        steer_gain = 1.0
-        steer_gain += 0.45 * clamp((route_heading_abs - 14.0) / 70.0, 0.0, 1.0)
-        steer_gain += 0.35 * clamp((route_lateral_abs - 2.0) / 14.0, 0.0, 1.0)
-        if command in (1, 2, 3):
-            steer_gain += 0.20 * route_turn_urgency
-        if command in (1, 2) and command_active_source == "planner":
-            if command_distance_to_turn <= 8.0:
-                steer_gain += 0.45
-            elif command_distance_to_turn <= 14.0:
-                steer_gain += 0.25
-        if route_valid >= 0.72 and route_valid < 0.90:
-            steer_gain += 0.12 * clamp((0.90 - route_valid) / 0.18, 0.0, 1.0)
-        if command_active_source == "planner":
-            steer_gain_limit = 1.25
-        elif route_valid >= 0.72:
-            steer_gain_limit = 1.15
-        elif route_valid >= 0.30 and not is_fallback:
-            steer_gain_limit = 1.05
-        else:
-            # Don't amplify noisy CNN output when route is completely lost
-            steer_gain_limit = 1.0
-        steer_gain = clamp(steer_gain, 1.0, steer_gain_limit)
-        steering_raw = clamp(model_steer * steer_gain, -1.0, 1.0)
+        stage_times["model"] = time.perf_counter() - model_t0
 
-        target_x_m = float(route_context.get("target_x_m", self._route_lookahead_m))
-        target_y_m = float(route_context.get("target_y_m", 0.0))
-        lateral_ratio = clamp(target_y_m / max(4.0, abs(target_x_m)), -1.0, 1.0)
-        route_steer_correction = clamp(
-            -(float(route_context.get("heading_error_deg", 0.0)) / 55.0) - 0.45 * lateral_ratio,
-            -0.85,
-            0.85,
-        )
-        route_assist_weight = 0.0
-        # Allow emergency route assist even at low route_valid when car is way off-course
-        if route_valid >= 0.72 or (route_heading_abs >= 30.0 and route_valid >= 0.25 and not is_fallback):
-            valid_scale = 1.0 if route_valid >= 0.72 else clamp((route_valid - 0.2) / 0.52, 0.2, 0.7)
-            route_assist_weight = max(
-                clamp((route_heading_abs - 18.0) / 70.0, 0.0, 0.35),
-                clamp((route_lateral_abs - 2.5) / 14.0, 0.0, 0.35),
-            )
-            route_assist_weight *= valid_scale
-            if command in (1, 2):
-                route_assist_weight += 0.12
-                if command_active_source == "planner" and command_distance_to_turn <= 10.0:
-                    route_assist_weight += 0.18
-            elif command == 3:
-                # STRAIGHT: chỉ dùng route assist rất nhẹ, để CNN tự lái thẳng
-                route_assist_weight *= 0.3
-        route_assist_weight = clamp(route_assist_weight, 0.0, 0.55)
-        if route_assist_weight > 0.0:
-            steering_raw = clamp(
-                (1.0 - route_assist_weight) * steering_raw
-                + route_assist_weight * route_steer_correction,
-                -1.0,
-                1.0,
-            )
+        control_t0 = time.perf_counter()
+        steering = clamp(model_steer, -1.0, 1.0)
 
-        lane_hint_valid = float(lane_hint.get("valid", 0.0))
-        if int(command) == 0 and lane_hint_valid > 0.5 and route_turn_urgency < 0.60:
-            lane_heading = float(lane_hint.get("heading_error_deg", 0.0))
-            lane_target_y = float(lane_hint.get("target_y_m", 0.0))
-            lane_half_width = max(1.2, float(lane_hint.get("lane_half_width_m", 1.75)))
-            lane_ratio = clamp(lane_target_y / lane_half_width, -1.4, 1.4)
-            lane_correction = clamp(
-                -(lane_heading / 55.0) - 0.15 * lane_ratio,
-                -0.25,
-                0.25,
-            )
-            lane_weight = clamp(
-                0.08
-                + 0.12 * clamp(abs(lane_target_y) - 0.15, 0.0, 2.0)
-                + 0.01 * clamp(abs(lane_heading) - 2.0, 0.0, 20.0),
-                0.08,
-                0.34,
-            )
-            steering_raw = clamp(
-                (1.0 - lane_weight) * steering_raw + lane_weight * lane_correction,
-                -1.0,
-                1.0,
-            )
-
-        if int(command) == 0:
-            if route_valid < 0.72:
-                # Adaptive clamp: allow more steering when heading error is large
-                # If fallback, allow CNN to steer more freely since route is unreliable
-                if is_fallback:
-                    low_valid_limit = 0.50
-                else:
-                    heading_factor = clamp(route_heading_abs / 45.0, 0.0, 1.0)
-                    low_valid_limit = 0.12 + 0.38 * heading_factor
-                steering_raw = clamp(steering_raw, -low_valid_limit, low_valid_limit)
-            elif route_turn_urgency < 0.45 and command_distance_to_turn > 25.0:
-                steering_raw = clamp(steering_raw, -0.34, 0.34)
-            if route_valid < 0.60 and route_lateral_abs > 10.0 and route_heading_abs < 25.0 and not is_fallback:
-                steering_raw = clamp(0.35 * steering_raw, -0.15, 0.15)
-
-        steering_target = 0.0 if abs(steering_raw) < self.CIL_STEER_DEADBAND else steering_raw
-        alpha_base = clamp(self.config.steer_smoothing, 0.0, 0.99)
-        speed_ratio = clamp(speed_kmh / 50.0, 0.0, 1.0)
-        alpha = clamp(alpha_base + 0.05 * speed_ratio, 0.0, 0.85)
-        steering_smooth = alpha * self._last_steer + (1.0 - alpha) * steering_target
-        dt_s = self.config.fixed_delta if self.config.sync else (1.0 / 20.0)
-        max_steer_step = clamp(self.CIL_MAX_STEER_RATE_PER_S * dt_s, 0.01, 0.18)
-        steering = clamp(
-            steering_smooth,
-            self._last_steer - max_steer_step,
-            self._last_steer + max_steer_step,
-        )
-        self._last_steer = steering
-
-        throttle, brake, adaptive_target_kmh, speed_plan = self._longitudinal_control(
+        throttle, brake, adaptive_target_kmh, speed_plan = self._longitudinal_control_command_only(
             speed_kmh=speed_kmh,
-            route_context=route_context,
             destination_distance_m=destination_distance_m,
             command=command,
             command_phase=str(command_debug.get("phase", "cruise")),
+            distance_to_turn_m=float(command_debug.get("distance_to_turn_m", float("inf"))),
         )
         control = carla.VehicleControl(
             throttle=float(throttle),
@@ -3561,7 +3537,7 @@ class CILAgent(BaseAgent):
         rotation = vehicle.get_transform().rotation
         yaw_deg = float(rotation.yaw)
         self._update_route_history(vehicle_location)
-        route_locations = self._collect_route_locations(max_points=80, step_idx=step_idx)
+        route_locations = self._collect_route_locations(max_points=220, step_idx=step_idx)
         # Disabled: CARLA debug line drawing is extremely expensive (~10 FPS penalty)
         # self._draw_route_debug_overlay(step_idx, route_locations, vehicle_location)
 
@@ -3585,41 +3561,25 @@ class CILAgent(BaseAgent):
                 yaw=rotation.yaw,
             )
 
-        if self._visualizer is not None:
-            extra_lines = []
-            if destination_distance_m is not None:
-                extra_lines.append(f"Dist to D: {destination_distance_m:.1f} m")
-            command_label = {0: "LANE_FOLLOW", 1: "LEFT", 2: "RIGHT", 3: "STRAIGHT"}.get(int(command), f"CMD_{command}")
-            extra_lines.append(f"Command: {command_label} ({command})")
-            self._visualizer.show_rgb(
-                frame,
-                {
-                    "agent": "cil",
-                    "tick": step_idx,
-                    "speed_kmh": speed_kmh,
-                    "target_speed_kmh": adaptive_target_kmh,
-                    "steer": control.steer,
-                    "throttle": control.throttle,
-                    "brake": control.brake,
-                    "command": command,
-                },
-                extra_lines=extra_lines if extra_lines else None,
-            )
+        stage_times["control"] = time.perf_counter() - control_t0
 
-        if self._route_map is not None:
-            self._route_map.show(
-                route_points=route_locations,
-                current_location=vehicle_location,
-                start_location=self._route_start_location,
-                destination_location=self._route_destination_location,
-                heading_yaw_deg=yaw_deg,
-                trajectory_points=self._route_history_xy,
-                command=command,
-            )
+        viz_t0 = time.perf_counter()
+
+        hud_fps = self._update_hud_fps()
+        self._update_spectator_follow()
+        self._draw_hud_on_screen(
+            step_idx, speed_kmh, adaptive_target_kmh,
+            control.steer, control.throttle, control.brake,
+            command, hud_fps, destination_distance_m, route_locations,
+        )
+
+        stage_times["viz"] = time.perf_counter() - viz_t0
+
+        telemetry_t0 = time.perf_counter()
 
         if step_idx % 20 == 0:
             logging.info(
-                "cil tick=%d speed=%.1f km/h target=%.1f cmd=%d phase=%s next=%d src=%s retarget=%s warmup=%s s_from_start=%.1f d_turn=%.1f d_route=%.1f d_junc=%.1f trigger=%.1f steer=%.3f model=%.3f gain=%.2f assist=%.2f throttle=%.2f brake=%.2f",
+                "cil tick=%d speed=%.1f km/h target=%.1f cmd=%d phase=%s next=%d src=%s warmup=%s s_from_start=%.1f d_turn=%.1f d_junc=%.1f trigger=%.1f steer=%.3f model=%.3f throttle=%.2f brake=%.2f",
                 step_idx,
                 speed_kmh,
                 adaptive_target_kmh,
@@ -3627,17 +3587,13 @@ class CILAgent(BaseAgent):
                 str(command_debug.get("phase", "cruise")),
                 int(command_debug.get("upcoming_command", 0)),
                 str(command_debug.get("upcoming_source", "none")),
-                str(command_debug.get("retargeted", False)),
                 str(command_debug.get("warmup_block_commands", False)),
                 float(command_debug.get("distance_from_start_m", float("inf"))),
                 float(command_debug.get("distance_to_turn_m", float("inf"))),
-                float(command_debug.get("route_distance_to_turn_m", float("inf"))),
                 float(command_debug.get("distance_to_junction_m", float("inf"))),
                 float(command_debug.get("trigger_distance_m", 0.0)),
                 control.steer,
                 model_steer,
-                steer_gain,
-                route_assist_weight,
                 control.throttle,
                 control.brake,
             )
@@ -3648,25 +3604,27 @@ class CILAgent(BaseAgent):
                     int(step_idx),
                     f"{float(speed_kmh):.3f}",
                     f"{float(adaptive_target_kmh):.3f}",
-                    f"{float(route_context.get('route_valid', 0.0)):.3f}",
-                    f"{float(route_context.get('target_x_m', 0.0)):.3f}",
-                    f"{float(route_context.get('target_y_m', 0.0)):.3f}",
-                    f"{float(route_context.get('distance_to_turn_m', float('inf'))):.3f}",
-                    f"{float(route_context.get('distance_to_junction_m', float('inf'))):.3f}",
-                    f"{float(route_context.get('turn_urgency', 0.0)):.3f}",
+                    f"{float(command_debug.get('distance_to_turn_m', float('inf'))):.3f}",
+                    f"{float(command_debug.get('distance_to_junction_m', float('inf'))):.3f}",
                     int(command),
                     str(command_debug.get("phase", "cruise")),
                     str(command_debug.get("active_source", "none")),
+                    int(command_debug.get("upcoming_command", 0)),
+                    int(bool(command_debug.get("warmup_block_commands", False))),
                     f"{float(control.steer):.4f}",
                     f"{float(control.throttle):.4f}",
                     f"{float(control.brake):.4f}",
-                    int(float(speed_plan.get("low_confidence_limit", 0.0)) > 0.5),
                 ]
             )
             if step_idx % 20 == 0 and self._telemetry_fp is not None:
                 self._telemetry_fp.flush()
 
+        stage_times["telemetry"] = time.perf_counter() - telemetry_t0
+        stage_times["total"] = time.perf_counter() - tick_t0
+        self._accumulate_tick_timing(stage_times, step_idx)
+
     def teardown(self) -> None:
+        self._route_overlay_bounds = None
         if self._collector is not None:
             self._collector.close()
             self._collector = None
@@ -3695,7 +3653,6 @@ class CILAgent(BaseAgent):
         self._cached_route_locations = []
         self._cached_route_tick = -1
         self._route_planner.reset_runtime_state()
-        self._last_route_context = {}
         self._last_speed_plan = {}
         self._active_navigation_command = 0
         self._active_command_source = "none"
@@ -3704,9 +3661,8 @@ class CILAgent(BaseAgent):
         self._command_entered_junction = False
         self._command_clear_frames = 0
         self._last_command_debug = {}
-        self._last_completed_turn_command = 0
-        self._last_completed_turn_tick = -10000
-        self._last_completed_turn_location = None
+        self._hud_ema_fps = None
+        self._hud_last_tick_time = None
         if self._visualizer is not None:
             self._visualizer.close()
             self._visualizer = None
@@ -4412,6 +4368,22 @@ def _cfg_get(env_cfg: Dict[str, Any], section: str, key: str, fallback: Any) -> 
     return fallback
 
 
+def _to_bool(value: Any, fallback: bool = False) -> bool:
+    if value is None:
+        return bool(fallback)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(fallback)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run CARLA agent loop.")
     parser.add_argument(
@@ -4425,55 +4397,68 @@ def parse_args() -> argparse.Namespace:
         default="lane_follow",
         help="Choose lane_follow/cil/autopilot/yolo_detect agent mode.",
     )
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=2000)
-    parser.add_argument("--tm-port", type=int, default=8000)
-    parser.add_argument("--timeout", type=float, default=1000.0)
-    parser.add_argument("--sync", action="store_true", help="Enable synchronous mode.")
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--tm-port", type=int, default=None)
+    parser.add_argument("--timeout", type=float, default=None)
+    parser.add_argument(
+        "--sync",
+        dest="sync",
+        action="store_true",
+        default=None,
+        help="Enable synchronous mode.",
+    )
+    parser.add_argument(
+        "--no-sync",
+        dest="sync",
+        action="store_false",
+        help="Disable synchronous mode.",
+    )
     parser.add_argument(
         "--fixed-delta",
         type=float,
-        default=0.05,
+        default=None,
         help="Fixed delta seconds (used when --sync is enabled).",
     )
-    parser.add_argument("--no-rendering", action="store_true")
+    parser.add_argument("--no-rendering", action="store_true", default=None)
     parser.add_argument(
         "--map",
-        default="Town03",
+        default=None,
         help="CARLA map to load before spawning vehicle (default: Town03).",
     )
-    parser.add_argument("--vehicle-filter", default="vehicle.tesla.model3")
+    parser.add_argument("--vehicle-filter", default=None)
     parser.add_argument(
         "--spawn-point",
         type=int,
-        default=-1,
+        default=None,
         help="Spawn-point index. Negative means random.",
     )
     parser.add_argument(
         "--destination-point",
         type=int,
-        default=-1,
+        default=None,
         help="Destination point index B. Negative means random destination.",
     )
-    parser.add_argument("--npc-vehicle-count", type=int, default=30)
-    parser.add_argument("--npc-bike-count", type=int, default=10)
-    parser.add_argument("--npc-motorbike-count", type=int, default=10)
-    parser.add_argument("--npc-pedestrian-count", type=int, default=50)
+    parser.add_argument("--npc-vehicle-count", type=int, default=None)
+    parser.add_argument("--npc-bike-count", type=int, default=None)
+    parser.add_argument("--npc-motorbike-count", type=int, default=None)
+    parser.add_argument("--npc-pedestrian-count", type=int, default=None)
     parser.add_argument(
         "--disable-npc-autopilot",
         action="store_true",
+        default=None,
         help="Spawn NPCs but do not enable autopilot for them.",
     )
     parser.add_argument(
         "--ticks",
         type=int,
-        default=1000,
+        default=None,
         help="Number of ticks to run. Use 0 or negative for infinite loop.",
     )
     parser.add_argument(
         "--tick-interval",
         type=float,
-        default=0.05,
+        default=None,
         help="Sleep interval per tick in dry-run mode.",
     )
     parser.add_argument("--dry-run", action="store_true")
@@ -4500,18 +4485,18 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "cpu", "cuda"],
         help="Inference device for lane_follow/cil.",
     )
-    parser.add_argument("--target-speed-kmh", type=float, default=30.0)
-    parser.add_argument("--max-throttle", type=float, default=0.2)
-    parser.add_argument("--max-brake", type=float, default=0.60)
+    parser.add_argument("--target-speed-kmh", type=float, default=None)
+    parser.add_argument("--max-throttle", type=float, default=None)
+    parser.add_argument("--max-brake", type=float, default=None)
     parser.add_argument(
         "--steer-smoothing",
         type=float,
-        default=0.35,
+        default=None,
         help="0 means no smoothing, closer to 1 means smoother steering.",
     )
-    parser.add_argument("--camera-width", type=int, default=800)
-    parser.add_argument("--camera-height", type=int, default=600)
-    parser.add_argument("--camera-fov", type=float, default=90.0)
+    parser.add_argument("--camera-width", type=int, default=None)
+    parser.add_argument("--camera-height", type=int, default=None)
+    parser.add_argument("--camera-fov", type=float, default=None)
 
     parser.add_argument(
         "--lock-spectator-on-spawn",
@@ -4524,30 +4509,32 @@ def parse_args() -> argparse.Namespace:
         "--no-lock-spectator-on-spawn",
         dest="lock_spectator_on_spawn",
         action="store_false",
+        default=None,
         help="Disable spectator spawn lock.",
     )
     parser.add_argument(
         "--spectator-reapply-each-tick",
         action="store_true",
+        default=None,
         help="Re-apply spectator transform every tick.",
     )
-    parser.add_argument("--spectator-follow-distance", type=float, default=9.0)
-    parser.add_argument("--spectator-height", type=float, default=4.5)
-    parser.add_argument("--spectator-pitch", type=float, default=-18.0)
+    parser.add_argument("--spectator-follow-distance", type=float, default=None)
+    parser.add_argument("--spectator-height", type=float, default=None)
+    parser.add_argument("--spectator-pitch", type=float, default=None)
 
-    parser.add_argument("--collect-data", action="store_true")
-    parser.add_argument("--collect-data-dir", default="data/collected")
-    parser.add_argument("--image-prefix", default="", help="Image filename prefix (e.g. town01_beochan)")
+    parser.add_argument("--collect-data", action="store_true", default=None)
+    parser.add_argument("--collect-data-dir", default=None)
+    parser.add_argument("--image-prefix", default=None, help="Image filename prefix (e.g. town01_beochan)")
     parser.add_argument(
         "--save-every-n",
         type=int,
-        default=50,
+        default=None,
         help="Only save a frame every N ticks (default: 50 for diverse scenes).",
     )
     parser.add_argument(
         "--nav-agent-type",
         choices=["basic", "behavior"],
-        default="basic",
+        default=None,
         help="Navigation agent used by autopilot mode for route command extraction.",
     )
     parser.add_argument(
@@ -4561,36 +4548,38 @@ def parse_args() -> argparse.Namespace:
         "--no-yolo-disable-autopilot-red-light",
         dest="yolo_disable_autopilot_red_light",
         action="store_false",
+        default=None,
         help="In yolo_detect mode, keep autopilot traffic-light handling enabled.",
     )
     parser.add_argument(
         "--no-random-weather",
         action="store_true",
+        default=None,
         help="Disable random weather preset selection at start.",
     )
     parser.add_argument(
         "--recovery-interval-frames",
         type=int,
-        default=100,
+        default=None,
         help="Apply recovery steering disturbance every N frames.",
     )
     parser.add_argument(
         "--recovery-duration-frames",
         type=int,
-        default=10,
+        default=None,
         help="Number of frames to keep disturbance active.",
     )
     parser.add_argument(
         "--recovery-steer-offset",
         type=float,
-        default=0.3,
+        default=None,
         help="Steering offset added during disturbance window.",
     )
-    parser.add_argument("--record-video", action="store_true")
-    parser.add_argument("--video-output-path", default="outputs/town_drive_10m.mp4")
-    parser.add_argument("--video-fps", type=float, default=20.0)
-    parser.add_argument("--video-duration-sec", type=int, default=600)
-    parser.add_argument("--video-codec", default="mp4v")
+    parser.add_argument("--record-video", action="store_true", default=None)
+    parser.add_argument("--video-output-path", default=None)
+    parser.add_argument("--video-fps", type=float, default=None)
+    parser.add_argument("--video-duration-sec", type=int, default=None)
+    parser.add_argument("--video-codec", default=None)
 
     parser.add_argument(
         "--log-level",
@@ -4600,7 +4589,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cil-route-lookahead-m",
         type=float,
-        default=9.0,
+        default=None,
         help="Nominal route lookahead used for route context and speed planning in CIL mode.",
     )
     return parser.parse_args()
@@ -4609,92 +4598,104 @@ def parse_args() -> argparse.Namespace:
 def build_config(args: argparse.Namespace) -> RunConfig:
     env_cfg = load_env_config(args.config)
 
-    lock_from_yaml = bool(_cfg_get(env_cfg, "spectator", "lock_on_spawn", True))
-    lock_spectator = (
-        args.lock_spectator_on_spawn
-        if args.lock_spectator_on_spawn is not None
-        else lock_from_yaml
+    def pick(cli_value: Any, section: str, key: str, fallback: Any) -> Any:
+        if cli_value is not None:
+            return cli_value
+        return _cfg_get(env_cfg, section, key, fallback)
+
+    host = str(pick(args.host, "carla", "host", "127.0.0.1"))
+    port = int(pick(args.port, "carla", "port", 2000))
+    tm_port = int(pick(args.tm_port, "carla", "tm_port", 8000))
+    timeout = float(pick(args.timeout, "carla", "timeout", 60.0))
+    map_name = str(pick(args.map, "carla", "map", "Town03"))
+    vehicle_filter = str(pick(args.vehicle_filter, "vehicle", "filter", "vehicle.tesla.model3"))
+
+    sync = _to_bool(args.sync, _to_bool(_cfg_get(env_cfg, "carla", "sync", False), False))
+    fixed_delta = float(pick(args.fixed_delta, "carla", "fixed_delta", 0.05))
+    if sync and fixed_delta <= 0.0:
+        fixed_delta = 1.0 / 30.0
+        logging.warning("Invalid fixed_delta in sync mode. Using fixed_delta=%.5f", fixed_delta)
+
+    no_rendering = _to_bool(
+        args.no_rendering,
+        _to_bool(_cfg_get(env_cfg, "carla", "no_rendering", False), False),
     )
 
-    sync = args.sync or bool(_cfg_get(env_cfg, "carla", "sync", False))
-    fixed_delta = (
-        args.fixed_delta
-        if args.fixed_delta != 0.05
-        else float(_cfg_get(env_cfg, "carla", "fixed_delta", args.fixed_delta))
+    lock_spectator = _to_bool(
+        args.lock_spectator_on_spawn,
+        _to_bool(_cfg_get(env_cfg, "spectator", "lock_on_spawn", True), True),
     )
-    if args.collect_data and not sync:
+    spectator_reapply_each_tick = _to_bool(
+        args.spectator_reapply_each_tick,
+        _to_bool(_cfg_get(env_cfg, "spectator", "keep_reapply_each_tick", False), False),
+    )
+    spectator_follow_distance = float(
+        pick(args.spectator_follow_distance, "spectator", "follow_distance", 9.0)
+    )
+    spectator_height = float(pick(args.spectator_height, "spectator", "height", 4.5))
+    spectator_pitch = float(pick(args.spectator_pitch, "spectator", "pitch", -18.0))
+
+    camera_width = int(pick(args.camera_width, "camera", "width", 800))
+    camera_height = int(pick(args.camera_height, "camera", "height", 600))
+    camera_fov = float(pick(args.camera_fov, "camera", "fov", 90.0))
+
+    collect_data = _to_bool(
+        args.collect_data,
+        _to_bool(_cfg_get(env_cfg, "data_collection", "enabled", False), False),
+    )
+    collect_data_dir = str(pick(args.collect_data_dir, "data_collection", "output_dir", "data/collected"))
+    save_every_n = max(1, int(pick(args.save_every_n, "data_collection", "save_every_n", 50)))
+    image_prefix = str(pick(args.image_prefix, "data_collection", "image_prefix", ""))
+
+    if collect_data and not sync:
         logging.warning("Data collection requires synchronous mode. Forcing sync=True.")
         sync = True
-    if args.collect_data and fixed_delta <= 0.0:
-        fixed_delta = 0.05
-        logging.warning("Invalid fixed_delta for data collection. Using fixed_delta=0.05.")
-    video_enabled = args.record_video or bool(
-        _cfg_get(env_cfg, "recording", "enabled", False)
-    )
-    video_output_path = (
-        args.video_output_path
-        if args.video_output_path != "outputs/town_drive_10m.mp4"
-        else str(_cfg_get(env_cfg, "recording", "output_path", args.video_output_path))
-    )
-    video_fps = (
-        args.video_fps
-        if args.video_fps != 20.0
-        else float(_cfg_get(env_cfg, "recording", "fps", args.video_fps))
-    )
-    video_duration_sec = (
-        args.video_duration_sec
-        if args.video_duration_sec != 600
-        else int(_cfg_get(env_cfg, "recording", "duration_sec", args.video_duration_sec))
-    )
-    video_codec = (
-        args.video_codec
-        if args.video_codec != "mp4v"
-        else str(_cfg_get(env_cfg, "recording", "codec", args.video_codec))
-    )
+    if collect_data and fixed_delta <= 0.0:
+        fixed_delta = 1.0 / 30.0
+        logging.warning("Invalid fixed_delta for data collection. Using fixed_delta=%.5f.", fixed_delta)
 
-    npc_vehicle_count = (
-        args.npc_vehicle_count
-        if args.npc_vehicle_count != 30
-        else int(_cfg_get(env_cfg, "traffic_spawn", "vehicle_count", args.npc_vehicle_count))
+    video_enabled = _to_bool(
+        args.record_video,
+        _to_bool(_cfg_get(env_cfg, "recording", "enabled", False), False),
     )
-    npc_bike_count = (
-        args.npc_bike_count
-        if args.npc_bike_count != 10
-        else int(_cfg_get(env_cfg, "traffic_spawn", "bike_count", args.npc_bike_count))
+    video_output_path = str(
+        pick(args.video_output_path, "recording", "output_path", "outputs/town_drive_10m.mp4")
     )
-    npc_motorbike_count = (
-        args.npc_motorbike_count
-        if args.npc_motorbike_count != 10
-        else int(_cfg_get(env_cfg, "traffic_spawn", "motorbike_count", args.npc_motorbike_count))
-    )
-    npc_pedestrian_count = (
-        args.npc_pedestrian_count
-        if args.npc_pedestrian_count != 50
-        else int(_cfg_get(env_cfg, "traffic_spawn", "pedestrian_count", args.npc_pedestrian_count))
-    )
-    npc_enable_autopilot = bool(
-        _cfg_get(env_cfg, "traffic_spawn", "npc_enable_autopilot", not args.disable_npc_autopilot)
-    ) and not args.disable_npc_autopilot
+    video_fps = float(pick(args.video_fps, "recording", "fps", 30.0))
+    video_duration_sec = int(pick(args.video_duration_sec, "recording", "duration_sec", 600))
+    video_codec = str(pick(args.video_codec, "recording", "codec", "mp4v"))
 
-    ticks = args.ticks
-    if video_enabled and args.ticks == 1000:
+    npc_vehicle_count = max(0, int(pick(args.npc_vehicle_count, "traffic_spawn", "vehicle_count", 30)))
+    npc_bike_count = max(0, int(pick(args.npc_bike_count, "traffic_spawn", "bike_count", 10)))
+    npc_motorbike_count = max(0, int(pick(args.npc_motorbike_count, "traffic_spawn", "motorbike_count", 10)))
+    npc_pedestrian_count = max(0, int(pick(args.npc_pedestrian_count, "traffic_spawn", "pedestrian_count", 50)))
+    npc_enable_autopilot = _to_bool(
+        _cfg_get(env_cfg, "traffic_spawn", "npc_enable_autopilot", True),
+        True,
+    )
+    if args.disable_npc_autopilot:
+        npc_enable_autopilot = False
+
+    runtime_ticks_cfg = _cfg_get(env_cfg, "runtime", "ticks", None)
+    if args.ticks is not None:
+        ticks = int(args.ticks)
+    elif runtime_ticks_cfg is not None:
+        ticks = int(runtime_ticks_cfg)
+    else:
+        ticks = 1000
+
+    tick_interval = float(pick(args.tick_interval, "runtime", "tick_interval", 0.05))
+
+    if video_enabled and args.ticks is None and runtime_ticks_cfg is None:
         if sync:
             required_ticks = max(1, int(video_duration_sec / max(fixed_delta, 1e-3)))
         else:
-            required_ticks = max(1, int(video_duration_sec * video_fps))
+            required_ticks = max(1, int(video_duration_sec * max(video_fps, 1e-3)))
         ticks = required_ticks
         logging.info("Auto-set ticks=%d from video duration=%ds.", ticks, video_duration_sec)
 
-    spawn_point_cfg = (
-        args.spawn_point
-        if args.spawn_point != -1
-        else int(_cfg_get(env_cfg, "vehicle", "spawn_point", args.spawn_point))
-    )
-    destination_point_cfg = (
-        args.destination_point
-        if args.destination_point != -1
-        else int(_cfg_get(env_cfg, "vehicle", "destination_point", args.destination_point))
-    )
+    spawn_point_cfg = int(pick(args.spawn_point, "vehicle", "spawn_point", -1))
+    destination_point_cfg = int(pick(args.destination_point, "vehicle", "destination_point", -1))
 
     if args.agent == "cil" and spawn_point_cfg < 0:
         logging.warning(
@@ -4710,11 +4711,16 @@ def build_config(args: argparse.Namespace) -> RunConfig:
             destination_point_cfg,
         )
 
-    cil_route_lookahead_m = (
-        args.cil_route_lookahead_m
-        if args.cil_route_lookahead_m != 9.0
-        else float(_cfg_get(env_cfg, "cil", "route_lookahead_m", args.cil_route_lookahead_m))
-    )
+    seed = args.seed if args.seed is not None else _cfg_get(env_cfg, "runtime", "seed", None)
+    if seed is not None:
+        seed = int(seed)
+
+    target_speed_kmh = float(pick(args.target_speed_kmh, "cil", "target_speed_kmh", 30.0))
+    max_throttle = float(pick(args.max_throttle, "cil", "max_throttle", 0.20))
+    max_brake = float(pick(args.max_brake, "cil", "max_brake", 0.60))
+    steer_smoothing = float(pick(args.steer_smoothing, "cil", "steer_smoothing", 0.35))
+
+    cil_route_lookahead_m = float(pick(args.cil_route_lookahead_m, "cil", "route_lookahead_m", 9.0))
     cil_command_prep_time_s = float(
         _cfg_get(env_cfg, "cil", "command_prep_time_s", CILAgent.COMMAND_PREP_TIME_S)
     )
@@ -4731,70 +4737,93 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     cil_command_trigger_max_m = max(cil_command_trigger_min_m + 1.0, cil_command_trigger_max_m)
     cil_command_prep_time_s = max(0.8, cil_command_prep_time_s)
     cil_command_retarget_window_s = max(0.8, cil_command_retarget_window_s)
-    yolo_disable_autopilot_red_light = (
-        args.yolo_disable_autopilot_red_light
-        if args.yolo_disable_autopilot_red_light is not None
-        else bool(_cfg_get(env_cfg, "yolo", "disable_autopilot_red_light", False))
+
+    nav_agent_type = str(pick(args.nav_agent_type, "cil", "nav_agent_type", "basic")).lower()
+    if nav_agent_type not in {"basic", "behavior"}:
+        logging.warning("Unsupported nav_agent_type=%s. Falling back to 'basic'.", nav_agent_type)
+        nav_agent_type = "basic"
+
+    yolo_disable_autopilot_red_light = _to_bool(
+        args.yolo_disable_autopilot_red_light,
+        _to_bool(_cfg_get(env_cfg, "yolo", "disable_autopilot_red_light", False), False),
+    )
+
+    weather_preset = str(_cfg_get(env_cfg, "weather", "preset", "ClearNoon"))
+    yaml_random_weather = _to_bool(_cfg_get(env_cfg, "weather", "random", False), False)
+    if yaml_random_weather and not _to_bool(args.no_random_weather, False):
+        logging.warning(
+            "weather.random=true is ignored for deterministic testing. Using fixed weather preset '%s'.",
+            weather_preset,
+        )
+
+    recovery_interval_frames = max(
+        1,
+        int(pick(args.recovery_interval_frames, "cil", "recovery_interval_frames", 100)),
+    )
+    recovery_duration_frames = max(
+        1,
+        int(pick(args.recovery_duration_frames, "cil", "recovery_duration_frames", 10)),
+    )
+    recovery_steer_offset = abs(
+        float(pick(args.recovery_steer_offset, "cil", "recovery_steer_offset", 0.3))
+    )
+
+    fps_log_interval_ticks = max(
+        1,
+        int(_cfg_get(env_cfg, "runtime", "fps_log_interval_ticks", 30)),
+    )
+    cil_enable_hud = _to_bool(_cfg_get(env_cfg, "runtime", "cil_enable_hud", False), False)
+    cil_enable_route_map = _to_bool(_cfg_get(env_cfg, "runtime", "cil_enable_route_map", False), False)
+    cil_enable_telemetry_csv = _to_bool(
+        _cfg_get(env_cfg, "runtime", "cil_enable_telemetry_csv", False),
+        False,
+    )
+    cil_profile_tick_timing = _to_bool(
+        _cfg_get(env_cfg, "runtime", "cil_profile_tick_timing", True),
+        True,
+    )
+    cil_profile_log_interval_ticks = max(
+        1,
+        int(_cfg_get(env_cfg, "runtime", "cil_profile_log_interval_ticks", 60)),
     )
 
     return RunConfig(
         env_config_path=args.config,
-        host=args.host if args.host != "127.0.0.1" else _cfg_get(env_cfg, "carla", "host", args.host),
-        port=args.port if args.port != 2000 else int(_cfg_get(env_cfg, "carla", "port", args.port)),
-        tm_port=args.tm_port if args.tm_port != 8000 else int(_cfg_get(env_cfg, "carla", "tm_port", args.tm_port)),
-        timeout=(
-            args.timeout
-            if args.timeout != 1000.0
-            else float(_cfg_get(env_cfg, "carla", "timeout", args.timeout))
-        ),
+        host=host,
+        port=port,
+        tm_port=tm_port,
+        timeout=timeout,
         sync=sync,
         fixed_delta=fixed_delta,
-        no_rendering=args.no_rendering or bool(_cfg_get(env_cfg, "carla", "no_rendering", False)),
-        map_name=args.map if args.map != "Town03" else _cfg_get(env_cfg, "carla", "map", args.map),
-        vehicle_filter=_cfg_get(env_cfg, "vehicle", "filter", args.vehicle_filter),
+        no_rendering=no_rendering,
+        map_name=map_name,
+        vehicle_filter=vehicle_filter,
         spawn_point=spawn_point_cfg,
         destination_point=destination_point_cfg,
         ticks=ticks,
-        tick_interval=args.tick_interval,
+        tick_interval=tick_interval,
         dry_run=args.dry_run,
-        seed=args.seed,
+        seed=seed,
         model_path=args.model_path,
         cil_model_path=args.cil_model_path,
         yolo_model_path=args.yolo_model_path,
         model_device=args.device,
-        target_speed_kmh=args.target_speed_kmh,
-        max_throttle=args.max_throttle,
-        max_brake=args.max_brake,
-        steer_smoothing=args.steer_smoothing,
-        camera_width=(
-            args.camera_width
-            if args.camera_width != 800
-            else int(_cfg_get(env_cfg, "camera", "width", args.camera_width))
-        ),
-        camera_height=(
-            args.camera_height
-            if args.camera_height != 600
-            else int(_cfg_get(env_cfg, "camera", "height", args.camera_height))
-        ),
-        camera_fov=(
-            args.camera_fov
-            if args.camera_fov != 90.0
-            else float(_cfg_get(env_cfg, "camera", "fov", args.camera_fov))
-        ),
+        target_speed_kmh=target_speed_kmh,
+        max_throttle=max_throttle,
+        max_brake=max_brake,
+        steer_smoothing=steer_smoothing,
+        camera_width=camera_width,
+        camera_height=camera_height,
+        camera_fov=camera_fov,
         lock_spectator_on_spawn=lock_spectator,
-        spectator_reapply_each_tick=(
-            args.spectator_reapply_each_tick
-            or bool(_cfg_get(env_cfg, "spectator", "keep_reapply_each_tick", False))
-        ),
-        spectator_follow_distance=float(
-            _cfg_get(env_cfg, "spectator", "follow_distance", args.spectator_follow_distance)
-        ),
-        spectator_height=float(_cfg_get(env_cfg, "spectator", "height", args.spectator_height)),
-        spectator_pitch=float(_cfg_get(env_cfg, "spectator", "pitch", args.spectator_pitch)),
-        collect_data=args.collect_data,
-        collect_data_dir=args.collect_data_dir,
-        save_every_n=args.save_every_n,
-        image_prefix=args.image_prefix,
+        spectator_reapply_each_tick=spectator_reapply_each_tick,
+        spectator_follow_distance=spectator_follow_distance,
+        spectator_height=spectator_height,
+        spectator_pitch=spectator_pitch,
+        collect_data=collect_data,
+        collect_data_dir=collect_data_dir,
+        save_every_n=save_every_n,
+        image_prefix=image_prefix,
         npc_vehicle_count=npc_vehicle_count,
         npc_bike_count=npc_bike_count,
         npc_motorbike_count=npc_motorbike_count,
@@ -4805,12 +4834,18 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         video_fps=video_fps,
         video_duration_sec=video_duration_sec,
         video_codec=video_codec,
-        random_weather=not args.no_random_weather,
-        weather_preset=str(_cfg_get(env_cfg, "weather", "preset", "ClearNoon")),
-        recovery_interval_frames=max(1, args.recovery_interval_frames),
-        recovery_duration_frames=max(1, args.recovery_duration_frames),
-        recovery_steer_offset=abs(args.recovery_steer_offset),
-        nav_agent_type=args.nav_agent_type,
+        random_weather=False,
+        weather_preset=weather_preset,
+        fps_log_interval_ticks=fps_log_interval_ticks,
+        cil_enable_hud=cil_enable_hud,
+        cil_enable_route_map=cil_enable_route_map,
+        cil_enable_telemetry_csv=cil_enable_telemetry_csv,
+        cil_profile_tick_timing=cil_profile_tick_timing,
+        cil_profile_log_interval_ticks=cil_profile_log_interval_ticks,
+        recovery_interval_frames=recovery_interval_frames,
+        recovery_duration_frames=recovery_duration_frames,
+        recovery_steer_offset=recovery_steer_offset,
+        nav_agent_type=nav_agent_type,
         yolo_disable_autopilot_red_light=bool(yolo_disable_autopilot_red_light),
         cil_route_lookahead_m=max(4.0, cil_route_lookahead_m),
         cil_command_prep_time_s=cil_command_prep_time_s,
@@ -4845,24 +4880,41 @@ def main() -> int:
     agent_cls = AGENT_REGISTRY[args.agent]
     agent = agent_cls(config)
     tick_limit = config.ticks
+    fps_profiler = TickFpsProfiler(
+        sync=config.sync,
+        fixed_delta=config.fixed_delta,
+        log_interval_ticks=config.fps_log_interval_ticks,
+    )
 
     try:
         session.start()
         if not config.dry_run and session.world is not None:
-            if config.random_weather:
-                preset = apply_random_weather(session.world)
-                logging.info("Applied random weather preset: %s", preset)
-            else:
-                apply_weather_preset(session.world, config.weather_preset)
+            apply_weather_preset(session.world, config.weather_preset)
         agent.setup(session)
         step = 0
         while tick_limit <= 0 or step < tick_limit:
             step += 1
+
+            tick_t0 = time.perf_counter()
             session.tick()
+            session_dt = time.perf_counter() - tick_t0
+
+            agent_t0 = time.perf_counter()
             agent.run_step(step)
+            agent_dt = time.perf_counter() - agent_t0
+
+            total_dt = time.perf_counter() - tick_t0
+            fps_profiler.record(
+                step_idx=step,
+                session_s=session_dt,
+                agent_s=agent_dt,
+                total_s=total_dt,
+            )
+
             if agent.should_stop():
                 logging.info("Agent requested stop at tick %d.", step)
                 break
+        fps_profiler.flush(step)
         logging.info("Finished %d ticks.", step)
         return 0
     except KeyboardInterrupt:

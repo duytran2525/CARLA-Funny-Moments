@@ -1,10 +1,10 @@
-﻿carla:
+carla:
   host: "127.0.0.1"
   port: 2000
   tm_port: 8000
   timeout: 60.0
   sync: true
-  fixed_delta: 0.05
+  fixed_delta: 0.03
   no_rendering: false
 
   map: "Town03"
@@ -25,19 +25,28 @@ spectator:
   pitch: -18.0
 
 camera:
-  width: 1920
-  height: 1080
+  width: 640
+  height: 360
   fov: 90.0
 
 weather:
+  random: false
   preset: "ClearNoon"
 
 cil:
+  target_speed_kmh: 35.0
+  max_throttle: 0.45
+  max_brake: 0.80
+  steer_smoothing: 0.85
+  nav_agent_type: "basic"
   route_lookahead_m: 11.0
   command_prep_time_s: 1.8
   command_trigger_min_m: 9.0
   command_trigger_max_m: 24.0
   command_retarget_window_s: 3.0
+  recovery_interval_frames: 100
+  recovery_duration_frames: 10
+  recovery_steer_offset: 0.3
 
 yolo:
   disable_autopilot_red_light: true
@@ -55,3 +64,13 @@ recording:
   fps: 30.0
   duration_sec: 600
   codec: "mp4v"
+
+runtime:
+  ticks: 0
+  tick_interval: 0.03
+  fps_log_interval_ticks: 30
+  cil_enable_hud: false
+  cil_enable_route_map: false
+  cil_enable_telemetry_csv: false
+  cil_profile_tick_timing: true
+  cil_profile_log_interval_ticks: 60

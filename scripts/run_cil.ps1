@@ -2,16 +2,16 @@ param(
     [string]$CarlaRoot = "E:\Carla",
     [string]$Config = "configs/carla_env.yaml",
     [string]$Model = "auto",
-    [double]$TargetSpeedKmh = 50,
-    [double]$MaxThrottle = 0.6,
-    [double]$MaxBrake = 0.80,
-    [int]$Ticks = 0,
+    [Nullable[double]]$TargetSpeedKmh = $null,
+    [Nullable[double]]$MaxThrottle = $null,
+    [Nullable[double]]$MaxBrake = $null,
+    [Nullable[int]]$Ticks = $null,
     [string]$Device = "auto",
     [switch]$NoRandomWeather,
-    [int]$NpcVehicleCount = 0,
-    [int]$NpcBikeCount = 0,
-    [int]$NpcMotorbikeCount = 0,
-    [int]$NpcPedestrianCount = 0
+    [Nullable[int]]$NpcVehicleCount = $null,
+    [Nullable[int]]$NpcBikeCount = $null,
+    [Nullable[int]]$NpcMotorbikeCount = $null,
+    [Nullable[int]]$NpcPedestrianCount = $null
 )
 
 $ErrorActionPreference = "Stop"
@@ -83,35 +83,40 @@ else {
 Write-Host "CARLA : $CarlaRoot"
 Write-Host "----- Running CIL agent -----"
 
+$runnerArgs = @(
+    "--agent", "cil",
+    "--config", $configPath,
+    "--cil-model-path", $modelPath,
+    "--device", $Device
+)
+
+if ($null -ne $TargetSpeedKmh) {
+    $runnerArgs += @("--target-speed-kmh", [string]$TargetSpeedKmh)
+}
+if ($null -ne $MaxThrottle) {
+    $runnerArgs += @("--max-throttle", [string]$MaxThrottle)
+}
+if ($null -ne $MaxBrake) {
+    $runnerArgs += @("--max-brake", [string]$MaxBrake)
+}
+if ($null -ne $NpcVehicleCount) {
+    $runnerArgs += @("--npc-vehicle-count", [string]$NpcVehicleCount)
+}
+if ($null -ne $NpcBikeCount) {
+    $runnerArgs += @("--npc-bike-count", [string]$NpcBikeCount)
+}
+if ($null -ne $NpcMotorbikeCount) {
+    $runnerArgs += @("--npc-motorbike-count", [string]$NpcMotorbikeCount)
+}
+if ($null -ne $NpcPedestrianCount) {
+    $runnerArgs += @("--npc-pedestrian-count", [string]$NpcPedestrianCount)
+}
+if ($null -ne $Ticks) {
+    $runnerArgs += @("--ticks", [string]$Ticks)
+}
 if ($NoRandomWeather) {
-    & $pythonExe "run_agents.py" `
-        "--agent" "cil" `
-        "--config" $configPath `
-        "--cil-model-path" $modelPath `
-        "--device" $Device `
-        "--target-speed-kmh" $TargetSpeedKmh `
-        "--max-throttle" $MaxThrottle `
-        "--max-brake" $MaxBrake `
-        "--npc-vehicle-count" $NpcVehicleCount `
-        "--npc-bike-count" $NpcBikeCount `
-        "--npc-motorbike-count" $NpcMotorbikeCount `
-        "--npc-pedestrian-count" $NpcPedestrianCount `
-        "--ticks" $Ticks `
-        "--no-random-weather"
+    $runnerArgs += "--no-random-weather"
 }
-else {
-    & $pythonExe "run_agents.py" `
-        "--agent" "cil" `
-        "--config" $configPath `
-        "--cil-model-path" $modelPath `
-        "--device" $Device `
-        "--target-speed-kmh" $TargetSpeedKmh `
-        "--max-throttle" $MaxThrottle `
-        "--max-brake" $MaxBrake `
-        "--npc-vehicle-count" $NpcVehicleCount `
-        "--npc-bike-count" $NpcBikeCount `
-        "--npc-motorbike-count" $NpcMotorbikeCount `
-        "--npc-pedestrian-count" $NpcPedestrianCount `
-        "--ticks" $Ticks
-}
+
+& $pythonExe "run_agents.py" @runnerArgs
 exit $LASTEXITCODE
