@@ -3699,9 +3699,14 @@ class YoloDetectAgent(BaseAgent):
         self._traffic_supervisor = None
         self._last_supervisor_debug_info: Dict[str, Any] = {}
         self._last_control_ts: Optional[float] = None
+        self._steer_ema_alpha = 0.85
+        self._smoothed_steer = 0.0
+        self._has_smoothed_steer = False
 
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
+        self._smoothed_steer = 0.0
+        self._has_smoothed_steer = False
         vehicle = session.ego_vehicle
         world = session.world
         if vehicle is None or world is None:
@@ -3987,9 +3992,19 @@ class YoloDetectAgent(BaseAgent):
         
         if vehicle is not None:
             try:
-                current_steer = float(vehicle.get_control().steer)
+                # Smooth raw autopilot steer command to avoid corridor jitter between frames.
+                raw_steer = float(vehicle.get_control().steer)
+                alpha = clamp(float(self._steer_ema_alpha), 0.0, 0.98)
+                if not self._has_smoothed_steer:
+                    self._smoothed_steer = raw_steer
+                    self._has_smoothed_steer = True
+                else:
+                    self._smoothed_steer = (
+                        alpha * self._smoothed_steer + (1.0 - alpha) * raw_steer
+                    )
+                current_steer = float(self._smoothed_steer)
             except Exception:
-                current_steer = None
+                current_steer = float(self._smoothed_steer)
             try:
                 velocity = vehicle.get_velocity()
                 speed_kmh = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2) * 3.6
@@ -4306,6 +4321,8 @@ class YoloDetectAgent(BaseAgent):
         self._traffic_supervisor = None
         self._last_supervisor_debug_info = {}
         self._last_control_ts = None
+        self._smoothed_steer = 0.0
+        self._has_smoothed_steer = False
 
         if self._camera is not None:
             self._camera.stop()
