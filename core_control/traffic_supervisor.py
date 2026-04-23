@@ -1049,7 +1049,7 @@ class TrafficSupervisor:
 
         candidates: List[Tuple[float, DetectionResult, str]] = []
 
-        # ✅ FIX: Stop line chỉ được dùng khi có red_light (phải có tín hiệu đèn đỏ)
+        # Stop line chỉ được dùng khi có red_light (phải có tín hiệu đèn đỏ)
         if stop_lines and (red_light is not None):
             nearest_stop = min(stop_lines, key=lambda s: s.distance)
             candidates.append((float(nearest_stop.distance), nearest_stop, 'stop_line'))
@@ -1673,13 +1673,26 @@ class TrafficSupervisor:
           - Reset to 0 khi exit STOPPED
           - Used for timeout detection
         """
+        # ✅ FIX: Braking phase - transition from CRUISING → STOPPING
         if should_brake:
             if self.state == SupervisorState.CRUISING:
                 self.state = SupervisorState.STOPPING
                 self.stopped_time = 0.0
         
+        # ✅ FIX: Speed check - transition from STOPPING → STOPPED
         if self.state == SupervisorState.STOPPING and current_speed < 0.1:
             self.state = SupervisorState.STOPPED
+        
+        # ✅ FIX: Exit from STOPPED when obstacle clears (should_brake = False)
+        # This is the missing logic that was causing the vehicle to be stuck
+        if not should_brake and self.state == SupervisorState.STOPPED:
+            self.state = SupervisorState.RESUMING
+        
+        # ✅ FIX: Exit from STOPPING when brake signal is cancelled
+        # Allows early exit if obstacle disappears during deceleration phase
+        if not should_brake and self.state == SupervisorState.STOPPING:
+            self.state = SupervisorState.CRUISING
+            self.stopped_time = 0.0
         
         # Time tracking
         if self.state == SupervisorState.STOPPED:
