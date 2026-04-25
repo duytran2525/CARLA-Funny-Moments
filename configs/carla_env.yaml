@@ -1,4 +1,4 @@
-carla:
+﻿carla:
   host: "127.0.0.1"
   port: 2000
   tm_port: 8000
@@ -39,11 +39,9 @@ cil:
   max_brake: 0.80
   steer_smoothing: 0.85
   nav_agent_type: "basic"
-  route_lookahead_m: 11.0
   command_prep_time_s: 1.8
   command_trigger_min_m: 9.0
   command_trigger_max_m: 24.0
-  command_retarget_window_s: 3.0
   recovery_interval_frames: 100
   recovery_duration_frames: 10
   recovery_steer_offset: 0.3
@@ -52,10 +50,10 @@ yolo:
   disable_autopilot_red_light: true
 
 traffic_spawn:
-  vehicle_count: 0
-  bike_count: 0
-  motorbike_count: 0
-  pedestrian_count: 0
+  vehicle_count: 5
+  bike_count: 5
+  motorbike_count: 5
+  pedestrian_count: 5
   npc_enable_autopilot: true
 
 recording:

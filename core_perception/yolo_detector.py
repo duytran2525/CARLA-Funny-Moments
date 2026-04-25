@@ -36,6 +36,7 @@ class YoloDetector:
         model_path: str,
         conf_threshold: float = 0.5,
         display_classes: Optional[Sequence[str]] = None,
+        inference_imgsz: Optional[int | Tuple[int, int]] = None,
         # Compatibility args used by run_agents.py
         camera_fov_deg: float = 90.0,
         obstacle_base_distance_m: float = 8.0,
@@ -62,6 +63,8 @@ class YoloDetector:
         self.camera_mount_z_m = float(camera_mount_z_m)
         self.camera_pitch_deg = float(camera_pitch_deg)
         self.camera_roll_deg = float(camera_roll_deg)
+        self.inference_imgsz = inference_imgsz
+        self.uses_depth_input = False
 
         model_ext = os.path.splitext(model_path)[1].lower()
         self._is_exported_model = model_ext in {".engine", ".onnx", ".openvino", ".xml", ".tflite"}
@@ -70,6 +73,11 @@ class YoloDetector:
             self._ensure_tensorrt_module_alias()
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._predict_device: Any = 0 if self.device.type == "cuda" else "cpu"
+        self._use_half_precision = self.device.type == "cuda" and not self._is_exported_model
+        self._warmed_up = False
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
         self.model = YOLO(model_path, task="detect")
         if not self._is_exported_model:
             self.model = self.model.to(self.device)
@@ -155,37 +163,58 @@ class YoloDetector:
             raise ValueError("raw_image must be HxWx3 or HxWx4.")
         if raw_image.shape[2] == 4:
             return cv2.cvtColor(raw_image, cv2.COLOR_BGRA2BGR)
-        return raw_image.copy()
+        if raw_image.flags.c_contiguous:
+            return raw_image
+        return np.ascontiguousarray(raw_image)
+
+    def _predict(self, image_bgr: np.ndarray):
+        predict_kwargs: Dict[str, Any] = {
+            "source": image_bgr,
+            "conf": self.conf_threshold,
+            "verbose": False,
+            "device": self._predict_device,
+        }
+        if self.inference_imgsz is not None:
+            predict_kwargs["imgsz"] = self.inference_imgsz
+        if self._use_half_precision:
+            predict_kwargs["half"] = True
+        return self.model.predict(**predict_kwargs)
+
+    def warmup(self, width: int, height: int) -> None:
+        if self._warmed_up:
+            return
+        warm_h = max(32, int(height))
+        warm_w = max(32, int(width))
+        warm_frame = np.zeros((warm_h, warm_w, 3), dtype=np.uint8)
+        self._predict(warm_frame)
+        self._warmed_up = True
 
     def detect(self, raw_image: np.ndarray) -> List[Dict[str, Any]]:
         image_bgr = self._prepare_bgr(raw_image)
-        if self._is_exported_model:
-            infer_device: Any = 0 if torch.cuda.is_available() else "cpu"
-            results = self.model.predict(
-                source=image_bgr,
-                conf=self.conf_threshold,
-                verbose=False,
-                device=infer_device,
-            )
-        else:
-            results = self.model(image_bgr, conf=self.conf_threshold, verbose=False)
+        results = self._predict(image_bgr)
         detections: List[Dict[str, Any]] = []
 
         if len(results) == 0:
             return detections
 
         boxes = results[0].boxes
-        for box in boxes:
-            cls_id = int(box.cls[0])
+        if boxes is None or len(boxes) == 0:
+            return detections
+
+        xyxy = boxes.xyxy.round().to(dtype=torch.int32).cpu().numpy()
+        confs = boxes.conf.float().cpu().numpy()
+        class_ids = boxes.cls.to(dtype=torch.int32).cpu().numpy()
+
+        for coords, conf, cls_id in zip(xyxy, confs, class_ids):
             class_name = self._resolve_class_name(cls_id)
             if class_name not in self.display_classes:
                 continue
 
-            conf = float(box.conf[0])
+            conf = float(conf)
             if conf < self.conf_threshold:
                 continue
 
-            x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+            x1, y1, x2, y2 = [int(v) for v in coords.tolist()]
             if x2 <= x1 or y2 <= y1:
                 continue
 

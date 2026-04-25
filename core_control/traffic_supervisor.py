@@ -825,7 +825,8 @@ class TrafficSupervisor:
                detections: List[dict],
                image_shape: Optional[Tuple] = None,
                dt: float = 0.033,
-               vehicle_steer: float = 0.0
+               vehicle_steer: float = 0.0,
+               danger_polygon: Optional[np.ndarray] = None,
                          ) -> Tuple[Optional[DetectionResult], 
                                    Optional[DetectionResult],
                                    Optional[List[DetectionResult]]]:
@@ -859,7 +860,8 @@ class TrafficSupervisor:
         red_light = None
         obstacle_candidates: List[DetectionResult] = []
         stop_lines = []
-        danger_polygon = self._build_obstacle_danger_polygon(image_shape, vehicle_steer)
+        if danger_polygon is None:
+            danger_polygon = self._build_obstacle_danger_polygon(image_shape, vehicle_steer)
         self.last_danger_polygon = danger_polygon
         
         for det in detections:
@@ -1758,17 +1760,20 @@ class TrafficSupervisor:
           - brake_force: 0.0 (no brake) → 1.0 (full brake)
         """
     
-        if danger_polygon is not None:
-          self.last_danger_polygon = danger_polygon
-    
         # Layer 1: Parse + Zone classification + Zone locking
         # NEW: Now returns 3-tuple with stop_lines support
         steer_val = vehicle_steer if vehicle_steer is not None else 0.0
-        # 🔧 FIX: Build and store polygon trước parse
-        danger_polygon = self._build_obstacle_danger_polygon(image_shape, steer_val, current_speed)
+        if danger_polygon is None:
+          danger_polygon = self._build_obstacle_danger_polygon(image_shape, steer_val, current_speed)
         self.last_danger_polygon = danger_polygon
         
-        red_light, obstacle, stop_lines = self._parse_detections(detections, image_shape, dt, steer_val)
+        red_light, obstacle, stop_lines = self._parse_detections(
+            detections,
+            image_shape,
+            dt,
+            steer_val,
+            danger_polygon=danger_polygon,
+        )
         
         # Update turn phase
         self._update_turn_phase(vehicle_steer)
