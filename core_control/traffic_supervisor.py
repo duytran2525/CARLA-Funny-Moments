@@ -116,14 +116,28 @@ class TrafficSupervisor:
         # ─────────────────────────────────────────────────────────
         # PATH CORRIDOR PARAMETERS (for trapezoid drawing)
         # ─────────────────────────────────────────────────────────
-        self.path_wheelbase_m = 2.7
-        self.path_max_steer_angle_deg = 70.0
+        self.path_wheelbase_m = 2.85
+        self.path_max_steer_angle_deg = 35.0
         self.path_base_half_width_m = 1.1
         self.path_width_growth_per_m = 0.035
         self.path_curve_width_gain = 0.55
         self.path_max_half_width_m = 2.8
         self.path_min_forward_m = 0.8
-        self.path_max_forward_m = 40.0
+        self.path_max_forward_m = 35.0
+        self.obstacle_base_distance_m = 8.0
+        self.obstacle_stop_min_distance_m = 5.5
+        self.obstacle_stop_max_distance_m = 18.0
+        self.obstacle_reaction_time_s = 0.45
+        self.obstacle_assumed_decel_mps2 = 5.5
+        self.obstacle_stop_margin_m = 1.5
+        self._emergency_obstacle_classes = {
+            "vehicle",
+            "pedestrian",
+            "car",
+            "truck",
+            "person",
+            "two_wheeler",
+        }
 
         # Merge V10 defaults (can be overridden by external config)
         self.config.setdefault('acc_time_gap', 1.5)
@@ -205,6 +219,13 @@ class TrafficSupervisor:
         self._last_ttc_urgency = float('-inf')
         self._last_selected_target_type = None
         self.last_danger_polygon = None
+        self._last_emergency_eval: Dict[str, Any] = {
+            "emergency": False,
+            "reason": "none",
+            "threshold_m": float(self.obstacle_base_distance_m),
+            "in_path_count": 0,
+            "trigger_candidate": None,
+        }
         
         # ─────────────────────────────────────────────────────────
         # DEBUG INFO
@@ -975,6 +996,83 @@ class TrafficSupervisor:
         
         distance = (focal_length * real_height) / h
         return max(0.5, min(distance, 100.0))
+
+    def _evaluate_obstacle_emergency_from_yolo_logic(
+        self,
+        detections: List[dict],
+        image_shape: Optional[Tuple],
+        vehicle_steer: Optional[float],
+        current_speed_mps: float,
+        distance_threshold: Optional[float],
+        danger_polygon: Optional[np.ndarray],
+    ) -> Dict[str, Any]:
+        """
+        Emergency-brake logic ported from yolo_detector.txt:
+        - obstacle class + confidence gate
+        - bottom-center must lie in danger corridor
+        - distance must be below dynamic threshold
+        """
+        speed_kmh = max(0.0, float(current_speed_mps)) * 3.6
+        threshold_m = self._compute_obstacle_distance_threshold(distance_threshold, speed_kmh)
+
+        if danger_polygon is None:
+            danger_polygon = self._build_obstacle_danger_polygon(
+                image_shape=image_shape,
+                vehicle_steer=0.0 if vehicle_steer is None else float(vehicle_steer),
+                vehicle_speed_kmh=speed_kmh,
+            )
+        self.last_danger_polygon = danger_polygon
+
+        trigger_candidate: Optional[Dict[str, Any]] = None
+        in_path_count = 0
+
+        for det in detections:
+            class_name = str(det.get("class_name", "")).strip().lower()
+            if class_name not in self._emergency_obstacle_classes:
+                continue
+
+            confidence = float(det.get("confidence", 0.0))
+            if confidence < 0.3:
+                continue
+
+            bbox = det.get("bbox")
+            if bbox is None or len(bbox) < 4:
+                continue
+
+            x, y, w, h = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+            bottom_center = (int(x + w / 2.0), int(y + h))
+            if danger_polygon is not None and not self._point_in_polygon(bottom_center, danger_polygon):
+                continue
+
+            in_path_count += 1
+
+            distance_m = float(det.get("distance_m", float("inf")))
+            if not np.isfinite(distance_m):
+                distance_m = self._estimate_distance_from_bbox((x, y, w, h))
+
+            if distance_m < threshold_m:
+                if trigger_candidate is None or distance_m < float(trigger_candidate["distance_m"]):
+                    trigger_candidate = {
+                        "class_name": class_name,
+                        "distance_m": float(distance_m),
+                        "confidence": confidence,
+                    }
+
+        emergency = trigger_candidate is not None
+        reason = "none"
+        if emergency and trigger_candidate is not None:
+            reason = (
+                f"in-path obstacle {trigger_candidate['class_name']} "
+                f"@ {trigger_candidate['distance_m']:.1f}m < {threshold_m:.1f}m"
+            )
+
+        return {
+            "emergency": emergency,
+            "reason": reason,
+            "threshold_m": float(threshold_m),
+            "in_path_count": int(in_path_count),
+            "trigger_candidate": trigger_candidate,
+        }
     
     # ═══════════════════════════════════════════════════════════════
     # LAYER 2: DECISION FUSION + TURN SUPPRESSION + DYNAMIC DISTANCE
@@ -1228,40 +1326,38 @@ class TrafficSupervisor:
         
         return np.clip(ramped_urgency, 0.0, 1.0)
     
-    def _compute_obstacle_distance_threshold(self,
-                                            current_speed: float,
-                                            base_threshold: float = 5.0
-                                            ) -> float:
+    def _compute_obstacle_distance_threshold(
+        self,
+        distance_threshold: Optional[float],
+        speed_kmh: Optional[float],
+    ) -> float:
         """
-        ┌─────────────────────────────────────────────────────────────┐
-        │ Dynamic Distance Threshold based on Speed                   │
-        └─────────────────────────────────────────────────────────────┘
-        
-        Formula:
-          threshold = base_threshold + reaction_time × speed + braking_distance
-          
-        Where:
-          - reaction_time = 0.5 seconds (human reaction)
-          - braking_distance = v² / (2 × deceleration)
-          - deceleration = 3.0 m/s² (moderate braking)
-        
-        Physics-based safe following distance
-        
-        Args:
-          - current_speed: m/s
-          - base_threshold: meters (default 5.0)
-        
-        Returns:
-          - threshold: meters (min 5.0, max 50.0)
+        Dynamic obstacle threshold copied from yolo_detector emergency logic.
         """
-        reaction_time = 0.5  # seconds
-        deceleration = 3.0   # m/s²
-        
-        reaction_distance = reaction_time * current_speed
-        braking_distance = (current_speed ** 2) / (2 * deceleration)
-        
-        threshold = base_threshold + reaction_distance + braking_distance
-        return max(5.0, min(threshold, 50.0))
+        base_threshold = self.obstacle_base_distance_m
+        if distance_threshold is not None:
+            base_threshold = float(distance_threshold)
+
+        if speed_kmh is None:
+            dynamic_threshold = base_threshold
+        else:
+            speed_mps = max(0.0, float(speed_kmh) / 3.6)
+            reaction_dist = speed_mps * self.obstacle_reaction_time_s
+            braking_dist = (speed_mps * speed_mps) / max(
+                2.0 * self.obstacle_assumed_decel_mps2,
+                0.1,
+            )
+            dynamic_threshold = max(
+                base_threshold,
+                reaction_dist + braking_dist + self.obstacle_stop_margin_m,
+            )
+
+        return float(
+            max(
+                self.obstacle_stop_min_distance_m,
+                min(self.obstacle_stop_max_distance_m, dynamic_threshold),
+            )
+        )
     
     def _should_brake(self,
                      red_light: Optional[DetectionResult],
@@ -1469,7 +1565,10 @@ class TrafficSupervisor:
                           red_light.confidence < 0.3)
         
         # Điều kiện 2: Không còn chướng ngại
-        obstacle_distance_threshold = self._compute_obstacle_distance_threshold(current_speed)
+        obstacle_distance_threshold = self._compute_obstacle_distance_threshold(
+            distance_threshold=None,
+            speed_kmh=max(0.0, float(current_speed)) * 3.6,
+        )
         obstacle_clear = (obstacle is None or
                          obstacle.distance > obstacle_distance_threshold or
                          obstacle.confidence < 0.3)
@@ -1760,61 +1859,41 @@ class TrafficSupervisor:
           - brake_force: 0.0 (no brake) → 1.0 (full brake)
         """
     
-        # Layer 1: Parse + Zone classification + Zone locking
-        # NEW: Now returns 3-tuple with stop_lines support
-        steer_val = vehicle_steer if vehicle_steer is not None else 0.0
+        # Emergency-brake pipeline replaced by legacy logic from yolo_detector.txt.
+        steer_val = 0.0 if vehicle_steer is None else float(vehicle_steer)
+        speed_kmh = max(0.0, float(current_speed)) * 3.6
+
         if danger_polygon is None:
-          danger_polygon = self._build_obstacle_danger_polygon(image_shape, steer_val, current_speed)
+            danger_polygon = self._build_obstacle_danger_polygon(
+                image_shape=image_shape,
+                vehicle_steer=steer_val,
+                vehicle_speed_kmh=speed_kmh,
+            )
         self.last_danger_polygon = danger_polygon
-        
-        red_light, obstacle, stop_lines = self._parse_detections(
-            detections,
-            image_shape,
-            dt,
-            steer_val,
+
+        emergency_eval = self._evaluate_obstacle_emergency_from_yolo_logic(
+            detections=detections,
+            image_shape=image_shape,
+            vehicle_steer=steer_val,
+            current_speed_mps=float(current_speed),
+            distance_threshold=distance_threshold,
             danger_polygon=danger_polygon,
         )
-        
-        # Update turn phase
-        self._update_turn_phase(vehicle_steer)
-        
-        # Layer 2: Decision fusion with stop_lines support
-        should_brake_raw, brake_conf_raw = self._should_brake(
-            red_light, obstacle, stop_lines, current_speed, vehicle_steer, distance_threshold
-        )
-        
-        # Layer 3: Red light smoothing + temporal consensus
-        should_brake, brake_conf = self._temporal_consensus(
-          should_brake_raw, brake_conf_raw, red_light, obstacle
-        )
-        
-        # Layer 4: Resume validation
-        can_resume = self._can_resume(red_light, obstacle, current_speed)
-        
-        # Layer 6: State update (trước fail-safe)
+        should_brake = bool(emergency_eval["emergency"])
+        brake_force = 1.0 if should_brake else 0.0
+
+        # Maintain supervisor runtime fields for overlays/logging compatibility.
+        self._last_selected_target_type = "obstacle" if should_brake else "none"
+        self._last_longitudinal_urgency = 1.0 if should_brake else 0.0
+        self._last_acc_urgency = self._last_longitudinal_urgency
+        self._last_ttc_urgency = self._last_longitudinal_urgency if should_brake else float("-inf")
+        self.red_light_history.append(False)
+        self.obstacle_history.append(should_brake)
         self._update_state(should_brake, current_speed, dt)
-        
-        # Compute brake force based on state
-        if self.state == SupervisorState.CRUISING:
-            brake_force = 0.0
-        elif self.state == SupervisorState.STOPPING:
-            brake_force = min(brake_conf, 1.0)
-        elif self.state == SupervisorState.STOPPED:
-            brake_force = 1.0
-        elif self.state == SupervisorState.RESUMING:
-            if can_resume:
-                self.state = SupervisorState.CRUISING
-                self.green_immunity_counter = 10  # 10-frame immunity after resume
-                brake_force = 0.0
-            else:
-                brake_force = 1.0
-        else:
-            brake_force = 1.0
-        
-        # Layer 5: Fail-safe (with jerk constraint and dt parameter)
-        brake_force = self._apply_failsafe(brake_force, dt)
-        
-        return brake_force
+
+        # Keep latest context for debug/reporting.
+        self._last_emergency_eval = emergency_eval
+        return float(brake_force)
     
     def get_state(self) -> str:
         """Return current state (for debugging)"""
@@ -1883,6 +1962,11 @@ class TrafficSupervisor:
             
             'danger_polygon': self.last_danger_polygon,  # ← THÊM DÒNG NÀY
             'danger_polygon_valid': self.last_danger_polygon is not None,
+            'obstacle_emergency': bool(self._last_emergency_eval.get('emergency', False)),
+            'obstacle_reason': str(self._last_emergency_eval.get('reason', 'none')),
+            'obstacle_threshold_m': float(self._last_emergency_eval.get('threshold_m', self.obstacle_base_distance_m)),
+            'obstacle_in_path_count': int(self._last_emergency_eval.get('in_path_count', 0)),
+            'obstacle_trigger': self._last_emergency_eval.get('trigger_candidate'),
 
             # NEW (Layer 5): Brake force tracking
             'prev_brake_force': round(self._prev_brake_force, 3),
