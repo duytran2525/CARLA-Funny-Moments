@@ -235,7 +235,7 @@ class TrafficSupervisor:
     def _print_init_report(self):
         """In báo cáo khởi tạo (one-time)"""
         print("\n" + "="*70)
-        print("🚦 TRAFFIC SUPERVISOR INITIALIZED")
+        print("[INFO] TRAFFIC SUPERVISOR INITIALIZED")
         print("="*70)
         print(f"Config:")
         print(f"  - Confidence Threshold: {self.config.get('confidence_threshold', 0.5)}")
@@ -1100,22 +1100,34 @@ class TrafficSupervisor:
             ↓ (turn_grace_counter ≥ 30)
           NORMAL
         """
+        hold_frames = 18
+        grace_frames = 30
+
         if vehicle_steer is None:
-            # Default: not turning
             self.in_turn_phase = False
-        elif abs(vehicle_steer) >= 0.22:
-            # Sharp turn detected
-            self.in_turn_phase = True
-            self.turn_hold_counter = 18
+            self.turn_hold_counter = 0
             self.turn_grace_counter = 0
-        
-        # Decrement counters
+            return
+
+        if abs(vehicle_steer) >= 0.22:
+            # Refresh suppression while steering remains in turning regime.
+            self.in_turn_phase = True
+            self.turn_hold_counter = hold_frames
+            self.turn_grace_counter = grace_frames
+            return
+
+        # Steering returned near center: count down hold first, then grace.
         if self.turn_hold_counter > 0:
             self.turn_hold_counter -= 1
-        elif self.turn_grace_counter > 0:
+            self.in_turn_phase = True
+            return
+
+        if self.turn_grace_counter > 0:
             self.turn_grace_counter -= 1
-            if self.turn_grace_counter == 0:
-                self.in_turn_phase = False
+            self.in_turn_phase = True
+            return
+
+        self.in_turn_phase = False
     
     def _resolve_braking_target(self,
                                red_light: Optional[DetectionResult],
@@ -1746,69 +1758,40 @@ class TrafficSupervisor:
                      current_speed: float,
                      dt: float
                      ) -> None:
-        """
-        ┌─────────────────────────────────────────────────────────────┐
-        │ LAYER 6: State Machine - Track vehicle state + green immunity
-        └─────────────────────────────────────────────────────────────┘
-        
-        State Transitions:
-        
-          CRUISING
-            ↓ (should_brake = True)
-          STOPPING
-            ↓ (speed → 0)
-          STOPPED
-            ↓ (all resume checks pass)
-          RESUMING
-            ↓ (safety check ok)
-          CRUISING
-        
-        Green Immunity:
-          - When transitioning STOPPED → RESUMING → CRUISING
-          - Set green_immunity_counter = 10 frames
-          - During this time, re-assess red light detection
-          - Protects against green light false negatives
-        
-        Time Tracking:
-          - stopped_time: Accumulate time in STOPPED state
-          - Reset to 0 khi exit STOPPED
-          - Used for timeout detection
-        """
-        # ✅ FIX: Braking phase - transition from CRUISING → STOPPING
+        """Update state machine and immunity timers."""
+        prev_state = self.state
+
         if should_brake:
-            if self.state == SupervisorState.CRUISING:
+            if self.state in (SupervisorState.CRUISING, SupervisorState.RESUMING):
                 self.state = SupervisorState.STOPPING
-                self.stopped_time = 0.0
-        
-        # ✅ FIX: Speed check - transition from STOPPING → STOPPED
+        else:
+            if self.state == SupervisorState.STOPPING:
+                self.state = SupervisorState.CRUISING
+            elif self.state == SupervisorState.STOPPED:
+                self.state = SupervisorState.RESUMING
+            elif self.state == SupervisorState.RESUMING:
+                self.state = SupervisorState.CRUISING
+
         if self.state == SupervisorState.STOPPING and current_speed < 0.1:
             self.state = SupervisorState.STOPPED
-        
-        # ✅ FIX: Exit from STOPPED when obstacle clears (should_brake = False)
-        # This is the missing logic that was causing the vehicle to be stuck
-        if not should_brake and self.state == SupervisorState.STOPPED:
-            self.state = SupervisorState.RESUMING
-        
-        # ✅ FIX: Exit from STOPPING when brake signal is cancelled
-        # Allows early exit if obstacle disappears during deceleration phase
-        if not should_brake and self.state == SupervisorState.STOPPING:
-            self.state = SupervisorState.CRUISING
-            self.stopped_time = 0.0
-        
-        # Time tracking
+
         if self.state == SupervisorState.STOPPED:
             self.stopped_time += dt
         else:
             self.stopped_time = 0.0
-        
+
+        if prev_state == SupervisorState.RESUMING and self.state == SupervisorState.CRUISING:
+            # Short immunity to avoid immediate resume->rebrake flicker.
+            self.green_immunity_counter = max(self.green_immunity_counter, 10)
+
         # Phantom immunity counter
         if self.phantom_immunity_counter > 0:
-          self.phantom_immunity_counter -= 1
+            self.phantom_immunity_counter -= 1
 
         # Green immunity counter
         if self.green_immunity_counter > 0:
             self.green_immunity_counter -= 1
-        
+
         self.frame_count += 1
     
     # ═══════════════════════════════════════════════════════════════
@@ -1824,42 +1807,7 @@ class TrafficSupervisor:
                dt: float = 0.033,
                danger_polygon: Optional[np.ndarray] = None
                ) -> float:
-        """
-        ┌─────────────────────────────────────────────────────────────┐
-        │ PUBLIC API: Main compute function (6-Layer Pipeline)        │
-        │ Called from: run_agents.py (mỗi frame)                      │
-        └─────────────────────────────────────────────────────────────┘
-        
-        Flow:
-          Input (detections, current_speed, image_shape, distance_threshold, vehicle_steer, dt)
-            ↓
-          Layer 1: Parse detections + zone classification + zone locking
-            ↓
-          Layer 2: Decision fusion (turn suppression + dynamic distance)
-            ↓
-          Layer 3: Red light smoothing + temporal consensus
-            ↓
-          Layer 4: Resume validation (check resume conditions)
-            ↓
-          Layer 6: State update (update state machine + green immunity)
-            ↓
-          Layer 5: Fail-safe (emergency handling)
-            ↓
-          Output (brake_force: 0.0 → 1.0)
-        
-        Args:
-          - detections: List[dict] from YOLO detector
-          - current_speed: float (m/s)
-          - image_shape: tuple (height, width, channels), optional
-          - distance_threshold: float (override obstacle distance), optional
-          - vehicle_steer: float (-1.0 to 1.0), optional (for turn suppression)
-          - dt: float (delta time, default 30 FPS = 0.033s)
-        
-        Returns:
-          - brake_force: 0.0 (no brake) → 1.0 (full brake)
-        """
-    
-        # Emergency-brake pipeline replaced by legacy logic from yolo_detector.txt.
+        """Run the supervisor 6-layer pipeline and return brake force [0, 1]."""
         steer_val = 0.0 if vehicle_steer is None else float(vehicle_steer)
         speed_kmh = max(0.0, float(current_speed)) * 3.6
 
@@ -1871,7 +1819,63 @@ class TrafficSupervisor:
             )
         self.last_danger_polygon = danger_polygon
 
-        emergency_eval = self._evaluate_obstacle_emergency_from_yolo_logic(
+        # Layer 1: parse detections + zone locking + stable obstacle tracking.
+        red_light, obstacle, stop_lines = self._parse_detections(
+            detections=detections,
+            image_shape=image_shape,
+            dt=dt,
+            vehicle_steer=steer_val,
+            danger_polygon=danger_polygon,
+        )
+
+        # Layer 2: turn suppression + target arbitration + urgency.
+        self._update_turn_phase(vehicle_steer=steer_val)
+        should_brake_raw, brake_conf_raw = self._should_brake(
+            red_light=red_light,
+            obstacle=obstacle,
+            stop_lines=stop_lines,
+            current_speed=float(current_speed),
+            vehicle_steer=steer_val,
+            distance_threshold=distance_threshold,
+        )
+
+        # Layer 3: temporal filtering.
+        should_brake, brake_conf = self._temporal_consensus(
+            should_brake_raw=should_brake_raw,
+            brake_conf_raw=brake_conf_raw,
+            red_light=red_light,
+            obstacle=obstacle,
+        )
+
+        # Layer 4: resume validation when in STOPPED/RESUMING states.
+        if self.state in (SupervisorState.STOPPED, SupervisorState.RESUMING):
+            can_resume = self._can_resume(
+                red_light=red_light,
+                obstacle=obstacle,
+                current_speed=float(current_speed),
+            )
+            if not can_resume:
+                should_brake = True
+                brake_conf = max(brake_conf, 0.35)
+
+        target_brake = float(np.clip(brake_conf, 0.0, 1.0)) if should_brake else 0.0
+
+        # Layer 6: update state machine.
+        self._update_state(
+            should_brake=should_brake,
+            current_speed=float(current_speed),
+            dt=dt,
+        )
+
+        # Keep minimum hold pressure while fully stopped under active braking.
+        if self.state == SupervisorState.STOPPED and should_brake:
+            target_brake = max(target_brake, 0.5)
+
+        # Layer 5: fail-safe + jerk limiter.
+        final_brake = self._apply_failsafe(brake_force=target_brake, dt=dt)
+
+        # Preserve obstacle-specific diagnostics for overlays/logging.
+        self._last_emergency_eval = self._evaluate_obstacle_emergency_from_yolo_logic(
             detections=detections,
             image_shape=image_shape,
             vehicle_steer=steer_val,
@@ -1879,22 +1883,11 @@ class TrafficSupervisor:
             distance_threshold=distance_threshold,
             danger_polygon=danger_polygon,
         )
-        should_brake = bool(emergency_eval["emergency"])
-        brake_force = 1.0 if should_brake else 0.0
+        if not should_brake and self._last_selected_target_type is None:
+            self._last_selected_target_type = 'none'
 
-        # Maintain supervisor runtime fields for overlays/logging compatibility.
-        self._last_selected_target_type = "obstacle" if should_brake else "none"
-        self._last_longitudinal_urgency = 1.0 if should_brake else 0.0
-        self._last_acc_urgency = self._last_longitudinal_urgency
-        self._last_ttc_urgency = self._last_longitudinal_urgency if should_brake else float("-inf")
-        self.red_light_history.append(False)
-        self.obstacle_history.append(should_brake)
-        self._update_state(should_brake, current_speed, dt)
+        return float(np.clip(final_brake, 0.0, 1.0))
 
-        # Keep latest context for debug/reporting.
-        self._last_emergency_eval = emergency_eval
-        return float(brake_force)
-    
     def get_state(self) -> str:
         """Return current state (for debugging)"""
         return self.state.value

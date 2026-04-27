@@ -1273,6 +1273,8 @@ class LaneFollowAgent(BaseAgent):
         self._visualizer = None
         # YOLO integration
         self._yolo_detector = None
+        self._traffic_supervisor = None
+        self._last_supervisor_ts: Optional[float] = None
         self._yolo_window_name = "Lane Follow + YOLO Detection"
         self._yolo_enabled = False
         # Speed control (PID)
@@ -1380,15 +1382,18 @@ class LaneFollowAgent(BaseAgent):
         """Load YOLO detector if yolo_model_path is provided."""
         if not self.config.yolo_model_path:
             logging.info("No YOLO model path provided, YOLO detection disabled.")
+            self._traffic_supervisor = None
             return
 
         if YoloDetector is None:
             logging.warning("YoloDetector not available. Install ultralytics to enable YOLO detection.")
+            self._traffic_supervisor = None
             return
 
         model_path = resolve_yolo_model_path(self.config.yolo_model_path)
         if not model_path.exists():
             logging.warning("YOLO model file not found: %s. YOLO detection disabled.", model_path)
+            self._traffic_supervisor = None
             return
 
         self._yolo_detector = YoloDetector(
@@ -1400,8 +1405,56 @@ class LaneFollowAgent(BaseAgent):
             camera_mount_z_m=2.2,
             camera_pitch_deg=-8.0,
         )
+        if TrafficSupervisor is None:
+            self._traffic_supervisor = None
+            logging.warning("TrafficSupervisor unavailable. lane_follow will use detector-only emergency fallback.")
+        else:
+            try:
+                self._traffic_supervisor = TrafficSupervisor(self._build_supervisor_config())
+                self._last_supervisor_ts = None
+                logging.info("TrafficSupervisor integrated into lane_follow YOLO loop.")
+            except Exception as exc:
+                self._traffic_supervisor = None
+                logging.warning("Failed to initialize TrafficSupervisor for lane_follow: %s", exc)
         self._yolo_enabled = True
         logging.info("YOLO detection integrated with lane_follow. Model: %s", model_path)
+
+    @staticmethod
+    def _build_supervisor_config() -> Dict[str, Any]:
+        return {
+            "confidence_threshold": 0.5,
+            "temporal_filter_frames": 3,
+            "red_light_distance_threshold": 30.0,
+            "obstacle_distance_threshold": 5.0,
+            "max_stopped_time": 30.0,
+        }
+
+    @staticmethod
+    def _to_supervisor_detections(detections: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        supervisor_inputs: list[Dict[str, Any]] = []
+        for det in detections:
+            box = det.get("box")
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                continue
+
+            x1, y1, x2, y2 = [int(v) for v in box]
+            w = max(1, x2 - x1)
+            h = max(1, y2 - y1)
+            distance_m = float(det.get("distance", float("inf")))
+            if not math.isfinite(distance_m):
+                distance_m = float("inf")
+
+            supervisor_inputs.append(
+                {
+                    "class_name": str(det.get("class_name", "unknown")),
+                    "confidence": float(det.get("confidence", 0.0)),
+                    "bbox": (x1, y1, w, h),
+                    "distance_m": distance_m,
+                    "relative_velocity_kmh": float(det.get("relative_velocity_kmh", 0.0)),
+                }
+            )
+
+        return supervisor_inputs
 
     def _load_model(self):
         if torch is None:
@@ -1560,7 +1613,7 @@ class LaneFollowAgent(BaseAgent):
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
         # distance_threshold applies to dynamic obstacles (pedestrian/vehicle/two_wheeler).
-        detections, is_emergency = self._yolo_detector.detect_and_evaluate(
+        detections, detector_emergency = self._yolo_detector.detect_and_evaluate(
             frame_bgr,
             distance_threshold=None,
             depth_map_m=depth_map_m,
@@ -1570,6 +1623,70 @@ class LaneFollowAgent(BaseAgent):
         debug_info = {}
         if hasattr(self._yolo_detector, "get_last_debug_info"):
             debug_info = self._yolo_detector.get_last_debug_info() or {}
+
+        supervisor_brake = 0.0
+        sup_debug: Dict[str, Any] = {}
+        if self._traffic_supervisor is not None:
+            now_ts = time.time()
+            if self._last_supervisor_ts is None:
+                dt = self.config.fixed_delta if self.config.sync else (1.0 / 30.0)
+            elif self.config.sync:
+                dt = self.config.fixed_delta
+            else:
+                dt = max(1e-3, now_ts - float(self._last_supervisor_ts))
+            self._last_supervisor_ts = now_ts
+
+            try:
+                sup_dets = self._to_supervisor_detections(detections)
+                supervisor_brake = float(
+                    self._traffic_supervisor.compute(
+                        detections=sup_dets,
+                        current_speed=0.0 if speed_kmh is None else (float(speed_kmh) / 3.6),
+                        image_shape=frame_bgr.shape,
+                        distance_threshold=None,
+                        vehicle_steer=0.0 if current_steer is None else float(current_steer),
+                        dt=dt,
+                    )
+                )
+                supervisor_brake = clamp(supervisor_brake, 0.0, 1.0)
+                sup_debug = self._traffic_supervisor.get_debug_info()
+            except Exception as exc:
+                supervisor_brake = 0.0
+                sup_debug = {}
+                logging.warning("Lane-follow TrafficSupervisor compute failed: %s", exc)
+
+        debug_info["supervisor_brake"] = float(supervisor_brake)
+        if sup_debug:
+            target_type = str(sup_debug.get("selected_target_type", "none"))
+            debug_info["decision_reason"] = target_type
+            debug_info["supervisor_state"] = str(sup_debug.get("state", "n/a"))
+            debug_info["locked_zone"] = sup_debug.get("locked_zone")
+            debug_info["green_immunity_counter"] = int(sup_debug.get("green_immunity_counter", 0))
+            debug_info["turn_phase_active"] = bool(sup_debug.get("in_turn_phase", False))
+            debug_info["turn_green_grace_counter"] = int(sup_debug.get("turn_grace_counter", 0))
+            debug_info["red_light_active"] = bool(
+                supervisor_brake > 0.0 and target_type in ("red_light", "traffic_light_red", "stop_line")
+            )
+            debug_info["obstacle_emergency"] = bool(supervisor_brake > 0.0 and target_type == "obstacle")
+            debug_info["obstacle_reason"] = str(sup_debug.get("obstacle_reason", ""))
+
+            polygon = sup_debug.get("danger_polygon")
+            polygon_list = []
+            if isinstance(polygon, np.ndarray):
+                polygon_list = [[int(p[0]), int(p[1])] for p in polygon.tolist() if isinstance(p, (list, tuple)) and len(p) >= 2]
+            elif isinstance(polygon, list):
+                polygon_list = [[int(p[0]), int(p[1])] for p in polygon if isinstance(p, (list, tuple)) and len(p) >= 2]
+            if polygon_list:
+                obstacle_roi = debug_info.get("obstacle_danger_roi", {}) or {}
+                obstacle_roi["polygon"] = polygon_list
+                debug_info["obstacle_danger_roi"] = obstacle_roi
+
+        # In lane-follow, prefer supervisor as primary brake source when available.
+        hard_supervisor_emergency = supervisor_brake >= 0.95
+        if self._traffic_supervisor is not None:
+            is_emergency = bool(hard_supervisor_emergency)
+        else:
+            is_emergency = bool(detector_emergency)
 
         annotated_frame = frame_bgr.copy()
         for roi_region in debug_info.get("roi_regions", []):
@@ -1731,6 +1848,7 @@ class LaneFollowAgent(BaseAgent):
 
         # Run YOLO detection and display if enabled
         is_emergency = False
+        supervisor_brake = 0.0
         yolo_debug_info: Dict[str, Any] = {}
         annotated_yolo_frame = None
         if self._yolo_enabled and self._yolo_detector is not None:
@@ -1741,6 +1859,7 @@ class LaneFollowAgent(BaseAgent):
                 current_steer=self._last_steer,
                 speed_kmh=speed_kmh,
             )
+            supervisor_brake = float(yolo_debug_info.get("supervisor_brake", 0.0))
 
         self._write_video_frame(frame)
         if self._stop_requested:
@@ -1754,11 +1873,11 @@ class LaneFollowAgent(BaseAgent):
 
         throttle, brake = self._longitudinal_control(speed_kmh)
 
-        # Apply emergency braking if YOLO detects danger
-        if is_emergency:
+        # Apply emergency/supervisor braking if YOLO detects danger.
+        if is_emergency or supervisor_brake > 0.0:
             throttle = 0.0
-            # Red light and obstacle use the same brake cap in lane-follow mode.
-            brake = max(brake, self.config.max_brake)
+            emergency_floor = self.config.max_brake if is_emergency else 0.0
+            brake = max(brake, supervisor_brake, emergency_floor)
 
         control = carla.VehicleControl(
             throttle=float(throttle),
@@ -1787,7 +1906,11 @@ class LaneFollowAgent(BaseAgent):
                 yaw=rotation.yaw,
             )
 
-        emergency_reason = yolo_debug_info.get("decision_reason", "none") if is_emergency else "none"
+        emergency_reason = (
+            yolo_debug_info.get("decision_reason", "none")
+            if (is_emergency or supervisor_brake > 0.0)
+            else "none"
+        )
         hud_metrics = {
             "agent": "lane_follow",
             "tick": step_idx,
@@ -1863,6 +1986,9 @@ class LaneFollowAgent(BaseAgent):
                 pass
             self._yolo_enabled = False
             logging.info("Closed YOLO detection window.")
+        self._yolo_detector = None
+        self._traffic_supervisor = None
+        self._last_supervisor_ts = None
 
     def should_stop(self) -> bool:
         return self._stop_requested
