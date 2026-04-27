@@ -1764,15 +1764,6 @@ class LaneFollowAgent(BaseAgent):
 
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
             label = f"{class_name} {conf:.2f} ({distance:.1f}m)"
-            label = f"{label} [{distance_source}]"
-            if roi_zone is not None:
-                label = f"{label} [{roi_zone}]"
-            if in_danger_roi:
-                label = f"{label} [path]"
-            if path_check_mode:
-                label = f"{label} [{path_check_mode}]"
-            if danger_match:
-                label = f"{label} [BRAKE]"
             cv2.putText(annotated_frame, label, (x1, y1 - 10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
@@ -4806,15 +4797,6 @@ class YoloDetectAgent(BaseAgent):
 
             # Build label
             label = f"{class_name} {confidence:.2f} ({distance:.1f}m)"
-            label = f"{label} [{distance_source}]"
-            if roi_zone is not None:
-                label = f"{label} [{roi_zone}]"
-            if in_danger_roi:
-                label = f"{label} [path]"
-            if path_check_mode:
-                label = f"{label} [{path_check_mode}]"
-            if danger_match:
-                label = f"{label} [BRAKE]"
 
             # Determine color
             if class_name == "traffic_light_red":
@@ -4848,17 +4830,23 @@ class YoloDetectAgent(BaseAgent):
         # ─────────────────────────────────────────────────────────
         # Draw Status Text Overlays
         # ─────────────────────────────────────────────────────────
-        if supervisor_brake > 0.0:
-            status_text = f"SUPERVISOR BRAKE {supervisor_brake:.2f} ({supervisor_reason})"
-            status_color = (0, 0, 255)
+        brake_level = float(clamp(display_brake, 0.0, 1.0))
+        if self._traffic_supervisor is not None:
+            supervisor_state_upper = str(sup_debug.get("state", "cruising")).upper()
+            status_text = f"SUPERVISOR {supervisor_state_upper} | BRK={brake_level:.2f}"
+            if supervisor_reason not in ("n/a", "none", ""):
+                status_text = f"{status_text} ({supervisor_reason})"
+            # Color encodes actual brake intensity: green (0.0) -> red (1.0)
+            status_color = (
+                0,
+                int(round(255.0 * (1.0 - brake_level))),
+                int(round(255.0 * brake_level)),
+            )
         elif is_emergency:
-            status_text = "EMERGENCY BRAKE"
+            status_text = f"EMERGENCY BRAKE | BRK={brake_level:.2f}"
             status_color = (0, 0, 255)
-        elif self._traffic_supervisor is not None:
-            status_text = f"Supervisor {str(sup_debug.get('state', 'cruising')).upper()}"
-            status_color = (0, 255, 0)
         else:
-            status_text = "Normal"
+            status_text = f"NORMAL | BRK={brake_level:.2f}"
             status_color = (0, 255, 0)
 
         cv2.putText(
