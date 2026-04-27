@@ -1563,9 +1563,7 @@ class TrafficSupervisor:
         Điều kiện resume (ALL phải TRUE):
           1. Không còn đèn đỏ gần (> threshold hoặc confidence < 0.3)
           2. Không còn chướng ngại gần (> dynamic threshold)
-          3. Xe đã dừng hoàn toàn (speed < 0.1 m/s)
-          4. Không timeout chờ quá lâu (< 30s)
-          5. Green immunity: chỉ resume nếu green_immunity_counter = 0
+          3. Green immunity: chỉ resume nếu green_immunity_counter = 0
         
         Nếu ANY condition fail:
           - Stay in STOPPED state
@@ -1585,17 +1583,10 @@ class TrafficSupervisor:
                          obstacle.distance > obstacle_distance_threshold or
                          obstacle.confidence < 0.3)
         
-        # Điều kiện 3: Xe đã dừng
-        speed_is_zero = current_speed < 0.1
-        
-        # Điều kiện 4: Không timeout
-        timeout = self.stopped_time < self.config.get('max_stopped_time', 30.0)
-        
-        # Điều kiện 5: Green immunity expires
+        # Điều kiện 3: Green immunity expires
         green_immunity_clear = (self.green_immunity_counter == 0)
         
-        can_resume = (red_light_clear and obstacle_clear and speed_is_zero and 
-                     timeout and green_immunity_clear)
+        can_resume = (red_light_clear and obstacle_clear and green_immunity_clear)
         return can_resume
     
     # ═══════════════════════════════════════════════════════════════
@@ -1847,8 +1838,8 @@ class TrafficSupervisor:
             obstacle=obstacle,
         )
 
-        # Layer 4: resume validation when in STOPPED/RESUMING states.
-        if self.state in (SupervisorState.STOPPED, SupervisorState.RESUMING):
+         # Layer 4: resume validation when in STOPPING/STOPPED/RESUMING states.
+        if self.state in (SupervisorState.STOPPING, SupervisorState.STOPPED, SupervisorState.RESUMING):
             can_resume = self._can_resume(
                 red_light=red_light,
                 obstacle=obstacle,

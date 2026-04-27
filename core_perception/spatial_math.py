@@ -111,35 +111,63 @@ class DynamicIPM:
             object_list = list(tracked_objects)
 
         projected: List[Dict[str, Any]] = []
+        
+        # Chiều cao thực tế giả định (m) cho các vật thể lơ lửng trên không
+        elevated_real_heights = {
+            "traffic_light_red": 0.8,
+            "traffic_light_green": 0.8,
+            "traffic_light": 0.8,
+            "traffic_sign": 0.7,
+            "stop_sign": 0.7,
+        }
+
         for obj in object_list:
             bbox = obj.get("bbox")
             if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
                 continue
 
             x1, y1, x2, y2 = [float(v) for v in bbox]
-            bottom_center_u = 0.5 * (x1 + x2)
-            bottom_center_v = y2
+            class_name = str(obj.get("class", "unknown")).lower()
 
-            ground_xy = self._project_pixel_to_ground(
-                bottom_center_u,
-                bottom_center_v,
-                float(pitch),
-                float(roll),
-            )
-            if ground_xy is None:
-                distance_m = float("inf")
-                bev_xy_m = [float("nan"), float("nan")]
-                rel_velocity_kmh = 0.0
+            if class_name in elevated_real_heights:
+                # 1. Pinhole Fallback cho vật thể lơ lửng
+                real_h = elevated_real_heights[class_name]
+                bbox_h = max(1.0, y2 - y1)
+                distance_m = float((self.intrinsics.fy * real_h) / bbox_h)
+                
+                # 2. Ước tính X, Y trong không gian xe
+                center_u = 0.5 * (x1 + x2)
+                center_v = 0.5 * (y1 + y2)
+                ray_cam = np.array([
+                    (center_u - self.intrinsics.cx) / max(self.intrinsics.fx, 1e-6),
+                    (center_v - self.intrinsics.cy) / max(self.intrinsics.fy, 1e-6),
+                    1.0
+                ], dtype=np.float64)
+                
+                p_cam = ray_cam * distance_m
+                rot = self._camera_to_vehicle_rotation(float(pitch), float(roll))
+                p_veh = rot @ p_cam
+                
+                x_m, y_m = float(p_veh[0]), float(p_veh[1])
+                bev_xy_m = [x_m, y_m]
+                rel_velocity_kmh = self._estimate_relative_speed(obj.get("track_id"), x_m, y_m, ts)
             else:
-                x_m, y_m = ground_xy
-                distance_m = float(math.hypot(x_m, y_m))
-                bev_xy_m = [float(x_m), float(y_m)]
-                rel_velocity_kmh = self._estimate_relative_speed(
-                    obj.get("track_id"),
-                    x_m,
-                    y_m,
-                    ts,
+                # Xử lý mặc định (IPM) cho vật thể chạm đất (xe, người...)
+                bottom_center_u = 0.5 * (x1 + x2)
+                bottom_center_v = y2
+
+                ground_xy = self._project_pixel_to_ground(
+                    bottom_center_u, bottom_center_v, float(pitch), float(roll)
                 )
+                if ground_xy is None:
+                    distance_m = float("inf")
+                    bev_xy_m = [float("nan"), float("nan")]
+                    rel_velocity_kmh = 0.0
+                else:
+                    x_m, y_m = ground_xy
+                    distance_m = float(math.hypot(x_m, y_m))
+                    bev_xy_m = [float(x_m), float(y_m)]
+                    rel_velocity_kmh = self._estimate_relative_speed(obj.get("track_id"), x_m, y_m, ts)
 
             enriched = dict(obj)
             enriched["distance_m"] = distance_m
