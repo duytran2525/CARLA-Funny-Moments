@@ -28,6 +28,12 @@ class CILRoutePlanner:
             return item[0]
         return None
 
+    @staticmethod
+    def _reference_item_location(item: Any):
+        if isinstance(item, dict):
+            return item.get("location")
+        return getattr(item, "location", None)
+
     def _nearest_route_index(
         self,
         route_locations: list[Any],
@@ -176,6 +182,39 @@ class CILRoutePlanner:
 
         queue_attr = getattr(planner, "_waypoints_queue", None)
         append_from(queue_attr, max_points)
+
+        if route_locations:
+            route_locations = self._sanitize_route_polyline(
+                route_locations,
+                anchor_location=anchor_location,
+                max_gap_m=35.0,
+            )
+
+        if anchor_location is not None and not route_locations:
+            route_locations.append(anchor_location)
+
+        if max_points > 0 and len(route_locations) > max_points:
+            route_locations = route_locations[:max_points]
+
+        return route_locations
+
+    def collect_reference_route_locations(
+        self,
+        reference_route_plan: list[Any],
+        max_points: int = 260,
+        anchor_location: Any = None,
+    ) -> list[Any]:
+        if not reference_route_plan:
+            return []
+
+        route_locations: list[Any] = []
+        for item in reference_route_plan:
+            location = self._reference_item_location(item)
+            if location is None:
+                continue
+            if route_locations and self._xy_distance(location, route_locations[-1]) < 0.10:
+                continue
+            route_locations.append(location)
 
         if route_locations:
             route_locations = self._sanitize_route_polyline(
