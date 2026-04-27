@@ -6,11 +6,15 @@ param(
     [int]$TargetImagesPerCamera = 30000,
     [int]$ChunkTicks = 15000,
     [int]$SaveEveryN = 3,
+    [string]$AutopilotBackend = "tm",
     [Nullable[double]]$TargetSpeedKmh = $null,
-    [Nullable[int]]$NpcVehicleCount = $null,
-    [Nullable[int]]$NpcBikeCount = $null,
-    [Nullable[int]]$NpcMotorbikeCount = $null,
-    [Nullable[int]]$NpcPedestrianCount = $null,
+    [Nullable[int]]$RecoveryIntervalFrames = 999999,
+    [Nullable[int]]$RecoveryDurationFrames = 1,
+    [Nullable[double]]$RecoverySteerOffset = 0.0,
+    [Nullable[int]]$NpcVehicleCount = 0,
+    [Nullable[int]]$NpcBikeCount = 0,
+    [Nullable[int]]$NpcMotorbikeCount = 0,
+    [Nullable[int]]$NpcPedestrianCount = 0,
     [int]$SeedBase = -1
 )
 
@@ -26,6 +30,42 @@ function Resolve-AbsolutePath {
         return $PathValue
     }
     return (Join-Path $RepoRoot $PathValue)
+}
+
+function Get-FixedDeltaSeconds {
+    param(
+        [string]$ConfigPath
+    )
+
+    foreach ($line in Get-Content -Path $ConfigPath) {
+        if ($line -match '^\s*fixed_delta\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*$') {
+            return [double]$Matches[1]
+        }
+    }
+
+    return 0.03
+}
+
+function Get-ChunkTickEstimate {
+    param(
+        [int]$RemainingImages,
+        [int]$DefaultChunkTicks,
+        [int]$FutureHorizonTicks,
+        [double]$YieldPerUsableTick,
+        [int]$MinChunkTicks
+    )
+
+    $safeYield = [Math]::Min(1.0, [Math]::Max(0.20, [double]$YieldPerUsableTick))
+    $defaultDeliverable = [int][Math]::Floor([Math]::Max(0, $DefaultChunkTicks - $FutureHorizonTicks) * $safeYield)
+    if ($RemainingImages -gt [int]($defaultDeliverable * 0.95)) {
+        return $DefaultChunkTicks
+    }
+
+    $estimatedUsableTicks = [int][Math]::Ceiling(([double]$RemainingImages / $safeYield) * 0.98)
+    $candidateTicks = $FutureHorizonTicks + $estimatedUsableTicks
+    $candidateTicks = [Math]::Max($MinChunkTicks, $candidateTicks)
+    $candidateTicks = [Math]::Min($DefaultChunkTicks, $candidateTicks)
+    return [int]$candidateTicks
 }
 
 function Get-CameraImageCounts {
@@ -70,7 +110,11 @@ function Invoke-CollectorChunk {
         [string]$TownOutputDir,
         [int]$Ticks,
         [int]$SaveEveryNValue,
+        [string]$AutopilotBackendValue,
         [Nullable[double]]$TargetSpeed,
+        [Nullable[int]]$RecoveryInterval,
+        [Nullable[int]]$RecoveryDuration,
+        [Nullable[double]]$RecoverySteer,
         [Nullable[int]]$VehicleCount,
         [Nullable[int]]$BikeCount,
         [Nullable[int]]$MotorbikeCount,
@@ -89,11 +133,21 @@ function Invoke-CollectorChunk {
         "--destination-point", "-1",
         "--ticks", [string]$Ticks,
         "--save-every-n", [string]$SaveEveryNValue,
+        "--autopilot-backend", $AutopilotBackendValue,
         "--nav-agent-type", "basic"
     )
 
     if ($null -ne $TargetSpeed) {
         $runnerArgs += @("--target-speed-kmh", [string]$TargetSpeed)
+    }
+    if ($null -ne $RecoveryInterval) {
+        $runnerArgs += @("--recovery-interval-frames", [string]$RecoveryInterval)
+    }
+    if ($null -ne $RecoveryDuration) {
+        $runnerArgs += @("--recovery-duration-frames", [string]$RecoveryDuration)
+    }
+    if ($null -ne $RecoverySteer) {
+        $runnerArgs += @("--recovery-steer-offset", [string]$RecoverySteer)
     }
     if ($null -ne $VehicleCount) {
         $runnerArgs += @("--npc-vehicle-count", [string]$VehicleCount)
@@ -133,6 +187,10 @@ if (-not (Test-Path $configPath)) {
 $resolvedOutputRoot = Resolve-AbsolutePath -RepoRoot $repoRoot -PathValue $OutputRoot
 New-Item -ItemType Directory -Force -Path $resolvedOutputRoot | Out-Null
 
+$fixedDeltaSeconds = Get-FixedDeltaSeconds -ConfigPath $configPath
+$futureHorizonTicks = [int][Math]::Ceiling(2.5 / [Math]::Max($fixedDeltaSeconds, 1e-6))
+$minChunkTicks = [Math]::Max(300, $futureHorizonTicks + 60)
+
 $pythonApi = Join-Path $CarlaRoot "PythonAPI"
 if (-not (Test-Path $pythonApi)) {
     throw "CARLA PythonAPI not found: $pythonApi"
@@ -160,6 +218,12 @@ Write-Host "Output : $resolvedOutputRoot"
 Write-Host "Towns  : $($Towns -join ', ')"
 Write-Host "Target : $TargetImagesPerCamera images per camera per town"
 Write-Host "Ticks  : $ChunkTicks per chunk | save_every_n=$SaveEveryN"
+Write-Host "Backend: autopilot_backend=$AutopilotBackend"
+Write-Host "Recovery: interval=$RecoveryIntervalFrames duration=$RecoveryDurationFrames steer=$RecoverySteerOffset"
+Write-Host "Traffic : vehicles=$NpcVehicleCount bikes=$NpcBikeCount motorbikes=$NpcMotorbikeCount pedestrians=$NpcPedestrianCount"
+Write-Host "Mode   : autopilot roaming whole map (spawn=-1, destination=-1)"
+Write-Host "Lights : ignore_red_lights=true during collect-data"
+Write-Host "Chunk planner: fixed_delta=$fixedDeltaSeconds future_horizon_ticks=$futureHorizonTicks min_chunk_ticks=$minChunkTicks"
 Write-Host "----- Collecting autopilot dataset -----"
 
 $summary = New-Object System.Collections.Generic.List[object]
@@ -170,6 +234,7 @@ for ($townIndex = 0; $townIndex -lt $Towns.Count; $townIndex++) {
     New-Item -ItemType Directory -Force -Path $townOutputDir | Out-Null
 
     $iteration = 0
+    $bestYieldPerUsableTick = $null
     while ($true) {
         $countsBefore = Get-CameraImageCounts -TownOutputDir $townOutputDir
         if ([int]$countsBefore.center -ge $TargetImagesPerCamera) {
@@ -178,12 +243,24 @@ for ($townIndex = 0; $townIndex -lt $Towns.Count; $townIndex++) {
         }
 
         $remaining = $TargetImagesPerCamera - [int]$countsBefore.center
+        $yieldForEstimate = 1.0
+        if ($null -ne $bestYieldPerUsableTick) {
+            $yieldForEstimate = [double]$bestYieldPerUsableTick
+        }
+        $ticksThisChunk = Get-ChunkTickEstimate `
+            -RemainingImages $remaining `
+            -DefaultChunkTicks $ChunkTicks `
+            -FutureHorizonTicks $futureHorizonTicks `
+            -YieldPerUsableTick $yieldForEstimate `
+            -MinChunkTicks $minChunkTicks
         Write-Host (
-            "[{0}] chunk #{1} | current={2} | remaining={3}" -f
+            "[{0}] chunk #{1} | current={2} | remaining={3} | ticks={4} | yield_est={5:N3}" -f
             $town,
             ($iteration + 1),
             $countsBefore.center,
-            $remaining
+            $remaining,
+            $ticksThisChunk,
+            $yieldForEstimate
         )
 
         $seedValue = $null
@@ -196,9 +273,13 @@ for ($townIndex = 0; $townIndex -lt $Towns.Count; $townIndex++) {
             -ConfigPath $configPath `
             -Town $town `
             -TownOutputDir $townOutputDir `
-            -Ticks $ChunkTicks `
+            -Ticks $ticksThisChunk `
             -SaveEveryNValue $SaveEveryN `
+            -AutopilotBackendValue $AutopilotBackend `
             -TargetSpeed $TargetSpeedKmh `
+            -RecoveryInterval $RecoveryIntervalFrames `
+            -RecoveryDuration $RecoveryDurationFrames `
+            -RecoverySteer $RecoverySteerOffset `
             -VehicleCount $NpcVehicleCount `
             -BikeCount $NpcBikeCount `
             -MotorbikeCount $NpcMotorbikeCount `
@@ -207,12 +288,22 @@ for ($townIndex = 0; $townIndex -lt $Towns.Count; $townIndex++) {
 
         $countsAfter = Get-CameraImageCounts -TownOutputDir $townOutputDir
         $delta = [int]$countsAfter.center - [int]$countsBefore.center
+        $usableTicks = [Math]::Max(1, $ticksThisChunk - $futureHorizonTicks)
+        $chunkYield = [Math]::Min(1.0, ([double]$delta / [double]$usableTicks))
+        if ($null -eq $bestYieldPerUsableTick) {
+            $bestYieldPerUsableTick = $chunkYield
+        }
+        else {
+            $bestYieldPerUsableTick = [Math]::Max([double]$bestYieldPerUsableTick, $chunkYield)
+        }
         Write-Host (
-            "[{0}] chunk #{1} done | added={2} | total={3}" -f
+            "[{0}] chunk #{1} done | added={2} | total={3} | yield={4:N3} | best_yield={5:N3}" -f
             $town,
             ($iteration + 1),
             $delta,
-            $countsAfter.center
+            $countsAfter.center,
+            $chunkYield,
+            [double]$bestYieldPerUsableTick
         )
 
         if ($delta -le 0) {

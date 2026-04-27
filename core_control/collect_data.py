@@ -160,6 +160,7 @@ class DataCollector:
         self._writer = csv.DictWriter(self._csv_file, fieldnames=self.CSV_FIELDNAMES)
         if not append:
             self._writer.writeheader()
+            self._csv_file.flush()
 
         self._next_img_index = self._resolve_next_image_index()
         self._rows_since_flush = 0

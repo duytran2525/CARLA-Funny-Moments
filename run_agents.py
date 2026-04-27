@@ -739,6 +739,7 @@ class RunConfig:
     recovery_interval_frames: int
     recovery_duration_frames: int
     recovery_steer_offset: float
+    autopilot_backend: str
     nav_agent_type: str
     yolo_disable_autopilot_red_light: bool
     cil_command_prep_time_s: float
@@ -1010,6 +1011,15 @@ class AutopilotAgent(BaseAgent):
         if not self._spawn_points:
             raise RuntimeError("No spawn points found to build navigation route.")
 
+        if self.config.autopilot_backend == "tm":
+            self._nav_agent = None
+            self._tm_fallback_mode = True
+            self._enable_tm_native_autopilot(vehicle)
+            logging.info(
+                "Autopilot backend initialized: tm native. Collector commands fall back to follow-lane (0)."
+            )
+            return
+
         ensure_navigation_agent_imports()
 
         nav_type = self.config.nav_agent_type.lower()
@@ -1022,20 +1032,114 @@ class AutopilotAgent(BaseAgent):
                 if BasicAgent is None:
                     raise RuntimeError("BasicAgent missing")
                 self._nav_agent = BasicAgent(vehicle, target_speed=max(10.0, self.config.target_speed_kmh))
+            self._configure_nav_agent_traffic_lights()
         except Exception:
             self._nav_agent = None
             self._tm_fallback_mode = True
-            try:
-                vehicle.set_autopilot(True, self.config.tm_port)
-            except TypeError:
-                vehicle.set_autopilot(True)
+            self._enable_tm_native_autopilot(vehicle)
             logging.info(
                 "Using TM autopilot fallback. Shared intersection-only CIL commands require planner access, so collector commands stay at follow-lane (0)."
             )
             return
 
+        self._tm_fallback_mode = False
         self._set_new_destination(vehicle)
         logging.info("Navigation agent initialized: %s", self.config.nav_agent_type)
+
+    def _enable_tm_native_autopilot(self, vehicle) -> None:
+        try:
+            vehicle.set_autopilot(True, self.config.tm_port)
+        except TypeError:
+            vehicle.set_autopilot(True)
+
+        self._configure_tm_traffic_lights(vehicle)
+
+        tm = getattr(self.session, "traffic_manager", None) if self.session is not None else None
+        if tm is None:
+            logging.warning("TrafficManager unavailable; native TM autopilot speed tuning skipped.")
+            return
+
+        try:
+            tm.auto_lane_change(vehicle, False)
+        except Exception:
+            pass
+
+        try:
+            tm.distance_to_leading_vehicle(vehicle, 3.0)
+        except Exception:
+            pass
+
+        try:
+            speed_limit_kmh = float(vehicle.get_speed_limit())
+        except Exception:
+            speed_limit_kmh = 0.0
+
+        target_speed_kmh = max(1.0, float(self.config.target_speed_kmh))
+        if speed_limit_kmh > 1.0:
+            speed_delta_pct = 100.0 * (1.0 - (target_speed_kmh / speed_limit_kmh))
+            speed_delta_pct = clamp(speed_delta_pct, -75.0, 95.0)
+            try:
+                tm.vehicle_percentage_speed_difference(vehicle, float(speed_delta_pct))
+                logging.info(
+                    "Configured TM native autopilot target speed %.1f km/h against limit %.1f km/h (speed_delta_pct=%.1f).",
+                    target_speed_kmh,
+                    speed_limit_kmh,
+                    float(speed_delta_pct),
+                )
+            except Exception as exc:
+                logging.warning("Failed to tune TM native autopilot speed: %s", exc)
+        else:
+            logging.info("TM native autopilot enabled without speed-limit tuning (unknown speed limit).")
+
+    def _configure_nav_agent_traffic_lights(self) -> None:
+        if not self.config.collect_data:
+            return
+        if self._nav_agent is None:
+            return
+
+        configured = False
+        ignore_fn = getattr(self._nav_agent, "ignore_traffic_lights", None)
+        if callable(ignore_fn):
+            try:
+                ignore_fn(True)
+                configured = True
+            except TypeError:
+                try:
+                    ignore_fn()
+                    configured = True
+                except Exception:
+                    configured = False
+            except Exception:
+                configured = False
+
+        if not configured and hasattr(self._nav_agent, "_ignore_traffic_lights"):
+            try:
+                setattr(self._nav_agent, "_ignore_traffic_lights", True)
+                configured = True
+            except Exception:
+                configured = False
+
+        if configured:
+            logging.info("Autopilot planner configured to ignore traffic lights during data collection.")
+        else:
+            logging.warning("Could not disable planner traffic-light handling for autopilot data collection.")
+
+    def _configure_tm_traffic_lights(self, vehicle) -> None:
+        if not self.config.collect_data:
+            return
+        if self.session is None:
+            return
+
+        tm = getattr(self.session, "traffic_manager", None)
+        if tm is None:
+            logging.warning("TrafficManager unavailable; cannot disable red-light stops for autopilot.")
+            return
+
+        try:
+            tm.ignore_lights_percentage(vehicle, 100.0)
+            logging.info("Autopilot TM configured to ignore all traffic lights (100%%) during data collection.")
+        except Exception as exc:
+            logging.warning("Failed to disable TM traffic-light stops for autopilot: %s", exc)
 
     def _set_new_destination(self, vehicle) -> None:
         if not self._spawn_points or self._nav_agent is None:
@@ -1047,7 +1151,13 @@ class AutopilotAgent(BaseAgent):
 
         route_plan: list[Dict[str, Any]] = []
         route_command_counts = {command: 0 for command in BALANCED_ROUTE_COMMANDS}
-        if self.config.destination_point >= 0 and not self._fixed_destination_consumed:
+        if self.config.collect_data:
+            dest_idx, destination, route_plan, route_command_counts = self._choose_balanced_destination(
+                current_loc=current_loc,
+                current_idx=current_idx,
+                world_map=world_map,
+            )
+        elif self.config.destination_point >= 0 and not self._fixed_destination_consumed:
             dest_idx = self.config.destination_point % len(self._spawn_points)
             destination = self._spawn_points[dest_idx].location
             if world_map is not None and current_loc is not None:
@@ -1057,12 +1167,6 @@ class AutopilotAgent(BaseAgent):
                     destination_location=destination,
                 )
                 route_command_counts = summarize_reference_route_commands(route_plan)
-        elif self.config.collect_data:
-            dest_idx, destination, route_plan, route_command_counts = self._choose_balanced_destination(
-                current_loc=current_loc,
-                current_idx=current_idx,
-                world_map=world_map,
-            )
         else:
             candidate_indices = [
                 idx for idx in range(len(self._spawn_points))
@@ -1084,16 +1188,31 @@ class AutopilotAgent(BaseAgent):
             route_plan = list(self._reference_route_plan)
             route_command_counts = summarize_reference_route_commands(route_plan)
         self._accumulate_route_balance(route_command_counts)
-        logging.info(
-            "Autopilot destination set: spawn=%d cmd_mix(L/R/S)=%d/%d/%d hist=%d/%d/%d",
-            int(dest_idx),
-            int(route_command_counts.get(1, 0)),
-            int(route_command_counts.get(2, 0)),
-            int(route_command_counts.get(3, 0)),
-            int(self._route_balance_command_counts.get(1, 0)),
-            int(self._route_balance_command_counts.get(2, 0)),
-            int(self._route_balance_command_counts.get(3, 0)),
-        )
+        if self.config.collect_data:
+            logging.info(
+                (
+                    "Autopilot collect-data roaming destination set: spawn=%d "
+                    "cmd_mix(L/R/S)=%d/%d/%d hist=%d/%d/%d"
+                ),
+                int(dest_idx),
+                int(route_command_counts.get(1, 0)),
+                int(route_command_counts.get(2, 0)),
+                int(route_command_counts.get(3, 0)),
+                int(self._route_balance_command_counts.get(1, 0)),
+                int(self._route_balance_command_counts.get(2, 0)),
+                int(self._route_balance_command_counts.get(3, 0)),
+            )
+        else:
+            logging.info(
+                "Autopilot destination set: spawn=%d cmd_mix(L/R/S)=%d/%d/%d hist=%d/%d/%d",
+                int(dest_idx),
+                int(route_command_counts.get(1, 0)),
+                int(route_command_counts.get(2, 0)),
+                int(route_command_counts.get(3, 0)),
+                int(self._route_balance_command_counts.get(1, 0)),
+                int(self._route_balance_command_counts.get(2, 0)),
+                int(self._route_balance_command_counts.get(3, 0)),
+            )
         self._command_oracle.reset()
 
     def _nearest_spawn_index(self, location) -> Optional[int]:
@@ -1243,6 +1362,8 @@ class AutopilotAgent(BaseAgent):
         return int(len(self._reference_route_plan))
 
     def _extract_current_command(self, speed_kmh: float = 0.0) -> int:
+        if self._tm_fallback_mode:
+            return 0
         command, _ = self._command_oracle.update(speed_kmh=speed_kmh)
         return int(command)
 
@@ -1379,12 +1500,6 @@ class AutopilotAgent(BaseAgent):
                 self._cache_reference_route_plan()
             try:
                 if self._nav_agent.done():
-                    if self.config.destination_point >= 0 and self.config.collect_data and not self._fixed_destination_consumed:
-                        self._fixed_destination_consumed = True
-                        logging.info(
-                            "Autopilot reached configured destination spawn=%s; switching to balanced roaming destinations.",
-                            self._route_destination_index,
-                        )
                     self._set_new_destination(vehicle)
             except Exception:
                 pass
@@ -5439,6 +5554,12 @@ def parse_args() -> argparse.Namespace:
         help="Navigation agent used by autopilot mode for route command extraction.",
     )
     parser.add_argument(
+        "--autopilot-backend",
+        choices=["planner", "tm"],
+        default=None,
+        help="Autopilot control backend for agent=autopilot. 'planner' uses BasicAgent/BehaviorAgent, 'tm' uses CARLA Traffic Manager autopilot.",
+    )
+    parser.add_argument(
         "--yolo-disable-autopilot-red-light",
         dest="yolo_disable_autopilot_red_light",
         action="store_true",
@@ -5592,6 +5713,22 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     spawn_point_cfg = int(pick(args.spawn_point, "vehicle", "spawn_point", -1))
     destination_point_cfg = int(pick(args.destination_point, "vehicle", "destination_point", -1))
 
+    if collect_data and args.agent == "autopilot":
+        if destination_point_cfg >= 0:
+            logging.info(
+                "Collect-data autopilot ignores configured destination_point=%d and uses roaming destinations instead.",
+                destination_point_cfg,
+            )
+        destination_point_cfg = -1
+        npc_vehicle_count = 0
+        npc_bike_count = 0
+        npc_motorbike_count = 0
+        npc_pedestrian_count = 0
+        npc_enable_autopilot = False
+        logging.info(
+            "Collect-data autopilot forcing zero traffic_spawn counts (vehicles=0 bikes=0 motorbikes=0 pedestrians=0)."
+        )
+
     if args.agent == "cil" and spawn_point_cfg < 0:
         logging.warning(
             "CIL route map requires deterministic S point. vehicle.spawn_point < 0, forcing spawn_point=0."
@@ -5632,6 +5769,10 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     if nav_agent_type not in {"basic", "behavior"}:
         logging.warning("Unsupported nav_agent_type=%s. Falling back to 'basic'.", nav_agent_type)
         nav_agent_type = "basic"
+    autopilot_backend = str(pick(args.autopilot_backend, "autopilot", "backend", "planner")).lower()
+    if autopilot_backend not in {"planner", "tm"}:
+        logging.warning("Unsupported autopilot_backend=%s. Falling back to 'planner'.", autopilot_backend)
+        autopilot_backend = "planner"
 
     yolo_disable_autopilot_red_light = _to_bool(
         args.yolo_disable_autopilot_red_light,
@@ -5735,6 +5876,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         recovery_interval_frames=recovery_interval_frames,
         recovery_duration_frames=recovery_duration_frames,
         recovery_steer_offset=recovery_steer_offset,
+        autopilot_backend=autopilot_backend,
         nav_agent_type=nav_agent_type,
         yolo_disable_autopilot_red_light=bool(yolo_disable_autopilot_red_light),
         cil_command_prep_time_s=cil_command_prep_time_s,
