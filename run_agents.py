@@ -5193,7 +5193,7 @@ class YoloDetectAgent(BaseAgent):
         brake_level = float(clamp(display_brake, 0.0, 1.0))
         if self._traffic_supervisor is not None:
             supervisor_state_upper = str(sup_debug.get("state", "cruising")).upper()
-            status_text = f"SUPERVISOR {supervisor_state_upper} | BRK={brake_level:.2f}"
+            status_text = f"SUPERVISOR {supervisor_state_upper} {brake_level:.2f}"
             if supervisor_reason not in ("n/a", "none", ""):
                 status_text = f"{status_text} ({supervisor_reason})"
             # Color encodes actual brake intensity: green (0.0) -> red (1.0)
@@ -5203,10 +5203,10 @@ class YoloDetectAgent(BaseAgent):
                 int(round(255.0 * brake_level)),
             )
         elif is_emergency:
-            status_text = f"EMERGENCY BRAKE | BRK={brake_level:.2f}"
+            status_text = f"EMERGENCY BRAKE {brake_level:.2f}"
             status_color = (0, 0, 255)
         else:
-            status_text = f"NORMAL | BRK={brake_level:.2f}"
+            status_text = f"NORMAL {brake_level:.2f}"
             status_color = (0, 255, 0)
 
         cv2.putText(
