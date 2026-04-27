@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import random
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, List, Optional, TYPE_CHECKING
 
@@ -91,11 +92,13 @@ class CarlaManager:
         self.world: Optional[CarlaWorld] = None
         self.tm: Optional[CarlaTrafficManager] = None
         self.ego_vehicle: Optional[CarlaVehicle] = None
+        self.collision_sensor: Optional[CarlaActor] = None
         self._original_settings: Optional[CarlaWorldSettings] = None
         self._spawn_transform: Optional[CarlaTransform] = None
         self._npc_actors: List[CarlaActor] = []
         self._walker_actors: List[CarlaActor] = []
         self._walker_controllers: List[CarlaActor] = []
+        self._collision_frames: deque[int] = deque(maxlen=256)
 
     def _retry_rpc_call(
         self,
@@ -166,6 +169,7 @@ class CarlaManager:
         self._apply_world_settings()
         self._destroy_existing_actors()
         self._spawn_ego_vehicle()
+        self._attach_collision_sensor()
         self._spawn_requested_traffic()
         self._spawn_pedestrians()
         self._log_static_traffic_actors()
@@ -185,6 +189,13 @@ class CarlaManager:
         """Destroy all leftover vehicles, walkers, and controllers from previous sessions."""
         assert self.world is not None
         actors = self.world.get_actors()
+
+        collision_sensors = list(actors.filter("sensor.other.collision*"))
+        for sensor in collision_sensors:
+            try:
+                sensor.destroy()
+            except RuntimeError:
+                pass
 
         # Destroy walker controllers first
         controllers = list(actors.filter("controller.ai.walker"))
@@ -211,11 +222,11 @@ class CarlaManager:
             except RuntimeError:
                 pass
 
-        total = len(controllers) + len(walkers) + len(vehicles)
+        total = len(collision_sensors) + len(controllers) + len(walkers) + len(vehicles)
         if total > 0:
             logging.info(
-                "Cleaned %d leftover actors (vehicles=%d, walkers=%d, controllers=%d).",
-                total, len(vehicles), len(walkers), len(controllers),
+                "Cleaned %d leftover actors (collision_sensors=%d, vehicles=%d, walkers=%d, controllers=%d).",
+                total, len(collision_sensors), len(vehicles), len(walkers), len(controllers),
             )
 
     def _spawn_ego_vehicle(self) -> None:
@@ -256,6 +267,35 @@ class CarlaManager:
             "Spawned %s at (%.1f, %.1f, %.1f) yaw=%.1f",
             self.ego_vehicle.type_id, loc.x, loc.y, loc.z, rot.yaw,
         )
+
+    def _attach_collision_sensor(self) -> None:
+        assert self.world is not None
+        assert self.ego_vehicle is not None
+        assert carla is not None
+
+        self._collision_frames.clear()
+        collision_bp = self.world.get_blueprint_library().find("sensor.other.collision")
+        self.collision_sensor = self.world.spawn_actor(
+            collision_bp,
+            carla.Transform(),
+            attach_to=self.ego_vehicle,
+        )
+        self.collision_sensor.listen(self._on_collision_event)
+        logging.info("Attached collision sensor to ego vehicle.")
+
+    def _on_collision_event(self, event: Any) -> None:
+        try:
+            frame_id = int(event.frame)
+        except Exception:
+            return
+        self._collision_frames.append(frame_id)
+
+    def had_collision_at(self, frame_id: int) -> bool:
+        frame_id = int(frame_id)
+        keep_after = frame_id - 200
+        while self._collision_frames and self._collision_frames[0] < keep_after:
+            self._collision_frames.popleft()
+        return frame_id in self._collision_frames
 
     @staticmethod
     def _wheel_count(bp: CarlaActorBlueprint) -> int:
@@ -503,6 +543,14 @@ class CarlaManager:
             self.apply_spawn_locked_spectator()
 
     def cleanup(self) -> None:
+        if self.collision_sensor is not None:
+            try:
+                self.collision_sensor.destroy()
+            except RuntimeError:
+                pass
+            self.collision_sensor = None
+            self._collision_frames.clear()
+
         # Stop and destroy walker controllers first
         for controller in self._walker_controllers:
             try:

@@ -472,6 +472,56 @@ def set_navigation_destination(nav_agent: Any, current_location: Any, destinatio
     setter(destination_location)
 
 
+BALANCED_ROUTE_COMMANDS: tuple[int, int, int] = (1, 2, 3)
+BALANCED_ROUTE_CANDIDATE_LIMIT = 12
+BALANCED_ROUTE_MIN_DISTANCE_M = 80.0
+
+
+def summarize_reference_route_commands(route_plan: Any) -> Dict[int, int]:
+    counts = {command: 0 for command in BALANCED_ROUTE_COMMANDS}
+    if not route_plan:
+        return counts
+
+    for item in route_plan:
+        if not isinstance(item, dict):
+            continue
+        command = int(item.get("command", 0))
+        if command in counts:
+            counts[command] += 1
+    return counts
+
+
+def score_reference_route_balance(
+    route_command_counts: Dict[int, int],
+    historical_command_counts: Dict[int, int],
+    distance_m: float,
+) -> float:
+    max_history = max((int(historical_command_counts.get(cmd, 0)) for cmd in BALANCED_ROUTE_COMMANDS), default=0)
+    denom = max(1.0, float(max_history))
+
+    score = 0.0
+    present_types = 0
+    total_turn_events = 0
+    for command in BALANCED_ROUTE_COMMANDS:
+        count = max(0, int(route_command_counts.get(command, 0)))
+        if count <= 0:
+            continue
+        present_types += 1
+        total_turn_events += count
+        balance_weight = 1.0 + 2.0 * (float(max_history) - float(historical_command_counts.get(command, 0))) / denom
+        score += balance_weight * (1.25 + 0.75 * min(count, 2))
+
+    if total_turn_events <= 0:
+        score -= 1.25
+    else:
+        score += 0.35 * min(total_turn_events, 4)
+        score += 0.30 * present_types
+
+    score += 0.08 * math.log1p(max(0.0, float(distance_m)))
+    score += random.random() * 0.05
+    return float(score)
+
+
 def apply_random_weather(world) -> str:
     # 40% clear day, 20% sunset, 20% night, 20% rain.
     roll = random.random()
@@ -715,6 +765,10 @@ class BaseSession:
     def world(self):
         return None
 
+    def had_collision_at(self, frame_id: int) -> bool:
+        _ = frame_id
+        return False
+
 
 class TickFpsProfiler:
     """Aggregate runtime FPS and per-stage timing to locate bottlenecks."""
@@ -799,6 +853,11 @@ class CarlaSession(BaseSession):
             return None
         return self._manager.tm
 
+    def had_collision_at(self, frame_id: int) -> bool:
+        if self._manager is None:
+            return False
+        return bool(self._manager.had_collision_at(frame_id))
+
     def start(self) -> None:
         assert carla is not None
         self._manager = CarlaManager(
@@ -873,6 +932,19 @@ class BaseAgent:
     def should_stop(self) -> bool:
         return False
 
+    def _resolve_frame_context(self, step_idx: int) -> tuple[int, float]:
+        world = self.session.world if self.session is not None else None
+        if world is None:
+            return int(step_idx), float(step_idx) * float(self.config.fixed_delta)
+
+        snapshot = world.get_snapshot()
+        return int(snapshot.frame), float(snapshot.timestamp.elapsed_seconds)
+
+    def _had_collision_at(self, frame_id: int) -> bool:
+        if self.session is None:
+            return False
+        return bool(self.session.had_collision_at(frame_id))
+
 
 class AutopilotAgent(BaseAgent):
     name = "autopilot"
@@ -893,7 +965,12 @@ class AutopilotAgent(BaseAgent):
         self._nav_agent = None
         self._spawn_points = []
         self._reference_route_plan: list[Dict[str, Any]] = []
+        self._route_destination_index: Optional[int] = None
         self._route_destination_location = None
+        self._fixed_destination_consumed = False
+        self._route_balance_command_counts: Dict[int, int] = {
+            command: 0 for command in BALANCED_ROUTE_COMMANDS
+        }
         self._recovery_start_frame = -1
         self._recovery_direction = 1.0
         self._tm_fallback_mode = False
@@ -910,6 +987,12 @@ class AutopilotAgent(BaseAgent):
 
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
+        self._route_destination_index = None
+        self._route_destination_location = None
+        self._fixed_destination_consumed = False
+        self._route_balance_command_counts = {
+            command: 0 for command in BALANCED_ROUTE_COMMANDS
+        }
         vehicle = session.ego_vehicle
         if vehicle is None or session.world is None:
             logging.info("No ego vehicle in this session; autopilot setup skipped.")
@@ -957,15 +1040,149 @@ class AutopilotAgent(BaseAgent):
     def _set_new_destination(self, vehicle) -> None:
         if not self._spawn_points or self._nav_agent is None:
             return
-        if self.config.destination_point >= 0:
-            destination = self._spawn_points[self.config.destination_point % len(self._spawn_points)].location
-        else:
-            destination = random.choice(self._spawn_points).location
         current_loc = vehicle.get_location()
+        world = self.session.world if self.session is not None else None
+        world_map = world.get_map() if world is not None else None
+        current_idx = self._nearest_spawn_index(current_loc)
+
+        route_plan: list[Dict[str, Any]] = []
+        route_command_counts = {command: 0 for command in BALANCED_ROUTE_COMMANDS}
+        if self.config.destination_point >= 0 and not self._fixed_destination_consumed:
+            dest_idx = self.config.destination_point % len(self._spawn_points)
+            destination = self._spawn_points[dest_idx].location
+            if world_map is not None and current_loc is not None:
+                route_plan = build_global_reference_route(
+                    world_map=world_map,
+                    start_location=current_loc,
+                    destination_location=destination,
+                )
+                route_command_counts = summarize_reference_route_commands(route_plan)
+        elif self.config.collect_data:
+            dest_idx, destination, route_plan, route_command_counts = self._choose_balanced_destination(
+                current_loc=current_loc,
+                current_idx=current_idx,
+                world_map=world_map,
+            )
+        else:
+            candidate_indices = [
+                idx for idx in range(len(self._spawn_points))
+                if current_idx is None or idx != current_idx
+            ]
+            if not candidate_indices:
+                candidate_indices = list(range(len(self._spawn_points)))
+            dest_idx = int(random.choice(candidate_indices))
+            destination = self._spawn_points[dest_idx].location
+
+        current_loc = vehicle.get_location()
+        self._route_destination_index = int(dest_idx)
         self._route_destination_location = destination
         set_navigation_destination(self._nav_agent, current_loc, destination)
-        self._cache_reference_route_plan(force=True)
+        if route_plan:
+            self._reference_route_plan = list(route_plan)
+        else:
+            self._cache_reference_route_plan(force=True)
+            route_plan = list(self._reference_route_plan)
+            route_command_counts = summarize_reference_route_commands(route_plan)
+        self._accumulate_route_balance(route_command_counts)
+        logging.info(
+            "Autopilot destination set: spawn=%d cmd_mix(L/R/S)=%d/%d/%d hist=%d/%d/%d",
+            int(dest_idx),
+            int(route_command_counts.get(1, 0)),
+            int(route_command_counts.get(2, 0)),
+            int(route_command_counts.get(3, 0)),
+            int(self._route_balance_command_counts.get(1, 0)),
+            int(self._route_balance_command_counts.get(2, 0)),
+            int(self._route_balance_command_counts.get(3, 0)),
+        )
         self._command_oracle.reset()
+
+    def _nearest_spawn_index(self, location) -> Optional[int]:
+        if location is None or not self._spawn_points:
+            return None
+        best_idx = None
+        best_dist = float("inf")
+        for idx, transform in enumerate(self._spawn_points):
+            dist = location.distance(transform.location)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        return best_idx
+
+    def _choose_balanced_destination(self, current_loc, current_idx: Optional[int], world_map: Any):
+        if not self._spawn_points:
+            raise RuntimeError("No spawn points available for autopilot destination selection.")
+
+        candidate_indices: list[int] = []
+        min_distance_m = float(BALANCED_ROUTE_MIN_DISTANCE_M)
+        for idx, transform in enumerate(self._spawn_points):
+            if current_idx is not None and idx == current_idx:
+                continue
+            if self._route_destination_index is not None and idx == self._route_destination_index:
+                continue
+            if current_loc is not None and current_loc.distance(transform.location) < min_distance_m:
+                continue
+            candidate_indices.append(idx)
+
+        if not candidate_indices:
+            for idx, _transform in enumerate(self._spawn_points):
+                if current_idx is not None and idx == current_idx:
+                    continue
+                if self._route_destination_index is not None and idx == self._route_destination_index:
+                    continue
+                candidate_indices.append(idx)
+
+        if not candidate_indices:
+            fallback_idx = int((current_idx or 0) % len(self._spawn_points))
+            fallback_destination = self._spawn_points[fallback_idx].location
+            return fallback_idx, fallback_destination, [], {command: 0 for command in BALANCED_ROUTE_COMMANDS}
+
+        sample_count = min(len(candidate_indices), BALANCED_ROUTE_CANDIDATE_LIMIT)
+        if sample_count < len(candidate_indices):
+            candidate_indices = random.sample(candidate_indices, sample_count)
+
+        best_idx = int(candidate_indices[0])
+        best_destination = self._spawn_points[best_idx].location
+        best_route_plan: list[Dict[str, Any]] = []
+        best_route_command_counts = {command: 0 for command in BALANCED_ROUTE_COMMANDS}
+        best_score = float("-inf")
+
+        for idx in candidate_indices:
+            destination = self._spawn_points[idx].location
+            route_plan = []
+            if world_map is not None and current_loc is not None:
+                route_plan = build_global_reference_route(
+                    world_map=world_map,
+                    start_location=current_loc,
+                    destination_location=destination,
+                )
+            route_command_counts = summarize_reference_route_commands(route_plan)
+            distance_m = (
+                float(current_loc.distance(destination))
+                if current_loc is not None and destination is not None
+                else 0.0
+            )
+            score = score_reference_route_balance(
+                route_command_counts=route_command_counts,
+                historical_command_counts=self._route_balance_command_counts,
+                distance_m=distance_m,
+            )
+            if route_plan:
+                score += 0.15
+            if score > best_score:
+                best_idx = int(idx)
+                best_destination = destination
+                best_route_plan = list(route_plan)
+                best_route_command_counts = dict(route_command_counts)
+                best_score = float(score)
+
+        return best_idx, best_destination, best_route_plan, best_route_command_counts
+
+    def _accumulate_route_balance(self, route_command_counts: Dict[int, int]) -> None:
+        for command in BALANCED_ROUTE_COMMANDS:
+            count = max(0, int(route_command_counts.get(command, 0)))
+            self._route_balance_command_counts[command] = (
+                int(self._route_balance_command_counts.get(command, 0)) + min(count, 2)
+            )
 
     def _vehicle_location(self):
         if self.session is None or self.session.ego_vehicle is None:
@@ -1116,8 +1333,8 @@ class AutopilotAgent(BaseAgent):
 
         camera_setups = [
             ("center", carla.Transform(carla.Location(x=1.5, y=0.0, z=2.2), carla.Rotation(pitch=-8.0))),
-            ("left", carla.Transform(carla.Location(x=1.5, y=-0.35, z=2.2), carla.Rotation(yaw=-25.0, pitch=-8.0))),
-            ("right", carla.Transform(carla.Location(x=1.5, y=0.35, z=2.2), carla.Rotation(yaw=25.0, pitch=-8.0))),
+            ("left", carla.Transform(carla.Location(x=1.5, y=-0.35, z=2.2), carla.Rotation(pitch=-8.0))),
+            ("right", carla.Transform(carla.Location(x=1.5, y=0.35, z=2.2), carla.Rotation(pitch=-8.0))),
         ]
         for side, transform in camera_setups:
             sensor = world.spawn_actor(camera_bp, transform, attach_to=vehicle)
@@ -1145,6 +1362,7 @@ class AutopilotAgent(BaseAgent):
         frame = self._read_latest_video_frame()
         vehicle = self.session.ego_vehicle if self.session is not None else None
         world = self.session.world if self.session is not None else None
+        recovery_delta = 0.0
         if frame is not None:
             if self._video_writer is not None:
                 bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -1161,6 +1379,12 @@ class AutopilotAgent(BaseAgent):
                 self._cache_reference_route_plan()
             try:
                 if self._nav_agent.done():
+                    if self.config.destination_point >= 0 and self.config.collect_data and not self._fixed_destination_consumed:
+                        self._fixed_destination_consumed = True
+                        logging.info(
+                            "Autopilot reached configured destination spawn=%s; switching to balanced roaming destinations.",
+                            self._route_destination_index,
+                        )
                     self._set_new_destination(vehicle)
             except Exception:
                 pass
@@ -1186,17 +1410,23 @@ class AutopilotAgent(BaseAgent):
             velocity = vehicle.get_velocity()
             speed_kmh = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2) * 3.6
             control = vehicle.get_control()
-            rotation = vehicle.get_transform().rotation
-            frame_id = step_idx
-            if world is not None:
-                frame_id = int(world.get_snapshot().frame)
+            transform = vehicle.get_transform()
+            location = transform.location
+            rotation = transform.rotation
+            frame_id, timestamp = self._resolve_frame_context(step_idx)
             command = self._extract_current_command(speed_kmh=speed_kmh)
             self._collector.add_vehicle_state(
                 frame_id=frame_id,
+                timestamp=timestamp,
                 steer=control.steer,
                 throttle=control.throttle,
                 brake=control.brake,
                 speed_kmh=speed_kmh,
+                x=location.x,
+                y=location.y,
+                z=location.z,
+                has_crash=self._had_collision_at(frame_id),
+                is_recovering=abs(recovery_delta) > 1e-6,
                 command=command,
                 pitch=rotation.pitch,
                 roll=rotation.roll,
@@ -1220,7 +1450,12 @@ class AutopilotAgent(BaseAgent):
         self._command_oracle.reset()
         self._nav_agent = None
         self._reference_route_plan = []
+        self._route_destination_index = None
         self._route_destination_location = None
+        self._fixed_destination_consumed = False
+        self._route_balance_command_counts = {
+            command: 0 for command in BALANCED_ROUTE_COMMANDS
+        }
         if self._collector is not None:
             self._collector.close()
             self._collector = None
@@ -1334,8 +1569,8 @@ class LaneFollowAgent(BaseAgent):
 
         camera_setups = [
             ("center", carla.Transform(carla.Location(x=1.5, y=0.0, z=2.2), carla.Rotation(pitch=-8.0))),
-            ("left", carla.Transform(carla.Location(x=1.5, y=-0.35, z=2.2), carla.Rotation(yaw=-25.0, pitch=-8.0))),
-            ("right", carla.Transform(carla.Location(x=1.5, y=0.35, z=2.2), carla.Rotation(yaw=25.0, pitch=-8.0))),
+            ("left", carla.Transform(carla.Location(x=1.5, y=-0.35, z=2.2), carla.Rotation(pitch=-8.0))),
+            ("right", carla.Transform(carla.Location(x=1.5, y=0.35, z=2.2), carla.Rotation(pitch=-8.0))),
         ]
         for side, transform in camera_setups:
             sensor = world.spawn_actor(camera_bp, transform, attach_to=vehicle)
@@ -1768,19 +2003,25 @@ class LaneFollowAgent(BaseAgent):
             reverse=False,
         )
         self.session.ego_vehicle.apply_control(control)
-        rotation = self.session.ego_vehicle.get_transform().rotation
+        transform = self.session.ego_vehicle.get_transform()
+        location = transform.location
+        rotation = transform.rotation
         yaw_deg = float(rotation.yaw)
 
         if self._collector is not None:
-            frame_id = step_idx
-            if self.session.world is not None:
-                frame_id = int(self.session.world.get_snapshot().frame)
+            frame_id, timestamp = self._resolve_frame_context(step_idx)
             self._collector.add_vehicle_state(
                 frame_id=frame_id,
+                timestamp=timestamp,
                 steer=control.steer,
                 throttle=control.throttle,
                 brake=control.brake,
                 speed_kmh=speed_kmh,
+                x=location.x,
+                y=location.y,
+                z=location.z,
+                has_crash=self._had_collision_at(frame_id),
+                is_recovering=False,
                 command=0,
                 pitch=rotation.pitch,
                 roll=rotation.roll,
@@ -3130,8 +3371,8 @@ class CILAgent(BaseAgent):
 
         camera_setups = [
             ("center", carla.Transform(carla.Location(x=1.5, y=0.0, z=2.2), carla.Rotation(pitch=-8.0))),
-            ("left", carla.Transform(carla.Location(x=1.5, y=-0.35, z=2.2), carla.Rotation(yaw=-25.0, pitch=-8.0))),
-            ("right", carla.Transform(carla.Location(x=1.5, y=0.35, z=2.2), carla.Rotation(yaw=25.0, pitch=-8.0))),
+            ("left", carla.Transform(carla.Location(x=1.5, y=-0.35, z=2.2), carla.Rotation(pitch=-8.0))),
+            ("right", carla.Transform(carla.Location(x=1.5, y=0.35, z=2.2), carla.Rotation(pitch=-8.0))),
         ]
         for side, transform in camera_setups:
             sensor = world.spawn_actor(camera_bp, transform, attach_to=vehicle)
@@ -3817,15 +4058,19 @@ class CILAgent(BaseAgent):
             self._request_stop_at_destination("distance_threshold", destination_distance_m)
 
         if self._collector is not None:
-            frame_id = step_idx
-            if self.session.world is not None:
-                frame_id = int(self.session.world.get_snapshot().frame)
+            frame_id, timestamp = self._resolve_frame_context(step_idx)
             self._collector.add_vehicle_state(
                 frame_id=frame_id,
+                timestamp=timestamp,
                 steer=control.steer,
                 throttle=control.throttle,
                 brake=control.brake,
                 speed_kmh=speed_kmh,
+                x=vehicle_location.x,
+                y=vehicle_location.y,
+                z=vehicle_location.z,
+                has_crash=self._had_collision_at(frame_id),
+                is_recovering=False,
                 command=command,
                 pitch=rotation.pitch,
                 roll=rotation.roll,
