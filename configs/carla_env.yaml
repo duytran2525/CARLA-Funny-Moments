@@ -7,13 +7,13 @@
   fixed_delta: 0.03
   no_rendering: false
 
-  map: "Town03"
+  map: "Town05"
 
 
 
 vehicle:
   filter: "vehicle.tesla.model3"
-  spawn_point: 3
+  spawn_point: 1
   destination_point: 15
   role_name: "hero"
 
@@ -34,8 +34,8 @@ weather:
   preset: "ClearNoon"
 
 cil:
-  target_speed_kmh: 35.0
-  max_throttle: 0.45
+  target_speed_kmh: 50
+  max_throttle: 0.75
   max_brake: 0.80
   steer_smoothing: 0.85
   nav_agent_type: "basic"
@@ -50,10 +50,10 @@ yolo:
   disable_autopilot_red_light: true
 
 traffic_spawn:
-  vehicle_count: 5
-  bike_count: 5
-  motorbike_count: 5
-  pedestrian_count: 5
+  vehicle_count: 0
+  bike_count: 0
+  motorbike_count: 0
+  pedestrian_count: 0
   npc_enable_autopilot: true
 
 recording:
@@ -67,8 +67,8 @@ runtime:
   ticks: 0
   tick_interval: 0.03
   fps_log_interval_ticks: 30
-  cil_enable_hud: false
+  cil_enable_hud: true
   cil_enable_route_map: false
-  cil_enable_telemetry_csv: false
+  cil_enable_telemetry_csv: true
   cil_profile_tick_timing: true
   cil_profile_log_interval_ticks: 60
