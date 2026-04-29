@@ -31,6 +31,9 @@ FUTURE_OFFSETS_S: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 2.5)
 HISTORY_NEAREST_TOLERANCE_S = 0.05
 EPSILON_S = 1e-6
 TURN_DENSE_STRIDE_DIVISOR = 5
+TRAJECTORY_COMMAND_MIN_LATERAL_M = 3.0
+TRAJECTORY_COMMAND_MIN_HEADING_DEG = 18.0
+TRAJECTORY_COMMAND_MIN_PEAK_LATERAL_M = 2.0
 
 
 def _build_csv_fieldnames() -> list[str]:
@@ -40,12 +43,17 @@ def _build_csv_fieldnames() -> list[str]:
         "img_id",
         "img_id_tm06",
         "img_id_tm03",
+        "image_filename",
+        "image_filename_tm06",
+        "image_filename_tm03",
         "frame_id_tm06",
         "frame_id_tm03",
         "timestamp_tm06",
         "timestamp_tm03",
         "speed",
         "command",
+        "route_command",
+        "command_source",
         "steering",
         "throttle",
         "brake",
@@ -55,6 +63,8 @@ def _build_csv_fieldnames() -> list[str]:
         "x",
         "y",
         "z",
+        "is_junction",
+        "junction_ahead",
         "has_crash",
         "recovery_flag",
     ]
@@ -78,6 +88,7 @@ class FrameRecord:
     x: float
     y: float
     z: float
+    is_junction: bool
     has_crash: bool
     is_recovering: bool
     images: Dict[str, Any]
@@ -259,6 +270,7 @@ class DataCollector:
         z: float,
         has_crash: bool,
         is_recovering: bool,
+        is_junction: bool = False,
         command: int = 0,
         pitch: float = 0.0,
         roll: float = 0.0,
@@ -283,6 +295,7 @@ class DataCollector:
             "x": float(x),
             "y": float(y),
             "z": float(z),
+            "is_junction": bool(is_junction),
             "has_crash": bool(has_crash),
             "is_recovering": bool(is_recovering),
         }
@@ -328,6 +341,7 @@ class DataCollector:
                 x=float(state["x"]),
                 y=float(state["y"]),
                 z=float(state["z"]),
+                is_junction=bool(state["is_junction"]),
                 has_crash=bool(state["has_crash"]),
                 is_recovering=bool(state["is_recovering"]),
                 images=dict(synchronized["images"]),
@@ -348,7 +362,7 @@ class DataCollector:
             self._target_frame_ids.append(record.frame_id)
 
     def _should_mark_target_frame(self, record: FrameRecord) -> bool:
-        if record.is_recovering or int(record.command) in (1, 2, 3):
+        if record.is_recovering or record.is_junction or int(record.command) in (1, 2, 3):
             return int(record.frame_id) % self.turn_save_every_n == 0
         return int(record.frame_id) % self.save_every_n == 0
 
@@ -386,7 +400,7 @@ class DataCollector:
 
         self._writer.writerow(sample_row)
         self._saved_samples += 1
-        command_value = int(target_frame.command)
+        command_value = int(sample_row.get("command", target_frame.command))
         if command_value not in self._saved_command_counts:
             self._saved_command_counts[command_value] = 0
         self._saved_command_counts[command_value] += 1
@@ -410,6 +424,7 @@ class DataCollector:
         xs = np.fromiter((record.x for record in records), dtype=np.float64)
         ys = np.fromiter((record.y for record in records), dtype=np.float64)
         crashes = np.fromiter((1 if record.has_crash else 0 for record in records), dtype=np.int8)
+        junctions = np.fromiter((1 if record.is_junction else 0 for record in records), dtype=np.int8)
 
         target_ts = float(target_frame.timestamp)
         history_start_ts = target_ts + HISTORY_LOOKUPS[0][1]
@@ -427,6 +442,8 @@ class DataCollector:
         crash_mask = (timestamps >= history_start_ts - EPSILON_S) & (timestamps <= future_end_ts + EPSILON_S)
         if bool(np.any(crashes[crash_mask] > 0)):
             return None, "crash_window"
+        future_mask = (timestamps >= target_ts - EPSILON_S) & (timestamps <= future_end_ts + EPSILON_S)
+        junction_ahead = bool(np.any(junctions[future_mask] > 0))
 
         future_waypoints = self._interpolate_future_waypoints(
             timestamps=timestamps,
@@ -437,6 +454,13 @@ class DataCollector:
         )
         if future_waypoints is None:
             return None, "geometry"
+
+        route_command = int(target_frame.command)
+        command, command_source = self._resolve_sample_command(
+            route_command=route_command,
+            future_waypoints=future_waypoints,
+            junction_ahead=junction_ahead,
+        )
 
         hist_tm06 = history_matches["tm06"]
         hist_tm03 = history_matches["tm03"]
@@ -450,12 +474,17 @@ class DataCollector:
             "img_id": img_id_t0,
             "img_id_tm06": img_id_tm06,
             "img_id_tm03": img_id_tm03,
+            "image_filename": f"{img_id_t0}.jpg",
+            "image_filename_tm06": f"{img_id_tm06}.jpg",
+            "image_filename_tm03": f"{img_id_tm03}.jpg",
             "frame_id_tm06": int(hist_tm06.frame_id),
             "frame_id_tm03": int(hist_tm03.frame_id),
             "timestamp_tm06": f"{hist_tm06.timestamp:.6f}",
             "timestamp_tm03": f"{hist_tm03.timestamp:.6f}",
             "speed": round(float(target_frame.speed), 3),
-            "command": int(target_frame.command),
+            "command": int(command),
+            "route_command": int(route_command),
+            "command_source": command_source,
             "steering": round(float(target_frame.steering), 5),
             "throttle": round(float(target_frame.throttle), 4),
             "brake": round(float(target_frame.brake), 4),
@@ -465,6 +494,8 @@ class DataCollector:
             "x": round(float(target_frame.x), 6),
             "y": round(float(target_frame.y), 6),
             "z": round(float(target_frame.z), 6),
+            "is_junction": int(bool(target_frame.is_junction)),
+            "junction_ahead": int(bool(junction_ahead)),
             "has_crash": int(bool(target_frame.has_crash)),
             "recovery_flag": int(bool(target_frame.is_recovering)),
         }
@@ -474,6 +505,42 @@ class DataCollector:
             row[f"wp_{index}_y"] = round(float(wp_y), 6)
 
         return row, None
+
+    @staticmethod
+    def _resolve_sample_command(
+        route_command: int,
+        future_waypoints: list[tuple[float, float]],
+        junction_ahead: bool,
+    ) -> tuple[int, str]:
+        if not junction_ahead:
+            return 0, "trajectory_lane_follow"
+
+        trajectory_command = DataCollector._infer_trajectory_command(future_waypoints)
+        if trajectory_command in (1, 2):
+            return int(trajectory_command), "trajectory_junction"
+        return 3, "trajectory_junction_straight"
+
+    @staticmethod
+    def _infer_trajectory_command(future_waypoints: list[tuple[float, float]]) -> int:
+        if not future_waypoints:
+            return 0
+
+        far_x, far_y = future_waypoints[-1]
+        far_x = max(float(far_x), EPSILON_S)
+        far_y = float(far_y)
+        heading_deg = math.degrees(math.atan2(far_y, far_x))
+
+        tail_waypoints = future_waypoints[max(0, len(future_waypoints) // 2) :]
+        peak_y = max((float(wp_y) for _wp_x, wp_y in tail_waypoints), key=abs, default=0.0)
+
+        if (
+            abs(far_y) < TRAJECTORY_COMMAND_MIN_LATERAL_M
+            or abs(heading_deg) < TRAJECTORY_COMMAND_MIN_HEADING_DEG
+            or abs(peak_y) < TRAJECTORY_COMMAND_MIN_PEAK_LATERAL_M
+        ):
+            return 0
+
+        return 2 if far_y > 0.0 else 1
 
     def _resolve_history_records(
         self,

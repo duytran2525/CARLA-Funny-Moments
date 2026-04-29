@@ -5,7 +5,7 @@ param(
     [string[]]$Towns = @("Town01", "Town02", "Town03"),
     [int]$TargetImagesPerCamera = 30000,
     [int]$ChunkTicks = 15000,
-    [int]$SaveEveryN = 3,
+    [int]$SaveEveryN = 15,
     [string]$AutopilotBackend = "tm",
     [Nullable[double]]$TargetSpeedKmh = $null,
     [Nullable[int]]$RecoveryIntervalFrames = 999999,

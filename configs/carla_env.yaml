@@ -50,10 +50,10 @@ yolo:
   disable_autopilot_red_light: true
 
 traffic_spawn:
-  vehicle_count: 0
-  bike_count: 0
-  motorbike_count: 0
-  pedestrian_count: 0
+  vehicle_count: 60
+  bike_count: 5
+  motorbike_count: 5
+  pedestrian_count: 5
   npc_enable_autopilot: true
 
 recording:

@@ -946,6 +946,16 @@ class BaseAgent:
             return False
         return bool(self.session.had_collision_at(frame_id))
 
+    def _is_vehicle_at_junction(self, vehicle: Any) -> bool:
+        world = self.session.world if self.session is not None else None
+        if world is None or vehicle is None:
+            return False
+        try:
+            waypoint = world.get_map().get_waypoint(vehicle.get_location(), project_to_road=True)
+        except Exception:
+            return False
+        return bool(getattr(waypoint, "is_junction", False))
+
 
 class AutopilotAgent(BaseAgent):
     name = "autopilot"
@@ -964,6 +974,7 @@ class AutopilotAgent(BaseAgent):
         self._data_cameras = []
         self._collector: Optional[DataCollector] = None
         self._nav_agent = None
+        self._command_nav_agent = None
         self._spawn_points = []
         self._reference_route_plan: list[Dict[str, Any]] = []
         self._route_destination_index: Optional[int] = None
@@ -1014,9 +1025,10 @@ class AutopilotAgent(BaseAgent):
         if self.config.autopilot_backend == "tm":
             self._nav_agent = None
             self._tm_fallback_mode = True
+            self._init_tm_command_planner(world, vehicle)
             self._enable_tm_native_autopilot(vehicle)
             logging.info(
-                "Autopilot backend initialized: tm native. Collector commands fall back to follow-lane (0)."
+                "Autopilot backend initialized: tm native control with shadow route planner for collector commands."
             )
             return
 
@@ -1036,15 +1048,39 @@ class AutopilotAgent(BaseAgent):
         except Exception:
             self._nav_agent = None
             self._tm_fallback_mode = True
+            self._init_tm_command_planner(world, vehicle)
             self._enable_tm_native_autopilot(vehicle)
             logging.info(
-                "Using TM autopilot fallback. Shared intersection-only CIL commands require planner access, so collector commands stay at follow-lane (0)."
+                "Using TM autopilot fallback with shadow route planner for collector commands. Reason: navigation agent unavailable."
             )
             return
 
         self._tm_fallback_mode = False
         self._set_new_destination(vehicle)
         logging.info("Navigation agent initialized: %s", self.config.nav_agent_type)
+
+    def _init_tm_command_planner(self, world, vehicle) -> None:
+        self._command_nav_agent = None
+        self._reference_route_plan = []
+        self._route_destination_index = None
+        self._route_destination_location = None
+
+        try:
+            ensure_navigation_agent_imports()
+            if BasicAgent is None:
+                raise RuntimeError("BasicAgent missing")
+            self._command_nav_agent = BasicAgent(vehicle, target_speed=max(10.0, self.config.target_speed_kmh))
+        except Exception as exc:
+            logging.warning("TM command shadow planner unavailable; collector command will remain 0. Reason: %s", exc)
+            return
+
+        try:
+            self._set_new_destination(vehicle)
+            logging.info("TM command shadow planner initialized for collector route labels.")
+        except Exception as exc:
+            self._command_nav_agent = None
+            self._reference_route_plan = []
+            logging.warning("Failed to initialize TM command route labels; collector command will remain 0. Reason: %s", exc)
 
     def _enable_tm_native_autopilot(self, vehicle) -> None:
         try:
@@ -1069,6 +1105,15 @@ class AutopilotAgent(BaseAgent):
         except Exception:
             pass
 
+        self._configure_tm_target_speed(vehicle, log=True)
+
+    def _configure_tm_target_speed(self, vehicle, log: bool = False) -> None:
+        tm = getattr(self.session, "traffic_manager", None) if self.session is not None else None
+        if tm is None:
+            if log:
+                logging.warning("TrafficManager unavailable; native TM autopilot speed tuning skipped.")
+            return
+
         try:
             speed_limit_kmh = float(vehicle.get_speed_limit())
         except Exception:
@@ -1080,15 +1125,16 @@ class AutopilotAgent(BaseAgent):
             speed_delta_pct = clamp(speed_delta_pct, -75.0, 95.0)
             try:
                 tm.vehicle_percentage_speed_difference(vehicle, float(speed_delta_pct))
-                logging.info(
-                    "Configured TM native autopilot target speed %.1f km/h against limit %.1f km/h (speed_delta_pct=%.1f).",
-                    target_speed_kmh,
-                    speed_limit_kmh,
-                    float(speed_delta_pct),
-                )
+                if log:
+                    logging.info(
+                        "Configured TM native autopilot target speed %.1f km/h against limit %.1f km/h (speed_delta_pct=%.1f).",
+                        target_speed_kmh,
+                        speed_limit_kmh,
+                        float(speed_delta_pct),
+                    )
             except Exception as exc:
                 logging.warning("Failed to tune TM native autopilot speed: %s", exc)
-        else:
+        elif log:
             logging.info("TM native autopilot enabled without speed-limit tuning (unknown speed limit).")
 
     def _configure_nav_agent_traffic_lights(self) -> None:
@@ -1142,7 +1188,8 @@ class AutopilotAgent(BaseAgent):
             logging.warning("Failed to disable TM traffic-light stops for autopilot: %s", exc)
 
     def _set_new_destination(self, vehicle) -> None:
-        if not self._spawn_points or self._nav_agent is None:
+        nav_agent = self._nav_agent if self._nav_agent is not None else self._command_nav_agent
+        if not self._spawn_points or nav_agent is None:
             return
         current_loc = vehicle.get_location()
         world = self.session.world if self.session is not None else None
@@ -1180,7 +1227,7 @@ class AutopilotAgent(BaseAgent):
         current_loc = vehicle.get_location()
         self._route_destination_index = int(dest_idx)
         self._route_destination_location = destination
-        set_navigation_destination(self._nav_agent, current_loc, destination)
+        set_navigation_destination(nav_agent, current_loc, destination)
         if route_plan:
             self._reference_route_plan = list(route_plan)
         else:
@@ -1320,10 +1367,11 @@ class AutopilotAgent(BaseAgent):
             return None
 
     def _get_local_planner(self):
-        if self._nav_agent is None or not hasattr(self._nav_agent, "get_local_planner"):
+        nav_agent = self._nav_agent if self._nav_agent is not None else self._command_nav_agent
+        if nav_agent is None or not hasattr(nav_agent, "get_local_planner"):
             return None
         try:
-            return self._nav_agent.get_local_planner()
+            return nav_agent.get_local_planner()
         except Exception:
             return None
 
@@ -1331,9 +1379,6 @@ class AutopilotAgent(BaseAgent):
         return list(self._reference_route_plan)
 
     def _cache_reference_route_plan(self, force: bool = False) -> int:
-        if self._tm_fallback_mode:
-            self._reference_route_plan = []
-            return 0
         if self._reference_route_plan and not force:
             return int(len(self._reference_route_plan))
         world = self.session.world if self.session is not None else None
@@ -1362,8 +1407,6 @@ class AutopilotAgent(BaseAgent):
         return int(len(self._reference_route_plan))
 
     def _extract_current_command(self, speed_kmh: float = 0.0) -> int:
-        if self._tm_fallback_mode:
-            return 0
         command, _ = self._command_oracle.update(speed_kmh=speed_kmh)
         return int(command)
 
@@ -1516,6 +1559,15 @@ class AutopilotAgent(BaseAgent):
             if world is not None:
                 frame_id_for_control = int(world.get_snapshot().frame)
             recovery_delta = self._recovery_offset(frame_id_for_control)
+            if frame_id_for_control % 30 == 0:
+                self._configure_tm_target_speed(vehicle, log=False)
+            if self._command_nav_agent is not None:
+                try:
+                    if hasattr(self._command_nav_agent, "done") and self._command_nav_agent.done():
+                        self._set_new_destination(vehicle)
+                    self._command_nav_agent.run_step()
+                except Exception:
+                    pass
             if abs(recovery_delta) > 1e-6:
                 control = vehicle.get_control()
                 control.steer = float(clamp(control.steer + recovery_delta, -1.0, 1.0))
@@ -1542,6 +1594,7 @@ class AutopilotAgent(BaseAgent):
                 z=location.z,
                 has_crash=self._had_collision_at(frame_id),
                 is_recovering=abs(recovery_delta) > 1e-6,
+                is_junction=self._is_vehicle_at_junction(vehicle),
                 command=command,
                 pitch=rotation.pitch,
                 roll=rotation.roll,
@@ -1564,6 +1617,7 @@ class AutopilotAgent(BaseAgent):
                 vehicle.set_autopilot(False)
         self._command_oracle.reset()
         self._nav_agent = None
+        self._command_nav_agent = None
         self._reference_route_plan = []
         self._route_destination_index = None
         self._route_destination_location = None
@@ -2247,6 +2301,7 @@ class LaneFollowAgent(BaseAgent):
                 z=location.z,
                 has_crash=self._had_collision_at(frame_id),
                 is_recovering=False,
+                is_junction=self._is_vehicle_at_junction(self.session.ego_vehicle),
                 command=0,
                 pitch=rotation.pitch,
                 roll=rotation.roll,
@@ -4303,6 +4358,7 @@ class CILAgent(BaseAgent):
                 z=vehicle_location.z,
                 has_crash=self._had_collision_at(frame_id),
                 is_recovering=False,
+                is_junction=self._is_vehicle_at_junction(vehicle),
                 command=command,
                 pitch=rotation.pitch,
                 roll=rotation.roll,
