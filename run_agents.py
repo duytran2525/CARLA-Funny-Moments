@@ -69,6 +69,12 @@ except Exception as exc:
     logging.warning("Failed to import TrafficSupervisor: %s", exc)
     TrafficSupervisor = None
 
+try:
+    from core_control.pure_pursuit import PurePursuitController
+except Exception as exc:
+    logging.warning("Failed to import PurePursuitController: %s", exc)
+    PurePursuitController = None
+
 from core_control.carla_manager import CarlaManager, SpectatorConfig
 from core_control.cil_route_planner import CILRoutePlanner
 from core_control.collect_data import DataCollector
@@ -745,6 +751,7 @@ class RunConfig:
     cil_command_prep_time_s: float
     cil_command_trigger_min_m: float
     cil_command_trigger_max_m: float
+    cil_use_pure_pursuit: bool
 
 class BaseSession:
     """Shared interface for CARLA and dry-run sessions."""
@@ -1687,6 +1694,13 @@ class LaneFollowAgent(BaseAgent):
             max_throttle=config.max_throttle,
             max_brake=config.max_brake,
         )
+
+        self._use_pure_pursuit = bool(config.cil_use_pure_pursuit)
+        if self._use_pure_pursuit and PurePursuitController is not None and np is not None:
+            dt = max(float(config.fixed_delta), 1e-3)
+            self._pure_pursuit = PurePursuitController(dt=dt)
+        else:
+            self._pure_pursuit = None
 
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
@@ -3907,6 +3921,42 @@ class CILAgent(BaseAgent):
         # self._last_steer = clamp(smoothed, -1.0, 1.0)
         # return float(self._last_steer)
 
+    def _route_locations_to_ego_waypoints(
+        self,
+        vehicle: Any,
+        route_locations: list[Any],
+        max_points: int = 5,
+    ) -> Optional[np.ndarray]:
+        if np is None or vehicle is None or not route_locations:
+            return None
+
+        transform = vehicle.get_transform() if vehicle is not None else None
+        if transform is None:
+            return None
+
+        yaw_rad = math.radians(float(transform.rotation.yaw))
+        cos_yaw = math.cos(yaw_rad)
+        sin_yaw = math.sin(yaw_rad)
+        origin = transform.location
+
+        ego_points: list[tuple[float, float]] = []
+        for loc in route_locations:
+            if loc is None:
+                continue
+            dx = float(loc.x - origin.x)
+            dy = float(loc.y - origin.y)
+            ego_x = cos_yaw * dx + sin_yaw * dy
+            ego_y = -sin_yaw * dx + cos_yaw * dy
+            if ego_x <= 0.5:
+                continue
+            ego_points.append((ego_x, ego_y))
+            if len(ego_points) >= max_points:
+                break
+
+        if len(ego_points) < 2:
+            return None
+        return np.asarray(ego_points, dtype=np.float32)
+
     @staticmethod
     def _xy_distance(a: Any, b: Any) -> float:
         return math.hypot(float(a.x - b.x), float(a.y - b.y))
@@ -4298,8 +4348,14 @@ class CILAgent(BaseAgent):
         stage_times["model"] = time.perf_counter() - model_t0
 
         control_t0 = time.perf_counter()
+        steering_source = model_steer
+        if self._pure_pursuit is not None and self._use_pure_pursuit:
+            ego_waypoints = self._route_locations_to_ego_waypoints(vehicle, route_locations)
+            if ego_waypoints is not None:
+                steering_source = self._pure_pursuit.compute_steering(ego_waypoints, speed_kmh)
+
         steering = self._stabilize_cil_steering(
-            steering_raw=model_steer,
+            steering_raw=steering_source,
             speed_kmh=speed_kmh,
             command=command,
             command_phase=str(command_debug.get("phase", "cruise")),
@@ -5821,6 +5877,11 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     cil_command_trigger_max_m = max(cil_command_trigger_min_m + 1.0, cil_command_trigger_max_m)
     cil_command_prep_time_s = max(0.8, cil_command_prep_time_s)
 
+    cil_use_pure_pursuit = _to_bool(
+        _cfg_get(env_cfg, "cil", "use_pure_pursuit", False),
+        False,
+    )
+
     nav_agent_type = str(pick(args.nav_agent_type, "cil", "nav_agent_type", "basic")).lower()
     if nav_agent_type not in {"basic", "behavior"}:
         logging.warning("Unsupported nav_agent_type=%s. Falling back to 'basic'.", nav_agent_type)
@@ -5938,6 +5999,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         cil_command_prep_time_s=cil_command_prep_time_s,
         cil_command_trigger_min_m=cil_command_trigger_min_m,
         cil_command_trigger_max_m=cil_command_trigger_max_m,
+        cil_use_pure_pursuit=cil_use_pure_pursuit,
     )
 
 

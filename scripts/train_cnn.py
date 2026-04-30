@@ -1,17 +1,25 @@
+from __future__ import annotations
+
 import os
 import sys
+from typing import Iterable, Optional, Tuple
+
 import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import torchvision.transforms as transforms
 import numpy as np
 import pandas as pd
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from core_perception.dataset import CarlaDataset, CILCarlaDataset
-from core_perception.cnn_model import CIL_NvidiaCNN as NvidiaCNN
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from core_perception.cnn_model import WaypointPredictor
+
+try:
+    from core_perception.dataset import WaypointCarlaDataset
+except ImportError:  # pragma: no cover
+    WaypointCarlaDataset = None
 
 def load_config(config_path):
     with open(config_path, 'r') as file:
@@ -32,33 +40,41 @@ def print_gpu_info():
         print(f"      - Memory: {props.total_memory / 1024**3:.1f} GB")
         print(f"      - Compute Capability: {props.major}.{props.minor}")
 
-def collate_cil_batch(batch):
+def collate_waypoint_batch(batch):
     """
-    Custom collate_fn để fix dtype casting issue trong DataLoader.
-    
-    DataLoader mặc định collate bằng cách stack tất cả tensors cùng dtype,
-    gây ra casting nhầm (commands float32→cần long, steerings long→cần float32).
-    
-    __getitem__ trả về: (image, steering, speed, command)
-    
-    Returns:
-        (images, steerings, speeds, commands) với dtype chính xác
+    Collate batch cho waypoint dataset.
+
+    __getitem__ kỳ vọng trả về: (image, waypoints, command, recovery_flag)
     """
-    images, steerings, speeds, commands = zip(*batch)
-    
+    images, waypoints, commands, recovery_flags = zip(*batch)
     return (
-        torch.stack(images),                                    # float32
-        torch.stack(steerings).float(),                         # ← FORCE float32
-        torch.stack(speeds),                                    # float32
-        torch.stack(commands).long(),                           # ← FORCE long
+        torch.stack(images),
+        torch.stack(waypoints).float(),
+        torch.stack(commands).long(),
+        torch.tensor(recovery_flags, dtype=torch.float32),
     )
+
+
+def _get_recovery_flags(dataset) -> Optional[Iterable[int]]:
+    if hasattr(dataset, "get_recovery_flags"):
+        return dataset.get_recovery_flags()
+    if hasattr(dataset, "recovery_flags"):
+        return dataset.recovery_flags
+    return None
+
+
+def _build_recovery_sampler(flags: Optional[Iterable[int]], recovery_weight: float) -> Optional[WeightedRandomSampler]:
+    if flags is None:
+        return None
+    weights = [recovery_weight if int(flag) == 1 else 1.0 for flag in flags]
+    return WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
 
 def main():
     ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     config = load_config(os.path.join(ROOT_DIR, 'configs', 'train_params.yaml'))
     DATA_DIR = os.path.join(ROOT_DIR, 'data')
     CSV_PATH = os.path.join(DATA_DIR, 'driving_log.csv')
-    MODEL_SAVE_PATH = os.path.join(ROOT_DIR, 'models', 'cnn_steering.pth')
+    MODEL_SAVE_PATH = os.path.join(ROOT_DIR, 'models', 'waypoint_predictor.pth')
     
     # ═══════════════════════════════════════════════════════════
     # PHẦN 1: GPU SETUP (OPTIMIZED CHO MULTI-GPU)
@@ -92,9 +108,10 @@ def main():
     print("📊 PHẦN 2: DATA LOADING")
     print("="*70)
 
+    # Cấu hình Transform: Vì dataset.py tự chuyển thành Tensor [9, H, W] rồi
+    # Ta chỉ cần tạo bộ Normalize cho 9 channels.
     transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        transforms.Normalize(mean=[0.5] * 9, std=[0.5] * 9)
     ])
 
     print("Đang phân chia tập Train và Validation từ file CSV...")
@@ -123,21 +140,26 @@ def main():
     train_df.to_csv(train_csv_path, index=False)
     val_df.to_csv(val_csv_path, index=False)
 
-    # Khởi tạo Dataset từ 2 file CSV riêng biệt
-    train_dataset = CILCarlaDataset(
-        csv_file=train_csv_path, 
-        root_dir=DATA_DIR, 
-        transform=transform, 
-        steering_correction=config['steering_correction'], 
-        is_training=True  # Sẽ gọi hàm balance và augmentation
+    if WaypointCarlaDataset is None:
+        raise RuntimeError(
+            "WaypointCarlaDataset chưa có trong core_perception.dataset. "
+            "Hãy triển khai dataset waypoint trước khi train."
+        )
+
+    train_dataset = WaypointCarlaDataset(
+        csv_file=train_csv_path,
+        root_dir=DATA_DIR,
+        transform=transform,
+        is_training=True,
+        geometric_offset=float(config.get("geometric_offset", 0.35)),
     )
-    
-    val_dataset = CILCarlaDataset(
-        csv_file=val_csv_path, 
-        root_dir=DATA_DIR, 
-        transform=transform, 
-        steering_correction=config['steering_correction'], 
-        is_training=False # Không augmentation, giữ nguyên data thực tế để đánh giá
+
+    val_dataset = WaypointCarlaDataset(
+        csv_file=val_csv_path,
+        root_dir=DATA_DIR,
+        transform=transform,
+        is_training=False,
+        geometric_offset=float(config.get("geometric_offset", 0.35)),
     )
     
     # ⭐ OPTIMIZE: num_workers dựa trên CPU cores
@@ -146,25 +168,29 @@ def main():
     
     batch_size = config['batch_size']
     
+    recovery_weight = float(config.get("recovery_weight", 2.0))
+    sampler = _build_recovery_sampler(_get_recovery_flags(train_dataset), recovery_weight)
+
     # Đưa vào DataLoader với tối ưu
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=num_workers,      # ← OPTIMIZED
-        pin_memory=pin_mem, 
-        collate_fn=collate_cil_batch,
-        persistent_workers=(num_workers > 0)  # ← NEW: Keep workers alive
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=(sampler is None),
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=pin_mem,
+        collate_fn=collate_waypoint_batch,
+        persistent_workers=(num_workers > 0),
     )
     
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=num_workers,      # ← OPTIMIZED
-        pin_memory=pin_mem, 
-        collate_fn=collate_cil_batch,
-        persistent_workers=(num_workers > 0)  # ← NEW
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_mem,
+        collate_fn=collate_waypoint_batch,
+        persistent_workers=(num_workers > 0),
     )
     
     print(f"DataLoader: batch_size={batch_size}, num_workers={num_workers}")
@@ -180,7 +206,7 @@ def main():
     print("="*70)
     
     # Tạo model trên primary device
-    model = NvidiaCNN().to(primary_device)
+    model = WaypointPredictor().to(primary_device)
     
     # ⭐ WRAP với DataParallel nếu có multi-GPU
     if use_multi_gpu:
@@ -202,7 +228,7 @@ def main():
     print("⚙️ PHẦN 4: TRAINING SETUP")
     print("="*70)
     
-    criterion = nn.MSELoss()
+    huber_loss = nn.SmoothL1Loss(reduction="mean")
     optimizer = optim.Adam(model.parameters(), lr=float(config['learning_rate']))
     
     # Learning rate scheduler
@@ -217,7 +243,7 @@ def main():
     scaler = torch.amp.GradScaler('cuda' if use_amp else 'cpu', enabled=use_amp)
     
     print(f"Optimizer: Adam (lr={float(config['learning_rate'])})")
-    print(f"Loss function: MSELoss")
+    print("Loss function: Huber + GNLL")
     print(f"LR Scheduler: ReduceLROnPlateau (factor={lr_factor}, patience={lr_patience})")
     print(f"Mixed precision: {'Enabled' if use_amp else 'Disabled'}")
     
@@ -241,18 +267,27 @@ def main():
         model.train()
         running_loss = 0.0
         
-        for i, (images, steerings, speeds, commands) in enumerate(train_loader):
+        for i, (images, waypoints, commands, recovery_flags) in enumerate(train_loader):
             images = images.to(primary_device, non_blocking=True)
-            speeds = speeds.to(primary_device, non_blocking=True).float()
             commands = commands.to(primary_device, non_blocking=True)
-            steerings = steerings.to(primary_device, non_blocking=True)
+            waypoints = waypoints.to(primary_device, non_blocking=True)
             
             optimizer.zero_grad()
             
             # Mixed precision training
             with torch.amp.autocast(device_type='cuda' if use_amp else 'cpu', enabled=use_amp):
-                outputs = model(images, speeds, commands)
-                loss = criterion(outputs, steerings)
+                outputs = model(images, commands)
+                pred_wp = outputs[:, :10].view(-1, 5, 2)
+                pred_sigma = outputs[:, 10:].view(-1, 5, 1).expand(-1, 5, 2)
+                target_wp = waypoints.view(-1, 5, 2)
+
+                loss_wp = huber_loss(pred_wp, target_wp)
+                loss_gnll = 0.5 * ((target_wp - pred_wp) ** 2 / pred_sigma + torch.log(pred_sigma))
+                loss_gnll = loss_gnll.mean()
+
+                lambda_wp = float(config.get("loss_lambda_wp", 1.0))
+                lambda_gnll = float(config.get("loss_lambda_gnll", 0.1))
+                loss = lambda_wp * loss_wp + lambda_gnll * loss_gnll
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -269,15 +304,24 @@ def main():
         val_loss = 0.0
         
         with torch.no_grad():
-            for images, steerings, speeds, commands in val_loader:
+            for images, waypoints, commands, recovery_flags in val_loader:
                 images = images.to(primary_device, non_blocking=True)
-                speeds = speeds.to(primary_device, non_blocking=True)
                 commands = commands.to(primary_device, non_blocking=True)
-                steerings = steerings.to(primary_device, non_blocking=True)
+                waypoints = waypoints.to(primary_device, non_blocking=True)
                 
                 with torch.amp.autocast(device_type='cuda' if use_amp else 'cpu', enabled=use_amp):
-                    outputs = model(images, speeds, commands)
-                    loss = criterion(outputs, steerings)
+                    outputs = model(images, commands)
+                    pred_wp = outputs[:, :10].view(-1, 5, 2)
+                    pred_sigma = outputs[:, 10:].view(-1, 5, 1).expand(-1, 5, 2)
+                    target_wp = waypoints.view(-1, 5, 2)
+
+                    loss_wp = huber_loss(pred_wp, target_wp)
+                    loss_gnll = 0.5 * ((target_wp - pred_wp) ** 2 / pred_sigma + torch.log(pred_sigma))
+                    loss_gnll = loss_gnll.mean()
+
+                    lambda_wp = float(config.get("loss_lambda_wp", 1.0))
+                    lambda_gnll = float(config.get("loss_lambda_gnll", 0.1))
+                    loss = lambda_wp * loss_wp + lambda_gnll * loss_gnll
                 
                 val_loss += loss.item()
         
