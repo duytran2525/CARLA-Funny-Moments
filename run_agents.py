@@ -5604,7 +5604,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--yolo-model-path",
-        default="yolo26l_best.pt",
+        default="best.pt",
         help="Path to YOLO .pt model used by yolo_detect agent.",
     )
     parser.add_argument(
