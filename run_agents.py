@@ -322,21 +322,24 @@ def _draw_red_light_zone_rois(
     rural_x1 = int(round(0.65 * frame_w))
     rural_x2 = int(round(0.95 * frame_w))
     locked_zone = str(supervisor_debug.get("locked_zone") or "")
+    roi_y1 = 0
+    roi_y2 = int(round(0.60 * frame_h))
+    roi_y2 = max(1, min(frame_h - 1, roi_y2))
 
     try:
         overlay = frame_bgr.copy()
-        cv2.rectangle(overlay, (urban_x1, 0), (urban_x2, frame_h - 1), (60, 140, 255), -1)
-        cv2.rectangle(overlay, (rural_x1, 0), (rural_x2, frame_h - 1), (60, 255, 120), -1)
+        cv2.rectangle(overlay, (urban_x1, roi_y1), (urban_x2, roi_y2), (60, 140, 255), -1)
+        cv2.rectangle(overlay, (rural_x1, roi_y1), (rural_x2, roi_y2), (60, 255, 120), -1)
         cv2.addWeighted(overlay, 0.08, frame_bgr, 0.92, 0.0, frame_bgr)
 
         urban_color = (0, 165, 255) if locked_zone == "urban" else (100, 130, 160)
         rural_color = (0, 220, 0) if locked_zone == "rural_right" else (100, 130, 160)
-        cv2.rectangle(frame_bgr, (urban_x1, 0), (urban_x2, frame_h - 1), urban_color, 2)
-        cv2.rectangle(frame_bgr, (rural_x1, 0), (rural_x2, frame_h - 1), rural_color, 2)
+        cv2.rectangle(frame_bgr, (urban_x1, roi_y1), (urban_x2, roi_y2), urban_color, 2)
+        cv2.rectangle(frame_bgr, (rural_x1, roi_y1), (rural_x2, roi_y2), rural_color, 2)
 
         cv2.putText(
             frame_bgr,
-            "TL ROI urban [0.35W-0.65W]",
+            "TL ROI urban [0.35W-0.65W, top60%H]",
             (urban_x1 + 4, max(18, int(0.06 * frame_h))),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.48,
@@ -345,7 +348,7 @@ def _draw_red_light_zone_rois(
         )
         cv2.putText(
             frame_bgr,
-            "TL ROI rural_right [0.65W-0.95W]",
+            "TL ROI rural_right [0.65W-0.95W, top60%H]",
             (rural_x1 + 4, max(36, int(0.11 * frame_h))),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.48,
