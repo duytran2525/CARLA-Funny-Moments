@@ -301,6 +301,62 @@ def _draw_yellow_danger_corridor(
         logging.warning("Failed to draw yellow corridor: %s", exc)
         return False
 
+def _draw_red_light_zone_rois(
+    frame_bgr: Any,
+    supervisor_debug: Dict[str, Any],
+) -> bool:
+    """Draw static red-light ROI bands used by TrafficSupervisor."""
+    if np is None or cv2 is None:
+        return False
+    if frame_bgr is None or getattr(frame_bgr, "shape", None) is None:
+        return False
+
+    frame_h, frame_w = frame_bgr.shape[:2]
+    if frame_h <= 0 or frame_w <= 0:
+        return False
+
+    # Keep aligned with TrafficSupervisor._classify_traffic_light_zone().
+    urban_x1 = int(round(0.35 * frame_w))
+    urban_x2 = int(round(0.65 * frame_w))
+    rural_x1 = int(round(0.65 * frame_w))
+    rural_x2 = int(round(0.95 * frame_w))
+    locked_zone = str(supervisor_debug.get("locked_zone") or "")
+
+    try:
+        overlay = frame_bgr.copy()
+        cv2.rectangle(overlay, (urban_x1, 0), (urban_x2, frame_h - 1), (60, 140, 255), -1)
+        cv2.rectangle(overlay, (rural_x1, 0), (rural_x2, frame_h - 1), (60, 255, 120), -1)
+        cv2.addWeighted(overlay, 0.08, frame_bgr, 0.92, 0.0, frame_bgr)
+
+        urban_color = (0, 165, 255) if locked_zone == "urban" else (100, 130, 160)
+        rural_color = (0, 220, 0) if locked_zone == "rural_right" else (100, 130, 160)
+        cv2.rectangle(frame_bgr, (urban_x1, 0), (urban_x2, frame_h - 1), urban_color, 2)
+        cv2.rectangle(frame_bgr, (rural_x1, 0), (rural_x2, frame_h - 1), rural_color, 2)
+
+        cv2.putText(
+            frame_bgr,
+            "TL ROI urban [0.35W-0.65W]",
+            (urban_x1 + 4, max(18, int(0.06 * frame_h))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            urban_color,
+            1,
+        )
+        cv2.putText(
+            frame_bgr,
+            "TL ROI rural_right [0.65W-0.95W]",
+            (rural_x1 + 4, max(36, int(0.11 * frame_h))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            rural_color,
+            1,
+        )
+    except Exception as exc:
+        logging.warning("Failed to draw red-light ROI zones: %s", exc)
+        return False
+
+    return True
+
 def _draw_curved_obstacle_path(
     frame_bgr: Any,
     debug_info: Dict[str, Any],
@@ -2107,6 +2163,7 @@ class LaneFollowAgent(BaseAgent):
             is_emergency = bool(detector_emergency)
 
         annotated_frame = frame_bgr.copy()
+        _draw_red_light_zone_rois(annotated_frame, sup_debug)
         for roi_region in debug_info.get("roi_regions", []):
             x1, y1, x2, y2 = roi_region["box"]
             is_active = bool(roi_region.get("active", False))
@@ -5213,6 +5270,7 @@ class YoloDetectAgent(BaseAgent):
         # Step 6: Prepare Annotation Frame
         # ─────────────────────────────────────────────────────────
         annotated_frame = frame_bgr.copy()
+        _draw_red_light_zone_rois(annotated_frame, sup_debug)
         hud_fps = self._update_hud_fps()
         steer_angle_deg = self._steer_to_angle_deg(vehicle, display_steer)
         speed_text = f"{float(speed_kmh):.1f} km/h" if speed_kmh is not None else "n/a"
