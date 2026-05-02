@@ -69,6 +69,12 @@ except Exception as exc:
     logging.warning("Failed to import TrafficSupervisor: %s", exc)
     TrafficSupervisor = None
 
+try:
+    from core_control.pure_pursuit import PurePursuitController
+except Exception as exc:
+    logging.warning("Failed to import PurePursuitController: %s", exc)
+    PurePursuitController = None
+
 from core_control.carla_manager import CarlaManager, SpectatorConfig
 from core_control.cil_route_planner import CILRoutePlanner
 from core_control.collect_data import DataCollector
@@ -294,6 +300,62 @@ def _draw_yellow_danger_corridor(
     except Exception as exc:
         logging.warning("Failed to draw yellow corridor: %s", exc)
         return False
+
+def _draw_red_light_zone_rois(
+    frame_bgr: Any,
+    supervisor_debug: Dict[str, Any],
+) -> bool:
+    """Draw static red-light ROI bands used by TrafficSupervisor."""
+    if np is None or cv2 is None:
+        return False
+    if frame_bgr is None or getattr(frame_bgr, "shape", None) is None:
+        return False
+
+    frame_h, frame_w = frame_bgr.shape[:2]
+    if frame_h <= 0 or frame_w <= 0:
+        return False
+
+    # Keep aligned with TrafficSupervisor._classify_traffic_light_zone().
+    urban_x1 = int(round(0.35 * frame_w))
+    urban_x2 = int(round(0.65 * frame_w))
+    rural_x1 = int(round(0.65 * frame_w))
+    rural_x2 = int(round(0.95 * frame_w))
+    locked_zone = str(supervisor_debug.get("locked_zone") or "")
+
+    try:
+        overlay = frame_bgr.copy()
+        cv2.rectangle(overlay, (urban_x1, 0), (urban_x2, frame_h - 1), (60, 140, 255), -1)
+        cv2.rectangle(overlay, (rural_x1, 0), (rural_x2, frame_h - 1), (60, 255, 120), -1)
+        cv2.addWeighted(overlay, 0.08, frame_bgr, 0.92, 0.0, frame_bgr)
+
+        urban_color = (0, 165, 255) if locked_zone == "urban" else (100, 130, 160)
+        rural_color = (0, 220, 0) if locked_zone == "rural_right" else (100, 130, 160)
+        cv2.rectangle(frame_bgr, (urban_x1, 0), (urban_x2, frame_h - 1), urban_color, 2)
+        cv2.rectangle(frame_bgr, (rural_x1, 0), (rural_x2, frame_h - 1), rural_color, 2)
+
+        cv2.putText(
+            frame_bgr,
+            "TL ROI urban [0.35W-0.65W]",
+            (urban_x1 + 4, max(18, int(0.06 * frame_h))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            urban_color,
+            1,
+        )
+        cv2.putText(
+            frame_bgr,
+            "TL ROI rural_right [0.65W-0.95W]",
+            (rural_x1 + 4, max(36, int(0.11 * frame_h))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            rural_color,
+            1,
+        )
+    except Exception as exc:
+        logging.warning("Failed to draw red-light ROI zones: %s", exc)
+        return False
+
+    return True
 
 def _draw_curved_obstacle_path(
     frame_bgr: Any,
@@ -745,6 +807,7 @@ class RunConfig:
     cil_command_prep_time_s: float
     cil_command_trigger_min_m: float
     cil_command_trigger_max_m: float
+    cil_use_pure_pursuit: bool
 
 class BaseSession:
     """Shared interface for CARLA and dry-run sessions."""
@@ -1688,6 +1751,13 @@ class LaneFollowAgent(BaseAgent):
             max_brake=config.max_brake,
         )
 
+        self._use_pure_pursuit = bool(config.cil_use_pure_pursuit)
+        if self._use_pure_pursuit and PurePursuitController is not None and np is not None:
+            dt = max(float(config.fixed_delta), 1e-3)
+            self._pure_pursuit = PurePursuitController(dt=dt)
+        else:
+            self._pure_pursuit = None
+
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
         vehicle = session.ego_vehicle
@@ -2093,6 +2163,7 @@ class LaneFollowAgent(BaseAgent):
             is_emergency = bool(detector_emergency)
 
         annotated_frame = frame_bgr.copy()
+        _draw_red_light_zone_rois(annotated_frame, sup_debug)
         for roi_region in debug_info.get("roi_regions", []):
             x1, y1, x2, y2 = roi_region["box"]
             is_active = bool(roi_region.get("active", False))
@@ -3907,6 +3978,42 @@ class CILAgent(BaseAgent):
         # self._last_steer = clamp(smoothed, -1.0, 1.0)
         # return float(self._last_steer)
 
+    def _route_locations_to_ego_waypoints(
+        self,
+        vehicle: Any,
+        route_locations: list[Any],
+        max_points: int = 5,
+    ) -> Optional[np.ndarray]:
+        if np is None or vehicle is None or not route_locations:
+            return None
+
+        transform = vehicle.get_transform() if vehicle is not None else None
+        if transform is None:
+            return None
+
+        yaw_rad = math.radians(float(transform.rotation.yaw))
+        cos_yaw = math.cos(yaw_rad)
+        sin_yaw = math.sin(yaw_rad)
+        origin = transform.location
+
+        ego_points: list[tuple[float, float]] = []
+        for loc in route_locations:
+            if loc is None:
+                continue
+            dx = float(loc.x - origin.x)
+            dy = float(loc.y - origin.y)
+            ego_x = cos_yaw * dx + sin_yaw * dy
+            ego_y = -sin_yaw * dx + cos_yaw * dy
+            if ego_x <= 0.5:
+                continue
+            ego_points.append((ego_x, ego_y))
+            if len(ego_points) >= max_points:
+                break
+
+        if len(ego_points) < 2:
+            return None
+        return np.asarray(ego_points, dtype=np.float32)
+
     @staticmethod
     def _xy_distance(a: Any, b: Any) -> float:
         return math.hypot(float(a.x - b.x), float(a.y - b.y))
@@ -4298,8 +4405,14 @@ class CILAgent(BaseAgent):
         stage_times["model"] = time.perf_counter() - model_t0
 
         control_t0 = time.perf_counter()
+        steering_source = model_steer
+        if self._pure_pursuit is not None and self._use_pure_pursuit:
+            ego_waypoints = self._route_locations_to_ego_waypoints(vehicle, route_locations)
+            if ego_waypoints is not None:
+                steering_source = self._pure_pursuit.compute_steering(ego_waypoints, speed_kmh)
+
         steering = self._stabilize_cil_steering(
-            steering_raw=model_steer,
+            steering_raw=steering_source,
             speed_kmh=speed_kmh,
             command=command,
             command_phase=str(command_debug.get("phase", "cruise")),
@@ -5157,6 +5270,7 @@ class YoloDetectAgent(BaseAgent):
         # Step 6: Prepare Annotation Frame
         # ─────────────────────────────────────────────────────────
         annotated_frame = frame_bgr.copy()
+        _draw_red_light_zone_rois(annotated_frame, sup_debug)
         hud_fps = self._update_hud_fps()
         steer_angle_deg = self._steer_to_angle_deg(vehicle, display_steer)
         speed_text = f"{float(speed_kmh):.1f} km/h" if speed_kmh is not None else "n/a"
@@ -5821,6 +5935,11 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     cil_command_trigger_max_m = max(cil_command_trigger_min_m + 1.0, cil_command_trigger_max_m)
     cil_command_prep_time_s = max(0.8, cil_command_prep_time_s)
 
+    cil_use_pure_pursuit = _to_bool(
+        _cfg_get(env_cfg, "cil", "use_pure_pursuit", False),
+        False,
+    )
+
     nav_agent_type = str(pick(args.nav_agent_type, "cil", "nav_agent_type", "basic")).lower()
     if nav_agent_type not in {"basic", "behavior"}:
         logging.warning("Unsupported nav_agent_type=%s. Falling back to 'basic'.", nav_agent_type)
@@ -5938,6 +6057,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         cil_command_prep_time_s=cil_command_prep_time_s,
         cil_command_trigger_min_m=cil_command_trigger_min_m,
         cil_command_trigger_max_m=cil_command_trigger_max_m,
+        cil_use_pure_pursuit=cil_use_pure_pursuit,
     )
 
 

@@ -1,14 +1,18 @@
+from __future__ import annotations
+
 import os
+import random
 import sys
+from typing import Iterable
+
+import cv2
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
-import cv2
-import random
-import numpy as np
 
 
-def _safe_print(message=""):
+def _safe_print(message: object = "") -> None:
     try:
         print(message)
     except UnicodeEncodeError:
@@ -20,557 +24,452 @@ def _safe_print(message=""):
         print(safe_message)
 
 
-class CarlaDataset(Dataset):
+def _image_id(value: object) -> str:
+    stem = str(value).strip()
+    if "." in stem:
+        stem = stem.split(".", 1)[0]
+    return stem.zfill(8) + ".jpg"
+
+
+def _filter_stationary_rows(
+    data_df: pd.DataFrame,
+    *,
+    min_speed_kmh: float,
+    min_wp5_x_m: float,
+) -> pd.DataFrame:
+    """Drop stopped samples whose future trajectory barely moves forward."""
+    required_columns = {"speed", "wp_5_x"}
+    if not required_columns.issubset(set(data_df.columns)):
+        return data_df
+
+    speed = pd.to_numeric(data_df["speed"], errors="coerce")
+    wp5_x = pd.to_numeric(data_df["wp_5_x"], errors="coerce")
+    stationary_mask = (speed < min_speed_kmh) & (wp5_x < min_wp5_x_m)
+    dropped = int(stationary_mask.sum())
+    if dropped <= 0:
+        return data_df
+
+    kept_df = data_df.loc[~stationary_mask].reset_index(drop=True)
+    _safe_print(
+        "Stationary filter: "
+        f"{len(data_df)} -> {len(kept_df)} rows "
+        f"(dropped {dropped}, speed < {min_speed_kmh:.1f} km/h "
+        f"and wp_5_x < {min_wp5_x_m:.1f} m)"
+    )
+    return kept_df
+
+
+class WaypointCarlaDataset(Dataset):
     """
-    Dataset PyTorch cho bài toán Behavioral Cloning (Phase 1) với dữ liệu thu từ CARLA.
+    Multi-frame waypoint dataset used by scripts/train_cnn.py.
 
-    Pipeline tổng quan
-    ------------------
-    Khởi tạo (``__init__``)
-        │
-        ├─► đọc CSV qua ``_prepare_data``
-        │       ├─ duyệt 3 thư mục camera (center / left / right)
-        │       ├─ áp steering correction cho camera trái/phải
-        │       └─ nếu ``is_training=True`` → ``_balance_steering_distribution``
-        │
-    Lấy mẫu (``__getitem__``)
-        │
-        ├─► đọc ảnh jpg bằng OpenCV (BGR → RGB)
-        ├─► crop phần trời (~45 % trên)
-        ├─► nếu ``is_training=True`` → áp dụng ngẫu nhiên các phép augmentation:
-        │       translate, brightness, shadow, flip, blur, noise, rotation, contrast
-        ├─► resize về 200x66
-        ├─► chuyển không gian màu RGB → YUV  (định dạng Nvidia CNN kỳ vọng)
-        ├─► áp ``transform`` tuỳ chọn (thường là ``ToTensor``)
-        └─► clamp steering về [-1, 1] và trả về ``(image_tensor, steering_tensor)``
-
-    Cấu trúc thư mục dữ liệu kỳ vọng
-    ----------------------------------
-    ::
-
-        root_dir/
-        ├── images_center/   (ảnh từ camera chính giữa)
-        ├── images_left/     (ảnh từ camera trái, steering + correction)
-        └── images_right/    (ảnh từ camera phải, steering - correction)
-
-    File CSV phải có header: ``img_id, steering, throttle, brake, speed, command, pitch, roll, yaw``.
-    ``img_id`` là tên file ảnh không có phần mở rộng, được pad thành 8 chữ số.
-
-    Parameters
-    ----------
-    csv_file : str
-        Đường dẫn đến file CSV chứa nhật ký lái (driving log).
-    root_dir : str
-        Thư mục gốc chứa ba thư mục con camera.
-    transform : callable, optional
-        Transform tùy chọn (ví dụ ``torchvision.transforms.ToTensor()``) áp lên
-        ảnh sau khi đã xử lý.  Nếu ``None``, ảnh trả về là ``np.ndarray``.
-    steering_correction : float, optional
-        Độ bù góc lái cho camera trái (+correction) và phải (-correction).
-        Mặc định 0.2 - giá trị này buộc xe "nhìn về giữa làn" khi học từ
-        ảnh của camera lệch.
-    is_training : bool, optional
-        Nếu ``True`` (mặc định): dùng cả 3 camera và bật augmentation.
-        Nếu ``False``: chỉ dùng camera chính giữa, tắt augmentation.
+    Each sample returns:
+    - stacked image tensor with shape [9, 66, 200] from t0, t-0.3, t-0.6
+    - future waypoints with shape [5, 2]
+    - command tensor
+    - recovery flag tensor
     """
 
-    def __init__(self, csv_file, root_dir, transform=None,
-                 steering_correction=0.2, is_training=True,
-                 filter_stationary=True, min_speed_kmh=1.0,
-                 min_wp5_x_m=3.0):
-        """
-        Khởi tạo CarlaDataset và xây dựng danh sách mẫu.
+    REQUIRED_COLUMNS = (
+        "img_id",
+        "img_id_tm03",
+        "img_id_tm06",
+        "wp_1_x",
+        "wp_1_y",
+        "wp_2_x",
+        "wp_2_y",
+        "wp_3_x",
+        "wp_3_y",
+        "wp_4_x",
+        "wp_4_y",
+        "wp_5_x",
+        "wp_5_y",
+    )
 
-        Gọi ``_prepare_data()`` để duyệt file CSV, khớp từng dòng với
-        file ảnh trên đĩa và (nếu là tập huấn luyện) cân bằng phân phối
-        steering.
-
-        Parameters
-        ----------
-        csv_file : str
-            Đường dẫn file CSV driving log.
-        root_dir : str
-            Thư mục gốc chứa ``images_center/``, ``images_left/``,
-            ``images_right/``.
-        transform : callable, optional
-            Transform áp lên ảnh sau pipeline chuẩn bị.
-        steering_correction : float, optional
-            Bù góc lái cho camera trái/phải.  Mặc định ``0.2``.
-        is_training : bool, optional
-            Kích hoạt augmentation và dùng 3 camera.  Mặc định ``True``.
-        """
+    def __init__(
+        self,
+        csv_file: str,
+        root_dir: str,
+        transform=None,
+        is_training: bool = True,
+        geometric_offset: float = 0.35,
+        filter_stationary: bool = True,
+        min_speed_kmh: float = 1.0,
+        min_wp5_x_m: float = 3.0,
+    ) -> None:
         self.root_dir = root_dir
         self.transform = transform
-        self.steering_correction = steering_correction
-        self.is_training = is_training
-        self.filter_stationary = bool(filter_stationary)
-        self.min_speed_kmh = float(min_speed_kmh)
-        self.min_wp5_x_m = float(min_wp5_x_m)
-        self.samples = []
+        self.is_training = bool(is_training)
+        self.geometric_offset = float(geometric_offset)
+        self.samples: list[dict[str, object]] = []
+        self.recovery_flags: list[int] = []
 
         self.data_df = pd.read_csv(csv_file)
-        if self.filter_stationary:
-            self.data_df = self._filter_stationary_rows(self.data_df)
-
+        if filter_stationary:
+            self.data_df = _filter_stationary_rows(
+                self.data_df,
+                min_speed_kmh=float(min_speed_kmh),
+                min_wp5_x_m=float(min_wp5_x_m),
+            )
+        self._validate_columns()
         self._prepare_data()
 
-    def _filter_stationary_rows(self, data_df):
-        """Drop stopped samples whose future trajectory barely moves forward."""
-        required_columns = {"speed", "wp_5_x"}
-        if not required_columns.issubset(set(data_df.columns)):
-            return data_df
+    def _validate_columns(self) -> None:
+        missing = [column for column in self.REQUIRED_COLUMNS if column not in self.data_df.columns]
+        if missing:
+            raise ValueError(
+                "WaypointCarlaDataset CSV is missing required columns: "
+                + ", ".join(missing)
+            )
 
-        speed = pd.to_numeric(data_df["speed"], errors="coerce")
-        wp5_x = pd.to_numeric(data_df["wp_5_x"], errors="coerce")
-        stationary_mask = (speed < self.min_speed_kmh) & (wp5_x < self.min_wp5_x_m)
-        dropped = int(stationary_mask.sum())
-        if dropped <= 0:
-            return data_df
-
-        kept_df = data_df.loc[~stationary_mask].reset_index(drop=True)
+    def _prepare_data(self) -> None:
         _safe_print(
-            "Stationary filter: "
-            f"{len(data_df)} -> {len(kept_df)} rows "
-            f"(dropped {dropped}, speed < {self.min_speed_kmh:.1f} km/h "
-            f"and wp_5_x < {self.min_wp5_x_m:.1f} m)"
+            "Đang phân tích cấu trúc dữ liệu đa luồng "
+            f"(Multi-frame) từ {len(self.data_df)} dòng..."
         )
-        return kept_df
 
-    def _prepare_data(self):
-        """
-        Xây dựng ``self.samples`` bằng cách khớp CSV với file ảnh trên đĩa.
-
-        Với mỗi dòng trong CSV:
-        * Chuẩn hoá ``img_id`` thành tên file 8 chữ số + ``.jpg``.
-        * Thử khớp với **3 thư mục camera** (center / left / right):
-          - Camera trái:  ``steering + steering_correction``
-          - Camera phải: ``steering - steering_correction``
-          - Khi ``is_training=False``: chỉ lấy ảnh center.
-        * Nếu file tồn tại → thêm ``(img_path, steering_corrected)`` vào
-          ``self.samples``.
-
-        Sau khi duyệt xong, nếu là tập huấn luyện thì gọi
-        ``_balance_steering_distribution()`` để cắt bớt mẫu đi thẳng.
-        
-        FIX (2026-04-14): Sử dụng SYMMETRIC SCALING thay vì data-dependent min-max.
-        - Giải quyết: Train/Val inconsistency (Issue #1)
-        - Giải quyết: Zero point loss (Issue #3)  
-        - Giải quyết: Clipping data loss (Issue #2)
-        """
-        _safe_print("Đang rà soát file ảnh từ 3 camera...")
-        
-        # ✅ SỬ DỤNG HẰNG SỐ VẬT LÝ (SYMMETRIC SCALING)
-        # CARLA max steering angle (physical constant, không phụ thuộc dữ liệu)
-        # Đảm bảo consistency giữa train/val/deploy
-        MAX_STEER = 1.0
-        
         for _, row in self.data_df.iterrows():
-            steering = float(row['steering'])
-            
-            img_id_str = str(row['img_id']).strip()
-            if '.' in img_id_str:
-                img_id_str = img_id_str.split('.')[0]  # Bỏ phần thập phân nếu có
-            img_id = img_id_str.zfill(8) + '.jpg'
+            command = int(row.get("command", 0))
+            recovery_flag = float(row.get("recovery_flag", 0.0))
 
-            configs = [
-                ('images_center', 0.0),
-                ('images_left',  self.steering_correction),
-                ('images_right', -self.steering_correction),
-            ]
+            waypoints = np.array(
+                [
+                    row["wp_1_x"],
+                    row["wp_1_y"],
+                    row["wp_2_x"],
+                    row["wp_2_y"],
+                    row["wp_3_x"],
+                    row["wp_3_y"],
+                    row["wp_4_x"],
+                    row["wp_4_y"],
+                    row["wp_5_x"],
+                    row["wp_5_y"],
+                ],
+                dtype=np.float32,
+            ).reshape(5, 2)
 
-            for sub_dir, correction in configs:
-                if not self.is_training and sub_dir != 'images_center':
+            image_ids = (
+                _image_id(row["img_id"]),
+                _image_id(row["img_id_tm03"]),
+                _image_id(row["img_id_tm06"]),
+            )
+            configs = (
+                ("images_center", 0.0),
+                ("images_left", self.geometric_offset),
+                ("images_right", -self.geometric_offset),
+            )
+
+            for sub_dir, offset in configs:
+                if not self.is_training and sub_dir != "images_center":
                     continue
-                img_path = os.path.join(self.root_dir, sub_dir, img_id)
-                if os.path.exists(img_path):
-                    # ✅ Áp correction TRƯỚC chuẩn hóa để tránh xén dữ liệu
-                    # Sau đó normalize bằng hằng số cố định (không phụ thuộc data)
-                    steering_with_correction = steering + correction
-                    steering_normalized = steering_with_correction / MAX_STEER
-                    self.samples.append((img_path, steering_normalized))
 
-        _safe_print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
-        _safe_print(f"   Steering được chuẩn hóa bằng: MAX_STEER = {MAX_STEER} (symmetric scaling)")
-        _safe_print(f"   Zero point được bảo toàn: 0 / {MAX_STEER} = 0 ✓")
-        if self.is_training:
-            self._balance_steering_distribution()
+                paths = tuple(os.path.join(self.root_dir, sub_dir, image_id) for image_id in image_ids)
+                if not all(os.path.exists(path) for path in paths):
+                    continue
 
-    def _balance_steering_distribution(self, bins=25, max_per_bin=None):
-        """
-        Giảm số lượng mẫu đi thẳng (steering ≈ 0) để cân bằng dữ liệu.
+                camera_waypoints = waypoints.copy()
+                camera_waypoints[:, 1] += offset
+                self.samples.append(
+                    {
+                        "paths": paths,
+                        "waypoints": camera_waypoints,
+                        "command": command,
+                        "recovery_flag": recovery_flag,
+                    }
+                )
+                self.recovery_flags.append(int(recovery_flag))
 
-        Vấn đề cần giải quyết
-        ---------------------
-        Trong lái xe thực tế, xe đi thẳng chiếm phần lớn thời gian.  Nếu
-        huấn luyện trực tiếp trên dữ liệu thô, mô hình sẽ thiên về dự đoán
-        steering ≈ 0 vì đây là giá trị phổ biến nhất → xe dễ bị lao thẳng
-        ở các khúc cua.
+        _safe_print(f"✅ Hoàn tất! Đã nạp thành công {len(self.samples)} khối lượng Tensor.")
 
-        Thuật toán
-        ----------
-        1. Chia trục steering thành ``bins`` khoảng đều nhau.
-        2. Tính ``max_per_bin = mean(histogram)`` nếu không truyền vào.
-        3. Duyệt ngẫu nhiên (sau ``shuffle``) danh sách mẫu:
-           - Xác định bin của mẫu đó.
-           - Nếu bin chưa đầy → giữ lại; ngược lại bỏ qua.
-        4. Kết quả: mỗi bin có tối đa ``max_per_bin`` mẫu.
-
-        Parameters
-        ----------
-        bins : int, optional
-            Số khoảng để chia phân phối steering.  Mặc định ``25``.
-        max_per_bin : int, optional
-            Ngưỡng tối đa mẫu mỗi bin.  Nếu ``None`` thì dùng
-            ``int(mean(histogram))``.
-        """
-        steerings = [s for _, s in self.samples]
-        hist, bin_edges = np.histogram(steerings, bins=bins)
-
-        if max_per_bin is None:
-            max_per_bin = int(np.mean(hist))
-
-        balanced_samples = []
-        bin_counts = {i: 0 for i in range(bins)}
-
-        random.shuffle(self.samples)
-
-        for img_path, steering in self.samples:
-            bin_idx = min(np.digitize(steering, bin_edges[1:-1]), bins - 1)
-            if bin_counts[bin_idx] < max_per_bin:
-                balanced_samples.append((img_path, steering))
-                bin_counts[bin_idx] += 1
-
-        _safe_print(f"Cân bằng dữ liệu: {len(self.samples)} → {len(balanced_samples)} mẫu")
-        self.samples = balanced_samples
-
-        _safe_print(f"Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
-
-    def __len__(self):
-        """Trả về tổng số mẫu trong dataset sau khi đã cân bằng."""
+    def __len__(self) -> int:
         return len(self.samples)
 
-    # --- CÁC HÀM AUGMENTATION ---
+    def get_recovery_flags(self) -> Iterable[int]:
+        return self.recovery_flags
 
-    def _random_brightness(self, image):
-        """
-        Thay đổi độ sáng ngẫu nhiên bằng cách chuyển sang hệ màu HSV.
-
-        Kênh V (Value - độ sáng) được nhân với một hệ số ngẫu nhiên trong
-        khoảng [0.5, 1.5]:
-
-        * Hệ số < 1 → ảnh tối hơn (mô phỏng ban đêm / bóng tối).
-        * Hệ số > 1 → ảnh sáng hơn (mô phỏng nắng gắt / lóa đèn).
-
-        Parameters
-        ----------
-        image : np.ndarray
-            Ảnh đầu vào ở không gian màu RGB, shape ``(H, W, 3)``,
-            dtype ``uint8``.
-
-        Returns
-        -------
-        np.ndarray
-            Ảnh sau khi điều chỉnh độ sáng, cùng shape và dtype với đầu vào.
-        """
+    def _random_brightness(self, image: np.ndarray) -> np.ndarray:
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-        # Tỉ lệ sáng từ 0.5 (tối đi một nửa) đến 1.5 (sáng rực)
         ratio = 1.0 + (random.random() - 0.5)
         hsv[:, :, 2] = np.clip(hsv[:, :, 2] * ratio, 0, 255)
         return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
 
-    def _random_shadow(self, image):
-        """
-        Tạo bóng râm ngẫu nhiên trên mặt đường.
-
-        Một đa giác 4 đỉnh được vẽ ngẫu nhiên trên mask, sau đó kênh V
-        trong không gian màu HSV tại vùng đó được giảm xuống còn 50%.
-
-        Mục đích: mô phỏng bóng của cây cối, tòa nhà hoặc xe khác đổ lên
-        mặt đường, giúp mô hình không bị nhầm bóng tối là vật cản.
-
-        Parameters
-        ----------
-        image : np.ndarray
-            Ảnh RGB đầu vào, shape ``(H, W, 3)``, dtype ``uint8``.
-
-        Returns
-        -------
-        np.ndarray
-            Ảnh RGB sau khi thêm bóng râm, cùng shape với đầu vào.
-        """
-        h, w = image.shape[:2]
-        # Tạo 4 điểm ngẫu nhiên để vẽ một đa giác (polygon) làm bóng râm
-        x1, y1 = random.randint(0, w), 0
-        x2, y2 = random.randint(0, w), h
-        x3, y3 = random.randint(0, w), h
-        x4, y4 = random.randint(0, w), 0
-
-        pts = np.array([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], np.int32)
-
+    def _random_shadow(self, image: np.ndarray) -> np.ndarray:
+        height, width = image.shape[:2]
+        pts = np.array(
+            [
+                [random.randint(0, width), 0],
+                [random.randint(0, width), height],
+                [random.randint(0, width), height],
+                [random.randint(0, width), 0],
+            ],
+            np.int32,
+        )
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
         mask = np.zeros_like(hsv[:, :, 2])
         cv2.fillPoly(mask, [pts], 255)
-
-        # Giảm độ sáng (kênh V) tại vùng có mask xuống 50%
         hsv[:, :, 2][mask == 255] = hsv[:, :, 2][mask == 255] * 0.5
         return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
 
-    def _random_translate(self, image, steering, range_x=20, range_y=10):
-        """
-        Dịch chuyển ảnh ngẫu nhiên và bù trừ góc lái tương ứng.
-
-        Xe trong ảnh dịch chuyển theo chiều ngang (±20 px) và dọc (±10 px).
-        Với mỗi pixel dịch ngang, góc lái được điều chỉnh +0.004 rad để mô
-        hình học cách phục hồi khi xe bị lệch khỏi tâm làn.
-
-        * ``trans_x > 0`` (xe lệch phải) → ``steering`` tăng (đánh lái phải
-          nhiều hơn để kéo xe về giữa).
-        * ``trans_x < 0`` (xe lệch trái)  → ``steering`` giảm (đánh lái
-          trái nhiều hơn).
-
-        Parameters
-        ----------
-        image : np.ndarray
-            Ảnh RGB đầu vào, shape ``(H, W, 3)``.
-        steering : float
-            Góc lái hiện tại (trước khi bù).
-        range_x : int, optional
-            Biên độ dịch ngang tối đa (pixel).  Mặc định ``20``.
-        range_y : int, optional
-            Biên độ dịch dọc tối đa (pixel).  Mặc định ``10``.
-
-        Returns
-        -------
-        image : np.ndarray
-            Ảnh sau khi dịch chuyển, cùng kích thước với đầu vào.
-        steering : float
-            Góc lái đã được bù trừ tương ứng với độ lệch ngang.
-        """
-        h, w = image.shape[:2]
-        trans_x = range_x * (random.random() - 0.5)
-        trans_y = range_y * (random.random() - 0.5)
-
-        # Nếu xe bị lệch sang phải (trans_x > 0), phải đánh lái thêm về bên phải để đưa xe về giữa
-        steering += trans_x * 0.004
-
-        trans_m = np.float32([[1, 0, trans_x], [0, 1, trans_y]])
-        image = cv2.warpAffine(image, trans_m, (w, h))
-        return image, steering
-
-    def _random_blur(self, image):
-        """
-        Thêm Gaussian blur ngẫu nhiên để mô phỏng mờ camera.
-
-        Kernel 3x3 hoặc 5x5 được chọn ngẫu nhiên với xác suất bằng nhau.
-        Blur mô phỏng các điều kiện thực tế: ống kính bẩn, rung xe, tốc độ
-        cao khiến ảnh bị nhoè (motion blur nhẹ).
-
-        Parameters
-        ----------
-        image : np.ndarray
-            Ảnh RGB, shape ``(H, W, 3)``, dtype ``uint8``.
-
-        Returns
-        -------
-        np.ndarray
-            Ảnh sau khi làm mờ, cùng shape với đầu vào.
-        """
+    def _random_blur(self, image: np.ndarray) -> np.ndarray:
         kernel_size = random.choice([3, 5])
-        image = cv2.GaussianBlur(image, (kernel_size, kernel_size), 0)
-        return image
+        return cv2.GaussianBlur(image, (kernel_size, kernel_size), 0)
 
-    def _random_noise(self, image):
-        """
-        Thêm nhiễu Gaussian ngẫu nhiên để mô phỏng nhiễu sensor.
-
-        Độ lệch chuẩn ``sigma`` được lấy ngẫu nhiên trong [5, 15].  Nhiễu
-        được cộng thêm vào từng pixel rồi clamp về [0, 255].
-
-        Mục đích: giúp mô hình bền vững trước các điều kiện ánh sáng kém,
-        camera chất lượng thấp, hoặc nhiễu điện tử từ sensor.
-
-        Parameters
-        ----------
-        image : np.ndarray
-            Ảnh RGB, shape ``(H, W, 3)``, dtype ``uint8``.
-
-        Returns
-        -------
-        np.ndarray
-            Ảnh sau khi thêm nhiễu, dtype ``uint8``.
-        """
+    def _random_noise(self, image: np.ndarray) -> np.ndarray:
         sigma = random.uniform(5, 15)
         noise = np.random.normal(0, sigma, image.shape).astype(np.float32)
-        image = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+        return np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    def _random_contrast(self, image: np.ndarray, low: float = 0.7, high: float = 1.3) -> np.ndarray:
+        factor = random.uniform(low, high)
+        mean = np.mean(image, axis=(0, 1), keepdims=True)
+        return np.clip((image - mean) * factor + mean, 0, 255).astype(np.uint8)
+
+    def _random_cutout(
+        self,
+        image: np.ndarray,
+        min_size_ratio: float = 0.1,
+        max_size_ratio: float = 0.3,
+    ) -> np.ndarray:
+        height, width, _channels = image.shape
+        cut_h = int(height * random.uniform(min_size_ratio, max_size_ratio))
+        cut_w = int(width * random.uniform(min_size_ratio, max_size_ratio))
+        center_y = random.randint(0, height)
+        center_x = random.randint(0, width)
+        y1, y2 = np.clip(center_y - cut_h // 2, 0, height), np.clip(center_y + cut_h // 2, 0, height)
+        x1, x2 = np.clip(center_x - cut_w // 2, 0, width), np.clip(center_x + cut_w // 2, 0, width)
+        image[y1:y2, x1:x2, :] = 0
         return image
 
-    def _random_rotation(self, image, steering, max_angle=5):
-        """
-        Xoay ảnh nhẹ ngẫu nhiên và bù steering tương ứng.
+    def __getitem__(self, idx: int):
+        sample = self.samples[idx]
+        paths = sample["paths"]
+        waypoints = np.asarray(sample["waypoints"], dtype=np.float32).copy()
+        command = int(sample["command"])
+        recovery_flag = float(sample["recovery_flag"])
 
-        Góc xoay được chọn ngẫu nhiên trong [-max_angle, +max_angle] độ.
-        Ảnh được xoay quanh tâm bằng ``cv2.warpAffine``.
+        images = []
+        do_flip = self.is_training and random.random() > 0.5
+        do_brightness = self.is_training and random.random() > 0.5
+        do_shadow = self.is_training and random.random() > 0.5
+        do_blur = self.is_training and random.random() > 0.5
+        do_noise = self.is_training and random.random() > 0.7
+        do_contrast = self.is_training and random.random() > 0.5
+        do_cutout = self.is_training and random.random() > 0.5
 
-        Quy ước bù steering:
-        * Xoay ngược kim đồng hồ (``angle > 0``): ảnh nghiêng trái → phần
-          đường phía trước lệch phải tương đối → cần lái ít hơn sang phải,
-          tức ``steering`` giảm.
-        * Xoay thuận kim đồng hồ (``angle < 0``): ngược lại.
+        for path in paths:
+            image = cv2.imread(str(path))
+            if image is None:
+                raise FileNotFoundError(f"Khong doc duoc anh dataset: {path}")
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            height = image.shape[0]
+            image = image[int(height * 0.45) :, :, :]
 
-        Parameters
-        ----------
-        image : np.ndarray
-            Ảnh RGB, shape ``(H, W, 3)``.
-        steering : float
-            Góc lái hiện tại.
-        max_angle : float, optional
-            Góc xoay tối đa (độ).  Mặc định ``5``.
+            if self.is_training:
+                if do_brightness:
+                    image = self._random_brightness(image)
+                if do_shadow:
+                    image = self._random_shadow(image)
+                if do_blur:
+                    image = self._random_blur(image)
+                if do_noise:
+                    image = self._random_noise(image)
+                if do_contrast:
+                    image = self._random_contrast(image)
+                if do_cutout:
+                    image = self._random_cutout(image)
+                if do_flip:
+                    image = cv2.flip(image, 1)
 
-        Returns
-        -------
-        image : np.ndarray
-            Ảnh sau khi xoay.
-        steering : float
-            Góc lái đã bù.
-        """
+            image = cv2.resize(image, (200, 66))
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2YUV)
+            images.append(image)
+
+        stacked_image = np.concatenate(images, axis=-1)
+        stacked_tensor = torch.from_numpy(stacked_image).permute(2, 0, 1).float() / 255.0
+        if self.transform:
+            stacked_tensor = self.transform(stacked_tensor)
+
+        if do_flip:
+            waypoints[:, 1] = -waypoints[:, 1]
+            if command == 1:
+                command = 2
+            elif command == 2:
+                command = 1
+
+        waypoint_tensor = torch.tensor(waypoints, dtype=torch.float32)
+        command_tensor = torch.tensor(command, dtype=torch.long)
+        recovery_tensor = torch.tensor(recovery_flag, dtype=torch.float32)
+        return stacked_tensor, waypoint_tensor, command_tensor, recovery_tensor
+
+
+class CarlaDataset(Dataset):
+    """Single-frame steering dataset kept for older behavioral-cloning code."""
+
+    def __init__(
+        self,
+        csv_file: str,
+        root_dir: str,
+        transform=None,
+        steering_correction: float = 0.2,
+        is_training: bool = True,
+        filter_stationary: bool = True,
+        min_speed_kmh: float = 1.0,
+        min_wp5_x_m: float = 3.0,
+    ) -> None:
+        self.root_dir = root_dir
+        self.transform = transform
+        self.steering_correction = float(steering_correction)
+        self.is_training = bool(is_training)
+        self.samples: list[tuple[str, float]] = []
+
+        self.data_df = pd.read_csv(csv_file)
+        if filter_stationary:
+            self.data_df = _filter_stationary_rows(
+                self.data_df,
+                min_speed_kmh=float(min_speed_kmh),
+                min_wp5_x_m=float(min_wp5_x_m),
+            )
+        self._prepare_data()
+
+    def _prepare_data(self) -> None:
+        _safe_print("Đang rà soát file ảnh từ 3 camera...")
+        max_steer = 1.0
+
+        for _, row in self.data_df.iterrows():
+            steering = float(row["steering"])
+            image_id = _image_id(row["img_id"])
+            configs = (
+                ("images_center", 0.0),
+                ("images_left", self.steering_correction),
+                ("images_right", -self.steering_correction),
+            )
+
+            for sub_dir, correction in configs:
+                if not self.is_training and sub_dir != "images_center":
+                    continue
+                image_path = os.path.join(self.root_dir, sub_dir, image_id)
+                if os.path.exists(image_path):
+                    self.samples.append((image_path, (steering + correction) / max_steer))
+
+        _safe_print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
+        _safe_print(f"   Steering được chuẩn hóa bằng: MAX_STEER = {max_steer} (symmetric scaling)")
+        if self.is_training:
+            self._balance_steering_distribution()
+
+    def _balance_steering_distribution(self, bins: int = 25, max_per_bin: int | None = None) -> None:
+        if not self.samples:
+            return
+
+        steerings = [steering for _path, steering in self.samples]
+        hist, bin_edges = np.histogram(steerings, bins=bins)
+        if max_per_bin is None:
+            max_per_bin = max(1, int(np.mean(hist)))
+
+        balanced_samples = []
+        bin_counts = {index: 0 for index in range(bins)}
+        random.shuffle(self.samples)
+
+        for image_path, steering in self.samples:
+            bin_idx = min(np.digitize(steering, bin_edges[1:-1]), bins - 1)
+            if bin_counts[bin_idx] < max_per_bin:
+                balanced_samples.append((image_path, steering))
+                bin_counts[bin_idx] += 1
+
+        _safe_print(f"Cân bằng dữ liệu: {len(self.samples)} -> {len(balanced_samples)} mẫu")
+        self.samples = balanced_samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _random_brightness(self, image: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+        ratio = 1.0 + (random.random() - 0.5)
+        hsv[:, :, 2] = np.clip(hsv[:, :, 2] * ratio, 0, 255)
+        return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+
+    def _random_shadow(self, image: np.ndarray) -> np.ndarray:
+        height, width = image.shape[:2]
+        pts = np.array(
+            [
+                [random.randint(0, width), 0],
+                [random.randint(0, width), height],
+                [random.randint(0, width), height],
+                [random.randint(0, width), 0],
+            ],
+            np.int32,
+        )
+        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+        mask = np.zeros_like(hsv[:, :, 2])
+        cv2.fillPoly(mask, [pts], 255)
+        hsv[:, :, 2][mask == 255] = hsv[:, :, 2][mask == 255] * 0.5
+        return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+
+    def _random_translate(
+        self,
+        image: np.ndarray,
+        steering: float,
+        range_x: int = 20,
+        range_y: int = 10,
+    ) -> tuple[np.ndarray, float]:
+        height, width = image.shape[:2]
+        trans_x = range_x * (random.random() - 0.5)
+        trans_y = range_y * (random.random() - 0.5)
+        steering += trans_x * 0.004
+        trans_m = np.float32([[1, 0, trans_x], [0, 1, trans_y]])
+        image = cv2.warpAffine(image, trans_m, (width, height))
+        return image, steering
+
+    def _random_blur(self, image: np.ndarray) -> np.ndarray:
+        kernel_size = random.choice([3, 5])
+        return cv2.GaussianBlur(image, (kernel_size, kernel_size), 0)
+
+    def _random_noise(self, image: np.ndarray) -> np.ndarray:
+        sigma = random.uniform(5, 15)
+        noise = np.random.normal(0, sigma, image.shape).astype(np.float32)
+        return np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    def _random_rotation(
+        self,
+        image: np.ndarray,
+        steering: float,
+        max_angle: float = 5,
+    ) -> tuple[np.ndarray, float]:
         angle = random.uniform(-max_angle, max_angle)
-        h, w = image.shape[:2]
-        M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-        image = cv2.warpAffine(image, M, (w, h))
-        # Xoay ảnh theo chiều kim đồng hồ (angle âm) ≈ xe nghiêng phải → cần lái trái
+        height, width = image.shape[:2]
+        matrix = cv2.getRotationMatrix2D((width / 2, height / 2), angle, 1.0)
+        image = cv2.warpAffine(image, matrix, (width, height))
         steering -= angle * 0.01
         return image, steering
 
-    def _random_contrast(self, image, low=0.7, high=1.3):
-        """
-        Thay đổi contrast ngẫu nhiên.
-
-        Công thức: ``output = clip((pixel - mean) * factor + mean, 0, 255)``
-
-        * ``factor > 1`` → tăng contrast (màu đậm hơn, sáng sáng hơn).
-        * ``factor < 1`` → giảm contrast (ảnh bị "mờ phẳng").
-
-        Mục đích: mô phỏng điều kiện thời tiết khác nhau (sương mù → contrast
-        thấp; nắng gắt → contrast cao).
-
-        Parameters
-        ----------
-        image : np.ndarray
-            Ảnh RGB, shape ``(H, W, 3)``, dtype ``uint8``.
-        low : float, optional
-            Hệ số contrast thấp nhất.  Mặc định ``0.7``.
-        high : float, optional
-            Hệ số contrast cao nhất.  Mặc định ``1.3``.
-
-        Returns
-        -------
-        np.ndarray
-            Ảnh sau khi điều chỉnh contrast, dtype ``uint8``.
-        """
+    def _random_contrast(self, image: np.ndarray, low: float = 0.7, high: float = 1.3) -> np.ndarray:
         factor = random.uniform(low, high)
         mean = np.mean(image, axis=(0, 1), keepdims=True)
-        image = np.clip((image - mean) * factor + mean, 0, 255).astype(np.uint8)
-        return image
-    def _random_cutout(self, image, min_size_ratio=0.1, max_size_ratio=0.3):
-        """
-        Kỹ thuật Cutout Augmentation: Che khuất một vùng chữ nhật ngẫu nhiên.
-        
-        Mục đích: Mô phỏng một vật cản (như xe tải ở khoảng cách 10-30m) 
-        che mất một phần mặt đường, ép mạng CNN phải học cách nhìn các 
-        vạch kẻ đường còn sót lại xung quanh để nội suy góc lái.
-        
-        Parameters
-        ----------
-        image : np.ndarray
-            Ảnh RGB đầu vào.
-        min_size_ratio : float
-            Tỷ lệ cạnh nhỏ nhất của hình chữ nhật so với ảnh (mặc định 10%).
-        max_size_ratio : float
-            Tỷ lệ cạnh lớn nhất của hình chữ nhật so với ảnh (mặc định 30%).
-        """
-        h, w, c = image.shape
+        return np.clip((image - mean) * factor + mean, 0, 255).astype(np.uint8)
 
-        # Random kích thước của "vật cản" (hình chữ nhật đen)
-        cut_h = int(h * random.uniform(min_size_ratio, max_size_ratio))
-        cut_w = int(w * random.uniform(min_size_ratio, max_size_ratio))
-
-        # Random tọa độ tâm của hình chữ nhật
-        # Cho phép hình chữ nhật nằm lấp ló ở các rìa ảnh
-        cy = random.randint(0, h)
-        cx = random.randint(0, w)
-
-        # Tính tọa độ 4 góc, dùng np.clip để không bị văng lỗi out-of-bounds
-        y1 = np.clip(cy - cut_h // 2, 0, h)
-        y2 = np.clip(cy + cut_h // 2, 0, h)
-        x1 = np.clip(cx - cut_w // 2, 0, w)
-        x2 = np.clip(cx + cut_w // 2, 0, w)
-
-        # Tô đen vùng bị cắt (Giá trị 0 tương đương màu đen / bóng tối)
-        # Bạn cũng có thể dùng màu xám trung bình np.mean(image) nếu muốn
+    def _random_cutout(
+        self,
+        image: np.ndarray,
+        min_size_ratio: float = 0.1,
+        max_size_ratio: float = 0.3,
+    ) -> np.ndarray:
+        height, width, _channels = image.shape
+        cut_h = int(height * random.uniform(min_size_ratio, max_size_ratio))
+        cut_w = int(width * random.uniform(min_size_ratio, max_size_ratio))
+        center_y = random.randint(0, height)
+        center_x = random.randint(0, width)
+        y1, y2 = np.clip(center_y - cut_h // 2, 0, height), np.clip(center_y + cut_h // 2, 0, height)
+        x1, x2 = np.clip(center_x - cut_w // 2, 0, width), np.clip(center_x + cut_w // 2, 0, width)
         image[y1:y2, x1:x2, :] = 0
-
         return image
-    def _process_image_and_steering(self, img_path, steering):
-        """
-        Trả về một mẫu dữ liệu đã qua toàn bộ pipeline xử lý.
 
-        Pipeline chi tiết
-        -----------------
-        1. **Đọc ảnh**: ``cv2.imread`` (BGR) → chuyển sang RGB.
-        2. **Crop**: cắt bỏ ~45 % trên cùng của ảnh (trời + chân trời) - phần
-           không chứa thông tin về làn đường.
-        3. **Augmentation** (chỉ khi ``is_training=True``, mỗi bước xác suất
-           độc lập):
-
-           +---+----------------------------+----------+
-           | # | Augmentation               | P(bật)   |
-           +===+============================+==========+
-           | 1 | Random translate           | 0.5      |
-           +---+----------------------------+----------+
-           | 2 | Random brightness          | 0.5      |
-           +---+----------------------------+----------+
-           | 3 | Random shadow              | 0.5      |
-           +---+----------------------------+----------+
-           | 4 | Horizontal flip            | 0.5      |
-           +---+----------------------------+----------+
-           | 5 | Gaussian blur              | 0.5      |
-           +---+----------------------------+----------+
-           | 6 | Gaussian noise             | 0.3      |
-           +---+----------------------------+----------+
-           | 7 | Random rotation            | 0.5      |
-           +---+----------------------------+----------+
-           | 8 | Random contrast            | 0.5      |
-           +---+----------------------------+----------+
-
-        4. **Resize**: 200x66 px (đúng kích thước đầu vào của Nvidia CNN).
-        5. **Colour space**: RGB → YUV (Nvidia CNN được thiết kế cho YUV).
-        6. **Transform**: áp ``self.transform`` nếu có (thường ``ToTensor``
-           để ra tensor ``float32`` trong [0, 1]).
-        7. **Steering clamp**: clip về [-1, 1] rồi bọc trong ``torch.Tensor``.
-
-        Parameters
-        ----------
-        idx : int
-            Chỉ số mẫu trong ``self.samples``.
-
-        Returns
-        -------
-        image : torch.Tensor hoặc np.ndarray
-            Ảnh đã xử lý.  Nếu ``transform`` là ``ToTensor`` thì shape là
-            ``(3, 66, 200)``, dtype ``float32``.
-        steering : torch.Tensor
-            Góc lái scalar, dtype ``float32``, trong [-1, 1].
-        """
-
-        image = cv2.imread(img_path)
+    def _process_image_and_steering(self, image_path: str, steering: float):
+        image = cv2.imread(image_path)
         if image is None:
-            raise FileNotFoundError(f"Khong doc duoc anh dataset: {img_path}")
+            raise FileNotFoundError(f"Khong doc duoc anh dataset: {image_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    
-        height, width, _ = image.shape
-        image = image[int(height * 0.45):, :, :]
+        height = image.shape[0]
+        image = image[int(height * 0.45) :, :, :]
 
-        # 2. DATA AUGMENTATION NGẪU NHIÊN
         if self.is_training:
             if random.random() > 0.5:
                 image, steering = self._random_translate(image, steering)
@@ -581,16 +480,15 @@ class CarlaDataset(Dataset):
             if random.random() > 0.5:
                 image = cv2.flip(image, 1)
                 steering = -steering
-            # --- Augmentation MỚI ---
-            if random.random() > 0.5:                                  # [MỚI #2]
+            if random.random() > 0.5:
                 image = self._random_blur(image)
-            if random.random() > 0.7:                                  # [MỚI #3] xác suất thấp hơn
+            if random.random() > 0.7:
                 image = self._random_noise(image)
-            if random.random() > 0.5:                                  # [MỚI #5]
+            if random.random() > 0.5:
                 image, steering = self._random_rotation(image, steering)
-            if random.random() > 0.5:                                  # [MỚI #8]
+            if random.random() > 0.5:
                 image = self._random_contrast(image)
-            if random.random() > 0.5:                         # Xác suất 50% xuất hiện vật cản che mắt
+            if random.random() > 0.5:
                 image = self._random_cutout(image)
 
         image = cv2.resize(image, (200, 66))
@@ -598,223 +496,113 @@ class CarlaDataset(Dataset):
         if self.transform:
             image = self.transform(image)
 
-        steering = torch.tensor(np.clip(steering, -1.0, 1.0), dtype=torch.float32)
+        steering_tensor = torch.tensor(np.clip(steering, -1.0, 1.0), dtype=torch.float32)
+        return image, steering_tensor
 
-        return image, steering
-    
-    def __getitem__(self, idx):
-        img_path, steering = self.samples[idx]
-        return self._process_image_and_steering(img_path, steering)
+    def __getitem__(self, idx: int):
+        image_path, steering = self.samples[idx]
+        return self._process_image_and_steering(image_path, steering)
 
 
 class CILCarlaDataset(CarlaDataset):
-    """
-    Dataset Phase 2 - Conditional Imitation Learning (CIL).
+    """Single-frame steering dataset with speed and high-level command labels."""
 
-    Kế thừa ``CarlaDataset`` và mở rộng để trả về thêm **vận tốc đã chuẩn
-    hoá** và **lệnh điều hướng cấp cao** bên cạnh ảnh và nhãn góc lái.
-
-    Sự khác biệt so với ``CarlaDataset``
-    -------------------------------------
-    * ``__getitem__`` trả về ``(image, steering, speed, command)`` thay vì
-      ``(image, steering)``.
-    * ``_prepare_data`` lưu ``(img_path, steering, speed_norm, command)``
-      trong mỗi phần tử của ``self.samples``.
-    * ``_balance_steering_distribution`` được ghi đè để làm việc với
-      tuple 4 phần tử thay vì 2.
-    * Vận tốc được chuẩn hoá về [0, 1] bằng cách chia cho
-      ``MAX_SPEED_KMH = 120``.
-
-    Định dạng CSV
-    -------------
-    CSV phải có 6 cột: ``img_id, steering, throttle, brake, speed, command``.
-    Nếu thiếu ``command`` hoặc ``speed``, một cảnh báo sẽ được phát và giá
-    trị mặc định (0) được điền vào - cho phép tải trọng số Phase 1 mà không
-    cần sửa file CSV.
-
-    Lệnh điều hướng
-    ---------------
-    =====================  =====
-    Lệnh                   Index
-    =====================  =====
-    Follow Lane            0
-    Turn Left              1
-    Turn Right             2
-    Go Straight            3
-    =====================  =====
-    """
-
-    # Maximum speed (km/h) used for normalisation. CARLA's default speed limit on
-    # urban roads is 30-90 km/h; 120 km/h provides headroom for highway scenarios
-    # while keeping normalised values comfortably in [0, 1].
     MAX_SPEED_KMH = 120.0
 
-    def __init__(self, csv_file, root_dir, transform=None,
-                 steering_correction=0.2, is_training=True,
-                 filter_stationary=True, min_speed_kmh=1.0,
-                 min_wp5_x_m=3.0):
-        """
-        Khởi tạo CILCarlaDataset.
-
-        Trước khi gọi ``super().__init__``, đọc CSV bằng pandas để kiểm tra
-        sự hiện diện của các cột ``speed`` và ``command``:
-
-        * Nếu thiếu ``command`` → cảnh báo + điền giá trị mặc định ``0``
-          (Follow Lane).
-        * Nếu thiếu ``speed``   → cảnh báo + điền giá trị mặc định ``0.0``.
-
-        DataFrame đã xử lý được lưu vào ``self._raw_df`` để phương thức
-        ``_prepare_data`` (được gọi bên trong ``super().__init__``) có thể
-        truy cập các cột bổ sung này.
-
-        Parameters
-        ----------
-        csv_file : str
-            Đường dẫn file CSV driving log (Phase 2).
-        root_dir : str
-            Thư mục gốc chứa ba thư mục con camera.
-        transform : callable, optional
-            Transform tuỳ chọn áp lên ảnh đã xử lý.
-        steering_correction : float, optional
-            Bù góc lái cho camera trái/phải.  Mặc định ``0.2``.
-        is_training : bool, optional
-            Bật/tắt augmentation và sử dụng 3 camera.  Mặc định ``True``.
-        """
-        # Read the extended CSV *before* calling super().__init__ so that the
-        # speed/command columns are available when _prepare_data runs.
-        self.filter_stationary = bool(filter_stationary)
-        self.min_speed_kmh = float(min_speed_kmh)
-        self.min_wp5_x_m = float(min_wp5_x_m)
-
+    def __init__(
+        self,
+        csv_file: str,
+        root_dir: str,
+        transform=None,
+        steering_correction: float = 0.2,
+        is_training: bool = True,
+        filter_stationary: bool = True,
+        min_speed_kmh: float = 1.0,
+        min_wp5_x_m: float = 3.0,
+    ) -> None:
         raw_df = pd.read_csv(csv_file)
-        if 'command' not in raw_df.columns:
+        if "command" not in raw_df.columns:
             import warnings
+
             warnings.warn(
-                "CSV file does not contain a 'command' column - defaulting all "
-                "commands to 0 (Follow Lane). Add a 'command' column to enable "
-                "full CIL training for Phase 2.",
-                UserWarning, stacklevel=2,
+                "CSV file does not contain a 'command' column; defaulting all "
+                "commands to 0 (Follow Lane).",
+                UserWarning,
+                stacklevel=2,
             )
-            raw_df['command'] = 0
-        if 'speed' not in raw_df.columns:
+            raw_df["command"] = 0
+        if "speed" not in raw_df.columns:
             import warnings
+
             warnings.warn(
-                "CSV file does not contain a 'speed' column - defaulting all "
-                "speeds to 0.0. Add a 'speed' column to enable speed-conditioned "
-                "CIL training for Phase 2.",
-                UserWarning, stacklevel=2,
+                "CSV file does not contain a 'speed' column; defaulting all speeds to 0.0.",
+                UserWarning,
+                stacklevel=2,
             )
-            raw_df['speed'] = 0.0
+            raw_df["speed"] = 0.0
 
-        if self.filter_stationary:
-            raw_df = self._filter_stationary_rows(raw_df)
+        if filter_stationary:
+            raw_df = _filter_stationary_rows(
+                raw_df,
+                min_speed_kmh=float(min_speed_kmh),
+                min_wp5_x_m=float(min_wp5_x_m),
+            )
 
-        # Persist as an attribute that _prepare_data (inside super().__init__)
-        # can also reference.
         self._raw_df = raw_df
-
-        super().__init__(csv_file=csv_file, root_dir=root_dir,
-                         transform=transform,
-                         steering_correction=steering_correction,
-                         is_training=is_training,
-                         filter_stationary=False,
-                         min_speed_kmh=min_speed_kmh,
-                         min_wp5_x_m=min_wp5_x_m)
-        self.filter_stationary = bool(filter_stationary)
+        super().__init__(
+            csv_file=csv_file,
+            root_dir=root_dir,
+            transform=transform,
+            steering_correction=steering_correction,
+            is_training=is_training,
+            filter_stationary=False,
+            min_speed_kmh=min_speed_kmh,
+            min_wp5_x_m=min_wp5_x_m,
+        )
         self.data_df = self._raw_df
 
-    def _prepare_data(self):
-        """
-        Xây dựng ``self.samples`` dưới dạng tuple 4 phần tử
-        ``(img_path, steering, speed_norm, command)``.
-
-        Tương tự ``CarlaDataset._prepare_data`` nhưng đọc thêm ``speed`` và
-        ``command`` từ ``self._raw_df``.  Vận tốc được chuẩn hoá ngay tại
-        đây bằng cách chia cho ``MAX_SPEED_KMH``.
-
-        Thứ tự ưu tiên nguồn dữ liệu:
-
-        1. ``self._raw_df`` - DataFrame đã có cột ``speed`` và ``command``
-           (được tạo trong ``__init__`` của class này).
-        2. ``self.data_df`` - fallback nếu ``_raw_df`` chưa được gán (không
-           nên xảy ra trong luồng bình thường).
-        """
+    def _prepare_data(self) -> None:
         _safe_print("Đang rà soát file ảnh từ 3 camera (CIL mode)...")
+        max_steer = 1.0
+        source_df = self._raw_df if hasattr(self, "_raw_df") else self.data_df
+        self.samples = []
 
-        # Use the raw df that already has 'speed' and 'command'
-        source_df = self._raw_df if hasattr(self, '_raw_df') else self.data_df
-
-        # ✅ SỬ DỤNG HẰNG SỐ VẬT LÝ (SYMMETRIC SCALING)
-        # CARLA max steering angle (physical constant, không phụ thuộc dữ liệu)
-        # Đảm bảo consistency giữa train/val/deploy (FIX 2026-04-14)
-        MAX_STEER = 1.0
-
-        self.samples = []  # reset in case called a second time
         for _, row in source_df.iterrows():
-            steering = float(row['steering'])
-            speed_norm = float(row.get('speed', 0.0)) / self.MAX_SPEED_KMH
-            command = int(row.get('command', 0))
-
-            img_id_str = str(row['img_id']).strip()
-            if '.' in img_id_str:
-                img_id_str = img_id_str.split('.')[0]
-            img_id = img_id_str.zfill(8) + '.jpg'
-
-            configs = [
-                ('images_center', 0.0),
-                ('images_left',  self.steering_correction),
-                ('images_right', -self.steering_correction),
-            ]
+            steering = float(row["steering"])
+            speed_norm = float(row.get("speed", 0.0)) / self.MAX_SPEED_KMH
+            command = int(row.get("command", 0))
+            image_id = _image_id(row["img_id"])
+            configs = (
+                ("images_center", 0.0),
+                ("images_left", self.steering_correction),
+                ("images_right", -self.steering_correction),
+            )
 
             for sub_dir, correction in configs:
-                if not self.is_training and sub_dir != 'images_center':
+                if not self.is_training and sub_dir != "images_center":
                     continue
-                img_path = os.path.join(self.root_dir, sub_dir, img_id)
-                if os.path.exists(img_path):
-                    # ✅ Áp correction TRƯỚC chuẩn hóa để tránh xén dữ liệu
-                    # Sau đó normalize bằng hằng số cố định (không phụ thuộc data)
-                    steering_with_correction = steering + correction
-                    steering_normalized = steering_with_correction / MAX_STEER
+                image_path = os.path.join(self.root_dir, sub_dir, image_id)
+                if os.path.exists(image_path):
                     self.samples.append(
-                        (img_path, steering_normalized, speed_norm, command)
+                        (image_path, (steering + correction) / max_steer, speed_norm, command)
                     )
 
         _safe_print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
-        _safe_print(f"   Steering được chuẩn hóa bằng: MAX_STEER = {MAX_STEER} (symmetric scaling)")
-        _safe_print(f"   Zero point được bảo toàn: 0 / {MAX_STEER} = 0 ✓")
-        
+        _safe_print(f"   Steering được chuẩn hóa bằng: MAX_STEER = {max_steer} (symmetric scaling)")
         if self.is_training:
             self._balance_steering_distribution()
 
-    def _balance_steering_distribution(self, bins=25, max_per_bin=None):
-        """
-        Cân bằng phân phối steering cho các mẫu 4-tuple của CIL dataset.
+    def _balance_steering_distribution(self, bins: int = 25, max_per_bin: int | None = None) -> None:
+        if not self.samples:
+            return
 
-        Ghi đè phiên bản cha vì mỗi phần tử trong ``self.samples`` là
-        tuple ``(img_path, steering, speed_norm, command)`` thay vì
-        tuple 2 phần tử.
-
-        Thuật toán giống hệt ``CarlaDataset._balance_steering_distribution``:
-        histogram → tính ``max_per_bin`` → shuffle → giữ lại tối đa
-        ``max_per_bin`` mẫu mỗi bin.
-
-        Parameters
-        ----------
-        bins : int, optional
-            Số bin phân phối steering.  Mặc định ``25``.
-        max_per_bin : int, optional
-            Ngưỡng tối đa mẫu mỗi bin.  Nếu ``None`` dùng
-            ``int(mean(histogram))``.
-        """
-        steerings = [s for _, s, _, _ in self.samples]
+        steerings = [steering for _path, steering, _speed, _command in self.samples]
         hist, bin_edges = np.histogram(steerings, bins=bins)
-
         if max_per_bin is None:
-            max_per_bin = int(np.mean(hist))
+            max_per_bin = max(1, int(np.mean(hist)))
 
         balanced_samples = []
-        bin_counts = {i: 0 for i in range(bins)}
-
+        bin_counts = {index: 0 for index in range(bins)}
         random.shuffle(self.samples)
 
         for sample in self.samples:
@@ -824,44 +612,12 @@ class CILCarlaDataset(CarlaDataset):
                 balanced_samples.append(sample)
                 bin_counts[bin_idx] += 1
 
-        _safe_print(f"Cân bằng dữ liệu: {len(self.samples)} → {len(balanced_samples)} mẫu")
+        _safe_print(f"Cân bằng dữ liệu: {len(self.samples)} -> {len(balanced_samples)} mẫu")
         self.samples = balanced_samples
-        _safe_print(f"Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
 
-    def __getitem__(self, idx):
-        """
-        Trả về một mẫu dữ liệu CIL đã qua toàn bộ pipeline xử lý.
-
-        Pipeline xử lý ảnh giống hệt ``CarlaDataset.__getitem__`` (crop,
-        augmentation, resize 200x66, chuyển YUV, transform).  Ngoài ra còn
-        đóng gói **vận tốc** và **lệnh điều hướng** thành tensor.
-
-        Parameters
-        ----------
-        idx : int
-            Chỉ số mẫu trong ``self.samples``.
-
-        Returns
-        -------
-        image : torch.Tensor hoặc np.ndarray
-            Ảnh đã xử lý, shape ``(3, 66, 200)`` nếu dùng ``ToTensor``.
-        steering : torch.Tensor
-            Góc lái scalar, dtype ``float32``, trong [-1, 1].
-        speed : torch.Tensor
-            Vận tốc đã chuẩn hoá, scalar, dtype ``float32``, trong [0, 1].
-        command : torch.Tensor
-            Lệnh điều hướng, scalar, dtype ``long`` (int64).
-            Giá trị hợp lệ: 0 (Follow Lane), 1 (Turn Left),
-            2 (Turn Right), 3 (Go Straight).
-        """
-        # 1. Lấy thông tin từ tuple 4 phần tử
-        img_path, steering, speed_norm, command = self.samples[idx]
-
-        # 2. Nhờ hàm của lớp cha xử lý giùm phần Ảnh và Vô lăng
-        image, steering_tensor = self._process_image_and_steering(img_path, steering)
-
-        # 3. Chỉ tập trung xử lý phần mở rộng (Speed và Command)
-        speed = torch.tensor(speed_norm, dtype=torch.float32)
-        command = torch.tensor(command, dtype=torch.long)
-
-        return image, steering_tensor, speed, command
+    def __getitem__(self, idx: int):
+        image_path, steering, speed_norm, command = self.samples[idx]
+        image, steering_tensor = self._process_image_and_steering(image_path, steering)
+        speed_tensor = torch.tensor(speed_norm, dtype=torch.float32)
+        command_tensor = torch.tensor(command, dtype=torch.long)
+        return image, steering_tensor, speed_tensor, command_tensor
