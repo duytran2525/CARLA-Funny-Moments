@@ -54,7 +54,16 @@ def _audit_town(town_dir: Path) -> bool:
 
     suspicious_turns = 0
     turn_without_junction = 0
+    stationary_filter_candidates = 0
     for row in rows:
+        try:
+            speed = float(row.get("speed", "nan"))
+            wp5_x = float(row.get("wp_5_x", "nan"))
+            if speed < 1.0 and wp5_x < 3.0:
+                stationary_filter_candidates += 1
+        except ValueError:
+            pass
+
         if row.get("command") not in {"1", "2"}:
             continue
         try:
@@ -68,6 +77,11 @@ def _audit_town(town_dir: Path) -> bool:
         print(f"{town_dir.name}: suspicious_turn_commands={suspicious_turns} (turn command with |wp_5_y| < 1m)")
     if turn_without_junction:
         print(f"{town_dir.name}: turn_without_junction_ahead={turn_without_junction}")
+    if stationary_filter_candidates:
+        print(
+            f"{town_dir.name}: stationary_filter_candidates={stationary_filter_candidates} "
+            "(speed < 1 km/h and wp_5_x < 3m)"
+        )
 
     return not (missing_center or missing_left or missing_right)
 

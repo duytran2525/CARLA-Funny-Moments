@@ -1,10 +1,23 @@
 import os
+import sys
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
 import cv2
 import random
 import numpy as np
+
+
+def _safe_print(message=""):
+    try:
+        print(message)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        safe_message = str(message).encode(encoding, errors="replace").decode(
+            encoding,
+            errors="replace",
+        )
+        print(safe_message)
 
 
 class CarlaDataset(Dataset):
@@ -62,7 +75,9 @@ class CarlaDataset(Dataset):
     """
 
     def __init__(self, csv_file, root_dir, transform=None,
-                 steering_correction=0.2, is_training=True):
+                 steering_correction=0.2, is_training=True,
+                 filter_stationary=True, min_speed_kmh=1.0,
+                 min_wp5_x_m=3.0):
         """
         Khởi tạo CarlaDataset và xây dựng danh sách mẫu.
 
@@ -84,13 +99,42 @@ class CarlaDataset(Dataset):
         is_training : bool, optional
             Kích hoạt augmentation và dùng 3 camera.  Mặc định ``True``.
         """
-        self.data_df = pd.read_csv(csv_file)
         self.root_dir = root_dir
         self.transform = transform
         self.steering_correction = steering_correction
         self.is_training = is_training
+        self.filter_stationary = bool(filter_stationary)
+        self.min_speed_kmh = float(min_speed_kmh)
+        self.min_wp5_x_m = float(min_wp5_x_m)
         self.samples = []
+
+        self.data_df = pd.read_csv(csv_file)
+        if self.filter_stationary:
+            self.data_df = self._filter_stationary_rows(self.data_df)
+
         self._prepare_data()
+
+    def _filter_stationary_rows(self, data_df):
+        """Drop stopped samples whose future trajectory barely moves forward."""
+        required_columns = {"speed", "wp_5_x"}
+        if not required_columns.issubset(set(data_df.columns)):
+            return data_df
+
+        speed = pd.to_numeric(data_df["speed"], errors="coerce")
+        wp5_x = pd.to_numeric(data_df["wp_5_x"], errors="coerce")
+        stationary_mask = (speed < self.min_speed_kmh) & (wp5_x < self.min_wp5_x_m)
+        dropped = int(stationary_mask.sum())
+        if dropped <= 0:
+            return data_df
+
+        kept_df = data_df.loc[~stationary_mask].reset_index(drop=True)
+        _safe_print(
+            "Stationary filter: "
+            f"{len(data_df)} -> {len(kept_df)} rows "
+            f"(dropped {dropped}, speed < {self.min_speed_kmh:.1f} km/h "
+            f"and wp_5_x < {self.min_wp5_x_m:.1f} m)"
+        )
+        return kept_df
 
     def _prepare_data(self):
         """
@@ -113,7 +157,7 @@ class CarlaDataset(Dataset):
         - Giải quyết: Zero point loss (Issue #3)  
         - Giải quyết: Clipping data loss (Issue #2)
         """
-        print("Đang rà soát file ảnh từ 3 camera...")
+        _safe_print("Đang rà soát file ảnh từ 3 camera...")
         
         # ✅ SỬ DỤNG HẰNG SỐ VẬT LÝ (SYMMETRIC SCALING)
         # CARLA max steering angle (physical constant, không phụ thuộc dữ liệu)
@@ -145,9 +189,9 @@ class CarlaDataset(Dataset):
                     steering_normalized = steering_with_correction / MAX_STEER
                     self.samples.append((img_path, steering_normalized))
 
-        print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
-        print(f"   Steering được chuẩn hóa bằng: MAX_STEER = {MAX_STEER} (symmetric scaling)")
-        print(f"   Zero point được bảo toàn: 0 / {MAX_STEER} = 0 ✓")
+        _safe_print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
+        _safe_print(f"   Steering được chuẩn hóa bằng: MAX_STEER = {MAX_STEER} (symmetric scaling)")
+        _safe_print(f"   Zero point được bảo toàn: 0 / {MAX_STEER} = 0 ✓")
         if self.is_training:
             self._balance_steering_distribution()
 
@@ -196,10 +240,10 @@ class CarlaDataset(Dataset):
                 balanced_samples.append((img_path, steering))
                 bin_counts[bin_idx] += 1
 
-        print(f"Cân bằng dữ liệu: {len(self.samples)} → {len(balanced_samples)} mẫu")
+        _safe_print(f"Cân bằng dữ liệu: {len(self.samples)} → {len(balanced_samples)} mẫu")
         self.samples = balanced_samples
 
-        print(f"Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
+        _safe_print(f"Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
 
     def __len__(self):
         """Trả về tổng số mẫu trong dataset sau khi đã cân bằng."""
@@ -606,7 +650,9 @@ class CILCarlaDataset(CarlaDataset):
     MAX_SPEED_KMH = 120.0
 
     def __init__(self, csv_file, root_dir, transform=None,
-                 steering_correction=0.2, is_training=True):
+                 steering_correction=0.2, is_training=True,
+                 filter_stationary=True, min_speed_kmh=1.0,
+                 min_wp5_x_m=3.0):
         """
         Khởi tạo CILCarlaDataset.
 
@@ -636,6 +682,10 @@ class CILCarlaDataset(CarlaDataset):
         """
         # Read the extended CSV *before* calling super().__init__ so that the
         # speed/command columns are available when _prepare_data runs.
+        self.filter_stationary = bool(filter_stationary)
+        self.min_speed_kmh = float(min_speed_kmh)
+        self.min_wp5_x_m = float(min_wp5_x_m)
+
         raw_df = pd.read_csv(csv_file)
         if 'command' not in raw_df.columns:
             import warnings
@@ -656,6 +706,9 @@ class CILCarlaDataset(CarlaDataset):
             )
             raw_df['speed'] = 0.0
 
+        if self.filter_stationary:
+            raw_df = self._filter_stationary_rows(raw_df)
+
         # Persist as an attribute that _prepare_data (inside super().__init__)
         # can also reference.
         self._raw_df = raw_df
@@ -663,7 +716,12 @@ class CILCarlaDataset(CarlaDataset):
         super().__init__(csv_file=csv_file, root_dir=root_dir,
                          transform=transform,
                          steering_correction=steering_correction,
-                         is_training=is_training)
+                         is_training=is_training,
+                         filter_stationary=False,
+                         min_speed_kmh=min_speed_kmh,
+                         min_wp5_x_m=min_wp5_x_m)
+        self.filter_stationary = bool(filter_stationary)
+        self.data_df = self._raw_df
 
     def _prepare_data(self):
         """
@@ -681,7 +739,7 @@ class CILCarlaDataset(CarlaDataset):
         2. ``self.data_df`` - fallback nếu ``_raw_df`` chưa được gán (không
            nên xảy ra trong luồng bình thường).
         """
-        print("Đang rà soát file ảnh từ 3 camera (CIL mode)...")
+        _safe_print("Đang rà soát file ảnh từ 3 camera (CIL mode)...")
 
         # Use the raw df that already has 'speed' and 'command'
         source_df = self._raw_df if hasattr(self, '_raw_df') else self.data_df
@@ -721,9 +779,9 @@ class CILCarlaDataset(CarlaDataset):
                         (img_path, steering_normalized, speed_norm, command)
                     )
 
-        print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
-        print(f"   Steering được chuẩn hóa bằng: MAX_STEER = {MAX_STEER} (symmetric scaling)")
-        print(f"   Zero point được bảo toàn: 0 / {MAX_STEER} = 0 ✓")
+        _safe_print(f"✅ Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
+        _safe_print(f"   Steering được chuẩn hóa bằng: MAX_STEER = {MAX_STEER} (symmetric scaling)")
+        _safe_print(f"   Zero point được bảo toàn: 0 / {MAX_STEER} = 0 ✓")
         
         if self.is_training:
             self._balance_steering_distribution()
@@ -766,9 +824,9 @@ class CILCarlaDataset(CarlaDataset):
                 balanced_samples.append(sample)
                 bin_counts[bin_idx] += 1
 
-        print(f"Cân bằng dữ liệu: {len(self.samples)} → {len(balanced_samples)} mẫu")
+        _safe_print(f"Cân bằng dữ liệu: {len(self.samples)} → {len(balanced_samples)} mẫu")
         self.samples = balanced_samples
-        print(f"Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
+        _safe_print(f"Hoàn tất! Tổng số mẫu hợp lệ: {len(self.samples)}")
 
     def __getitem__(self, idx):
         """
