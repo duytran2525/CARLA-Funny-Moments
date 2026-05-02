@@ -155,7 +155,8 @@ class TrafficSupervisor:
         self.config.setdefault('tracking_patience_seconds', 0.3)
         self.config.setdefault('tracking_max_lead_decel_ms2', 8.0)
         self.config.setdefault('tracking_max_physical_accel_ms2', 10.0)
-        self.config.setdefault('stop_line_confirm_frames', 2)
+        self.config.setdefault('stop_line_confirm_frames', 1)
+        self.config.setdefault('red_stopline_trigger_distance_m', 7.0)
         self.config.setdefault('safe_distance_urban_m', 20.0)
         self.config.setdefault('safe_distance_rural_right_m', 10.0)
         self.config.setdefault('safe_distance_default_m', 15.0)
@@ -1483,7 +1484,22 @@ class TrafficSupervisor:
         if self.phantom_immunity_counter > 0:
           obstacle = None
 
-        # Step 2: Resolve braking target (stop_line priority)
+        # Step 2: Hard rule for traffic signal:
+        # red light in valid ROI + nearest stop line <= trigger distance => brake immediately.
+        if red_light is not None and stop_lines:
+            nearest_stop = min(stop_lines, key=lambda s: float(s.distance))
+            trigger_distance_m = float(self.config.get('red_stopline_trigger_distance_m', 7.0))
+            if np.isfinite(float(nearest_stop.distance)) and float(nearest_stop.distance) <= trigger_distance_m:
+                confirm_frames = max(1, int(self.config.get('stop_line_confirm_frames', 1)))
+                self.stop_line_confirm_count = max(self.stop_line_confirm_count, confirm_frames)
+                self._last_selected_target_type = 'stop_line'
+                return True, 1.0
+
+        # No red-light distance braking fallback:
+        # outside the hard stop_line trigger rule, red lights alone do not command braking.
+        red_light = None
+
+        # Step 3: Resolve braking target (obstacle-focused for remaining flow)
         target, target_type, _use_fallback = self._resolve_braking_target(
             red_light, obstacle, stop_lines
         )
@@ -1496,18 +1512,18 @@ class TrafficSupervisor:
         # Convert current speed to m/s
         current_speed_ms = current_speed  # Already in m/s from supervisor
         
-        # Step 3: Compute urgency (TTC-aware)
+        # Step 4: Compute urgency (TTC-aware)
         urgency = self._compute_collision_urgency(
             target, target_type, current_speed_ms
         )
         
-        # Step 4: confidence gate (keep continuous urgency for V10)
+        # Step 5: confidence gate (keep continuous urgency for V10)
         confidence_scale = 1.0
         if target.confidence < 0.35:
           confidence_scale = 0.8
         final_urgency = float(np.clip(urgency * confidence_scale, 0.0, 1.0))
         
-        # Step 5: Decision threshold
+        # Step 6: Decision threshold
         should_brake = final_urgency > 0.2  # Threshold for braking
         
         return should_brake, final_urgency

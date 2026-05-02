@@ -5325,10 +5325,35 @@ class YoloDetectAgent(BaseAgent):
                 pass
 
             nav_control = self._nav_agent.run_step()
-            vehicle.apply_control(nav_control)
-            display_steer = float(nav_control.steer)
-            display_throttle = float(nav_control.throttle)
-            display_brake = float(nav_control.brake)
+            final_control = nav_control
+
+            # IMPORTANT: supervisor brake must override planner throttle/brake.
+            if is_emergency or supervisor_brake > 0.0:
+                emergency_floor = 0.6 if is_emergency else 0.45
+                final_control = carla.VehicleControl()
+                final_control.steer = float(nav_control.steer)
+                final_control.throttle = 0.0
+                final_control.brake = float(
+                    clamp(
+                        max(float(nav_control.brake), float(supervisor_brake), float(emergency_floor)),
+                        0.0,
+                        1.0,
+                    )
+                )
+                final_control.hand_brake = False
+                logging.debug(
+                    "[TICK %d] Supervisor override planner control: emergency=%s supervisor_brake=%.2f planner_brake=%.2f final_brake=%.2f",
+                    step_idx,
+                    bool(is_emergency),
+                    float(supervisor_brake),
+                    float(nav_control.brake),
+                    float(final_control.brake),
+                )
+
+            vehicle.apply_control(final_control)
+            display_steer = float(final_control.steer)
+            display_throttle = float(final_control.throttle)
+            display_brake = float(final_control.brake)
 
         # ─────────────────────────────────────────────────────────
         # Step 6: Prepare Annotation Frame
