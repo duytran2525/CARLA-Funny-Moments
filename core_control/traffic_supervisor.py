@@ -123,8 +123,10 @@ class TrafficSupervisor:
         self.path_curve_width_gain = 0.55
         self.path_max_half_width_m = 2.8
         self.path_min_forward_m = 0.8
-        self.path_max_forward_m = 35.0
-        self.path_horizon_scale = 0.82
+        self.path_max_forward_m = 55.0
+        self.path_horizon_base_m = 10.0
+        self.path_horizon_speed_gain = 0.90
+        self.path_horizon_steer_gain = 4.0
         self.obstacle_base_distance_m = 8.0
         self.obstacle_stop_min_distance_m = 5.5
         self.obstacle_stop_max_distance_m = 18.0
@@ -155,8 +157,15 @@ class TrafficSupervisor:
         self.config.setdefault('tracking_patience_seconds', 0.3)
         self.config.setdefault('tracking_max_lead_decel_ms2', 8.0)
         self.config.setdefault('tracking_max_physical_accel_ms2', 10.0)
+        self.config.setdefault('turn_suppress_steer_threshold', 0.16)
+        self.config.setdefault('turn_hold_frames', 30)
+        self.config.setdefault('turn_grace_frames', 45)
         self.config.setdefault('stop_line_confirm_frames', 1)
         self.config.setdefault('red_stopline_trigger_distance_m', 7.0)
+        self.config.setdefault('rural_red_trigger_distance_m', 8.0)
+        self.config.setdefault('obstacle_linear_full_brake_distance_m', 6.0)
+        self.config.setdefault('obstacle_linear_max_brake', 0.5)
+        self.config.setdefault('obstacle_linear_zero_brake_distance_m', 18.0)
         self.config.setdefault('safe_distance_urban_m', 20.0)
         self.config.setdefault('safe_distance_rural_right_m', 10.0)
         self.config.setdefault('safe_distance_default_m', 15.0)
@@ -228,6 +237,12 @@ class TrafficSupervisor:
             "in_path_count": 0,
             "trigger_candidate": None,
         }
+        self._last_obstacle_linear_brake = 0.0
+        self._obstacle_direct_brake_active = False
+        self._green_release_active = False
+        self._green_release_zone = None
+        self._force_signal_brake_active = False
+        self._force_signal_brake_target = None
         
         # ─────────────────────────────────────────────────────────
         # DEBUG INFO
@@ -465,24 +480,16 @@ class TrafficSupervisor:
       # ─────────────────────────────────────────────────────────
       # Bước 2: Xác định Horizon dựa trên Speed
       # ─────────────────────────────────────────────────────────
-      # Horizon = base + speed-dependent term (soft-saturating).
-      # Old linear rule (2.2 * m/s + 8) stretched too far at high speed.
-      horizon_m = max(self.path_min_forward_m + 2.0, 12.0)
+      # Horizon now grows directly with speed (linear model) so the corridor
+      # deformation tracks vehicle speed instead of early saturation.
+      horizon_m = max(self.path_min_forward_m + 2.0, self.path_horizon_base_m)
       if vehicle_speed_kmh is not None:
           speed_mps = max(0.0, float(vehicle_speed_kmh) / 3.6)
-          # Smooth growth: rises quickly at low speed, then saturates.
-          # At ~0 m/s  -> ~12 m
-          # At ~30 km/h -> ~16 m
-          # At high speed -> approaches ~22 m (before global clamp)
-          speed_term = 10.0 * (1.0 - math.exp(-speed_mps / 3.5))
-          horizon_m = max(horizon_m, 12.0 + speed_term)
-      horizon_m = min(horizon_m, self.path_max_forward_m)
-      # Keep obstacle corridor shorter in both logic and visualization.
-      # This scales the effective forward horizon before polygon sampling.
-      horizon_m = max(
-          self.path_min_forward_m + 2.0,
-          min(self.path_max_forward_m, horizon_m * float(self.path_horizon_scale)),
-      )
+          steer_mag = min(1.0, abs(float(vehicle_steer)))
+          horizon_m = self.path_horizon_base_m + (self.path_horizon_speed_gain * speed_mps) + (
+              self.path_horizon_steer_gain * steer_mag
+          )
+      horizon_m = max(self.path_min_forward_m + 2.0, min(horizon_m, self.path_max_forward_m))
       
       # ─────────────────────────────────────────────────────────
       # Bước 3: Sample Points trong Vehicle-Space
@@ -901,7 +908,10 @@ class TrafficSupervisor:
         """
         red_light = None
         red_light_zone: Optional[str] = None
+        best_red_by_zone: Dict[str, DetectionResult] = {}
         best_green_by_zone: Dict[str, DetectionResult] = {}
+        self._green_release_active = False
+        self._green_release_zone = None
         obstacle_candidates: List[DetectionResult] = []
         stop_lines = []
         if danger_polygon is None:
@@ -928,33 +938,18 @@ class TrafficSupervisor:
                 if zone is None:
                     continue
 
-                preferred_zone = self.locked_zone if self.locked_zone in ('urban', 'rural_right') else 'urban'
-                zone_priority = 1 if zone == preferred_zone else 0
-                candidate_key = (zone_priority, confidence, -distance)
-
-                if red_light is None:
-                    red_light = DetectionResult(
-                        class_name='traffic_light_red',
-                        confidence=confidence,
-                        bbox=bbox,
-                        distance=distance,
-                        signal_score=None  # Will compute later
-                    )
-                    red_light.relative_velocity_kmh = relative_velocity_kmh
-                    red_light_zone = zone
-                else:
-                    current_zone_priority = 1 if red_light_zone == preferred_zone else 0
-                    current_key = (current_zone_priority, red_light.confidence, -float(red_light.distance))
-                    if candidate_key > current_key:
-                        red_light = DetectionResult(
-                            class_name='traffic_light_red',
-                            confidence=confidence,
-                            bbox=bbox,
-                            distance=distance,
-                            signal_score=None
-                        )
-                        red_light.relative_velocity_kmh = relative_velocity_kmh
-                        red_light_zone = zone
+                red_det = DetectionResult(
+                    class_name='traffic_light_red',
+                    confidence=confidence,
+                    bbox=bbox,
+                    distance=distance,
+                    signal_score=None
+                )
+                red_det.relative_velocity_kmh = relative_velocity_kmh
+                red_det.roi_zone = zone
+                existing_red = best_red_by_zone.get(zone)
+                if existing_red is None or confidence > existing_red.confidence:
+                    best_red_by_zone[zone] = red_det
 
             # ┌─ Classification: Green traffic lights (for same-frame arbitration)
             elif class_name in ['traffic_light_green', 'green_light'] and confidence > 0.3:
@@ -970,6 +965,7 @@ class TrafficSupervisor:
                         distance=distance,
                         signal_score=None
                     )
+                    green_det.roi_zone = zone
                     best_green_by_zone[zone] = green_det
             
             # ┌─ Phân loại: Chướng ngại (Vehicle/Pedestrian)
@@ -1002,15 +998,51 @@ class TrafficSupervisor:
                     )
                     stop_lines.append(stop_line_det)
         
-        # Green-vs-red arbitration (same frame):
-        # If a reliable urban green is visible, suppress rural red to avoid false stops at intersections.
+        # ROI policy: urban signal has absolute priority over rural.
+        # - If any urban signal exists (green OR red), ignore rural.
+        # - If no urban signal, follow rural signal.
+        urban_red = best_red_by_zone.get('urban')
         urban_green = best_green_by_zone.get('urban')
-        if red_light is not None and red_light_zone == 'rural_right' and urban_green is not None:
-            green_margin = 0.05
-            if float(urban_green.confidence) >= float(red_light.confidence) + green_margin:
+        rural_red = best_red_by_zone.get('rural_right')
+        rural_green = best_green_by_zone.get('rural_right')
+
+        if urban_red is not None or urban_green is not None:
+            if urban_red is not None and urban_green is not None:
+                # Same-zone conflict resolution (urban only): choose by confidence margin.
+                green_margin = 0.05
+                if float(urban_green.confidence) >= float(urban_red.confidence) + green_margin:
+                    red_light = None
+                    red_light_zone = None
+                    self._green_release_active = True
+                    self._green_release_zone = 'urban'
+                else:
+                    red_light = urban_red
+                    red_light_zone = 'urban'
+            elif urban_red is not None:
+                red_light = urban_red
+                red_light_zone = 'urban'
+            else:
                 red_light = None
                 red_light_zone = None
-                self.green_immunity_counter = max(self.green_immunity_counter, 8)
+                self._green_release_active = True
+                self._green_release_zone = 'urban'
+        else:
+            if rural_red is not None:
+                red_light = rural_red
+                red_light_zone = 'rural_right'
+            elif rural_green is not None:
+                red_light = None
+                red_light_zone = None
+                self._green_release_active = True
+                self._green_release_zone = 'rural_right'
+
+        if self._green_release_active:
+            self.red_confirmed = False
+            self.red_confirm_count = 0
+            self.red_hold_count = 0
+            self.red_release_count = 0
+            self.stop_line_confirm_count = 0
+            self.green_immunity_counter = 0
 
         # Update zone locking state (using red_light)
         if red_light:
@@ -1173,8 +1205,9 @@ class TrafficSupervisor:
             ↓ (turn_grace_counter ≥ 30)
           NORMAL
         """
-        hold_frames = 18
-        grace_frames = 30
+        hold_frames = max(1, int(self.config.get('turn_hold_frames', 30)))
+        grace_frames = max(1, int(self.config.get('turn_grace_frames', 45)))
+        steer_threshold = float(self.config.get('turn_suppress_steer_threshold', 0.16))
 
         if vehicle_steer is None:
             self.in_turn_phase = False
@@ -1182,7 +1215,7 @@ class TrafficSupervisor:
             self.turn_grace_counter = 0
             return
 
-        if abs(vehicle_steer) >= 0.22:
+        if abs(vehicle_steer) >= steer_threshold:
             # Refresh suppression while steering remains in turning regime.
             self.in_turn_phase = True
             self.turn_hold_counter = hold_frames
@@ -1450,6 +1483,66 @@ class TrafficSupervisor:
                 min(self.obstacle_stop_max_distance_m, dynamic_threshold),
             )
         )
+
+    def _compute_obstacle_linear_brake(
+        self,
+        detections: List[dict],
+        danger_polygon: Optional[np.ndarray],
+    ) -> float:
+        """Hard obstacle brake rule from in-path distance with linear profile."""
+        if not detections or danger_polygon is None:
+            self._last_obstacle_linear_brake = 0.0
+            return 0.0
+
+        obstacle_classes = {
+            "vehicle",
+            "pedestrian",
+            "two_wheeler",
+            "car",
+            "truck",
+            "person",
+        }
+        min_distance_m = float("inf")
+        in_path_count = 0
+
+        for det in detections:
+            class_name = str(det.get("class_name", "")).strip().lower()
+            if class_name not in obstacle_classes:
+                continue
+
+            bbox = det.get("bbox")
+            if bbox is None or len(bbox) < 4:
+                continue
+            x, y, w, h = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+            bottom_center = (int(x + w / 2.0), int(y + h))
+            if not self._point_in_polygon(bottom_center, danger_polygon):
+                continue
+
+            in_path_count += 1
+            distance_m = float(det.get("distance_m", float("inf")))
+            if not np.isfinite(distance_m):
+                distance_m = self._estimate_distance_from_bbox((x, y, w, h))
+            min_distance_m = min(min_distance_m, float(distance_m))
+
+        if in_path_count <= 0 or not np.isfinite(min_distance_m):
+            self._last_obstacle_linear_brake = 0.0
+            return 0.0
+
+        full_brake_dist = float(self.config.get("obstacle_linear_full_brake_distance_m", 6.0))
+        linear_max_brake = float(self.config.get("obstacle_linear_max_brake", 0.5))
+        zero_brake_dist = float(self.config.get("obstacle_linear_zero_brake_distance_m", 18.0))
+        zero_brake_dist = max(full_brake_dist + 0.1, zero_brake_dist)
+
+        if min_distance_m <= full_brake_dist:
+            brake = 1.0
+        elif min_distance_m >= zero_brake_dist:
+            brake = 0.0
+        else:
+            ratio = (zero_brake_dist - min_distance_m) / (zero_brake_dist - full_brake_dist)
+            brake = linear_max_brake * float(np.clip(ratio, 0.0, 1.0))
+
+        self._last_obstacle_linear_brake = float(np.clip(brake, 0.0, 1.0))
+        return self._last_obstacle_linear_brake
     
     def _should_brake(self,
                      red_light: Optional[DetectionResult],
@@ -1472,9 +1565,15 @@ class TrafficSupervisor:
           4. Apply confidence ramp
           5. Return should_brake + urgency
         """
-        # Step 1: Turn suppression
+        self._force_signal_brake_active = False
+        self._force_signal_brake_target = None
+
+        # Step 1: Turn suppression for traffic signal only.
+        # Keep obstacle logic active while turning for safety.
         if self.in_turn_phase:
-            return False, 0.0
+            if red_light is not None or (stop_lines is not None and len(stop_lines) > 0):
+                red_light = None
+                stop_lines = []
 
         # Bug 1 fix: during green immunity, ignore transient red-light detections
         if self.green_immunity_counter > 0 and red_light is not None:
@@ -1484,19 +1583,41 @@ class TrafficSupervisor:
         if self.phantom_immunity_counter > 0:
           obstacle = None
 
-        # Step 2: Hard rule for traffic signal:
-        # red light in valid ROI + nearest stop line <= trigger distance => brake immediately.
-        if red_light is not None and stop_lines:
-            nearest_stop = min(stop_lines, key=lambda s: float(s.distance))
-            trigger_distance_m = float(self.config.get('red_stopline_trigger_distance_m', 7.0))
-            if np.isfinite(float(nearest_stop.distance)) and float(nearest_stop.distance) <= trigger_distance_m:
-                confirm_frames = max(1, int(self.config.get('stop_line_confirm_frames', 1)))
-                self.stop_line_confirm_count = max(self.stop_line_confirm_count, confirm_frames)
-                self._last_selected_target_type = 'stop_line'
-                return True, 1.0
+        # Green release override (ROI policy):
+        # - If urban has green, release red-stop immediately.
+        # - If urban has no signal and rural has green, also release.
+        # Keep obstacle handling intact.
+        if self._green_release_active:
+            red_light = None
+            stop_lines = []
 
-        # No red-light distance braking fallback:
-        # outside the hard stop_line trigger rule, red lights alone do not command braking.
+        # Step 2: Hard rules for traffic signal with ROI priority policy:
+        # - urban red: brake immediately when nearest stop_line <= 7m
+        # - rural red (only when no urban signal): brake when red_light distance <= 8m
+        if red_light is not None and stop_lines:
+            roi_zone = getattr(red_light, 'roi_zone', None)
+            if roi_zone == 'urban':
+                nearest_stop = min(stop_lines, key=lambda s: float(s.distance))
+                trigger_distance_m = float(self.config.get('red_stopline_trigger_distance_m', 7.0))
+                if np.isfinite(float(nearest_stop.distance)) and float(nearest_stop.distance) <= trigger_distance_m:
+                    confirm_frames = max(1, int(self.config.get('stop_line_confirm_frames', 1)))
+                    self.stop_line_confirm_count = max(self.stop_line_confirm_count, confirm_frames)
+                    self._last_selected_target_type = 'stop_line'
+                    self._force_signal_brake_active = True
+                    self._force_signal_brake_target = 'stop_line'
+                    return True, 1.0
+
+        if red_light is not None:
+            roi_zone = getattr(red_light, 'roi_zone', None)
+            if roi_zone == 'rural_right':
+                rural_trigger_m = float(self.config.get('rural_red_trigger_distance_m', 8.0))
+                if np.isfinite(float(red_light.distance)) and float(red_light.distance) <= rural_trigger_m:
+                    self._last_selected_target_type = 'red_light'
+                    self._force_signal_brake_active = True
+                    self._force_signal_brake_target = 'red_light'
+                    return True, 1.0
+
+        # Outside the hard ROI-specific trigger rules, red lights alone do not command braking.
         red_light = None
 
         # Step 3: Resolve braking target (obstacle-focused for remaining flow)
@@ -1624,7 +1745,9 @@ class TrafficSupervisor:
         stop_line_consensus = self.stop_line_confirm_count >= stop_line_confirm_frames
 
         # Respect Layer-2 physical decision first, then apply temporal gate by target type.
-        if not should_brake_raw:
+        if should_brake_raw and self._force_signal_brake_active:
+          final_brake = True
+        elif not should_brake_raw:
           final_brake = False
         elif target_type == 'stop_line':
           final_brake = stop_line_consensus
@@ -1933,6 +2056,18 @@ class TrafficSupervisor:
             obstacle=obstacle,
         )
 
+        # Hard obstacle stop rule: evaluate all in-path objects every frame.
+        obstacle_linear_brake = self._compute_obstacle_linear_brake(
+            detections=detections,
+            danger_polygon=danger_polygon,
+        )
+        if obstacle_linear_brake > 0.0:
+            should_brake = True
+            prev_brake_conf = float(brake_conf)
+            brake_conf = max(brake_conf, float(obstacle_linear_brake))
+            if brake_conf <= float(obstacle_linear_brake) + 1e-6 and prev_brake_conf <= float(obstacle_linear_brake) + 1e-6:
+                self._last_selected_target_type = 'obstacle'
+
          # Layer 4: resume validation when in STOPPING/STOPPED/RESUMING states.
         if self.state in (SupervisorState.STOPPING, SupervisorState.STOPPED, SupervisorState.RESUMING):
             can_resume = self._can_resume(
@@ -1958,7 +2093,28 @@ class TrafficSupervisor:
             target_brake = max(target_brake, 0.5)
 
         # Layer 5: fail-safe + jerk limiter.
-        final_brake = self._apply_failsafe(brake_force=target_brake, dt=dt)
+        # Hard obstacle-linear channel is applied directly to satisfy exact braking law:
+        # - <=6m => 1.0 immediately
+        # - >6m  => linear [0..0.5]
+        # - no obstacle in corridor => 0.0 release immediately
+        signal_direct_now = bool(self._force_signal_brake_active and should_brake and brake_conf >= 0.99)
+        obstacle_direct_now = obstacle_linear_brake > 0.0 and self._last_selected_target_type == 'obstacle'
+        if signal_direct_now:
+            final_brake = float(np.clip(target_brake, 0.0, 1.0))
+            self._prev_brake_force = final_brake
+            self._obstacle_direct_brake_active = False
+        elif obstacle_direct_now:
+            final_brake = float(np.clip(obstacle_linear_brake, 0.0, 1.0))
+            self._prev_brake_force = final_brake
+            self._obstacle_direct_brake_active = True
+        elif self._obstacle_direct_brake_active and not should_brake:
+            final_brake = 0.0
+            self._prev_brake_force = 0.0
+            self._obstacle_direct_brake_active = False
+        else:
+            final_brake = self._apply_failsafe(brake_force=target_brake, dt=dt)
+            if not should_brake:
+                self._obstacle_direct_brake_active = False
 
         # Preserve obstacle-specific diagnostics for overlays/logging.
         self._last_emergency_eval = self._evaluate_obstacle_emergency_from_yolo_logic(
@@ -2046,6 +2202,12 @@ class TrafficSupervisor:
             'obstacle_threshold_m': float(self._last_emergency_eval.get('threshold_m', self.obstacle_base_distance_m)),
             'obstacle_in_path_count': int(self._last_emergency_eval.get('in_path_count', 0)),
             'obstacle_trigger': self._last_emergency_eval.get('trigger_candidate'),
+            'obstacle_linear_brake': round(float(self._last_obstacle_linear_brake), 3),
+            'obstacle_direct_brake_active': bool(self._obstacle_direct_brake_active),
+            'green_release_active': bool(self._green_release_active),
+            'green_release_zone': self._green_release_zone,
+            'force_signal_brake_active': bool(self._force_signal_brake_active),
+            'force_signal_brake_target': self._force_signal_brake_target,
 
             # NEW (Layer 5): Brake force tracking
             'prev_brake_force': round(self._prev_brake_force, 3),

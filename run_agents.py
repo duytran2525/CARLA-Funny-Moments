@@ -5329,7 +5329,7 @@ class YoloDetectAgent(BaseAgent):
 
             # IMPORTANT: supervisor brake must override planner throttle/brake.
             if is_emergency or supervisor_brake > 0.0:
-                emergency_floor = 0.6 if is_emergency else 0.45
+                emergency_floor = 0.6 if is_emergency else 0.0
                 final_control = carla.VehicleControl()
                 final_control.steer = float(nav_control.steer)
                 final_control.throttle = 0.0
@@ -5354,6 +5354,33 @@ class YoloDetectAgent(BaseAgent):
             display_steer = float(final_control.steer)
             display_throttle = float(final_control.throttle)
             display_brake = float(final_control.brake)
+        elif vehicle is not None and self._tm_fallback_mode:
+            if is_emergency or supervisor_brake > 0.0:
+                emergency_floor = 0.6 if is_emergency else 0.0
+                current_control = vehicle.get_control()
+                final_control = carla.VehicleControl()
+                final_control.steer = float(current_control.steer)
+                final_control.throttle = 0.0
+                final_control.brake = float(
+                    clamp(
+                        max(float(current_control.brake), float(supervisor_brake), float(emergency_floor)),
+                        0.0,
+                        1.0,
+                    )
+                )
+                final_control.hand_brake = False
+                vehicle.apply_control(final_control)
+                display_steer = float(final_control.steer)
+                display_throttle = float(final_control.throttle)
+                display_brake = float(final_control.brake)
+                logging.debug(
+                    "[TICK %d] Supervisor override TM fallback: emergency=%s supervisor_brake=%.2f tm_brake=%.2f final_brake=%.2f",
+                    step_idx,
+                    bool(is_emergency),
+                    float(supervisor_brake),
+                    float(current_control.brake),
+                    float(final_control.brake),
+                )
 
         # ─────────────────────────────────────────────────────────
         # Step 6: Prepare Annotation Frame
