@@ -395,9 +395,15 @@ class TrafficSupervisor:
             image_shape = (480, 640, 3)  # Default CARLA camera
         
         x_center = bbox[0] + bbox[2] / 2.0
+        y_center = bbox[1] + bbox[3] / 2.0
         img_width = image_shape[1]
+        img_height = image_shape[0]
         
         x_ratio = x_center / img_width
+        y_ratio = y_center / max(1.0, float(img_height))
+        # Traffic lights are expected in upper image region.
+        if y_ratio > 0.60:
+            return None
         
         if 0.35 <= x_ratio <= 0.65:
             return 'urban'
@@ -456,11 +462,17 @@ class TrafficSupervisor:
       # ─────────────────────────────────────────────────────────
       # Bước 2: Xác định Horizon dựa trên Speed
       # ─────────────────────────────────────────────────────────
-      # Horizon = base + speed-dependent term
+      # Horizon = base + speed-dependent term (soft-saturating).
+      # Old linear rule (2.2 * m/s + 8) stretched too far at high speed.
       horizon_m = max(self.path_min_forward_m + 2.0, 12.0)
       if vehicle_speed_kmh is not None:
           speed_mps = max(0.0, float(vehicle_speed_kmh) / 3.6)
-          horizon_m = max(horizon_m, speed_mps * 2.2 + 8.0)
+          # Smooth growth: rises quickly at low speed, then saturates.
+          # At ~0 m/s  -> ~12 m
+          # At ~30 km/h -> ~16 m
+          # At high speed -> approaches ~22 m (before global clamp)
+          speed_term = 10.0 * (1.0 - math.exp(-speed_mps / 3.5))
+          horizon_m = max(horizon_m, 12.0 + speed_term)
       horizon_m = min(horizon_m, self.path_max_forward_m)
       
       # ─────────────────────────────────────────────────────────
@@ -879,6 +891,8 @@ class TrafficSupervisor:
           7. Return 3-tuple
         """
         red_light = None
+        red_light_zone: Optional[str] = None
+        best_green_by_zone: Dict[str, DetectionResult] = {}
         obstacle_candidates: List[DetectionResult] = []
         stop_lines = []
         if danger_polygon is None:
@@ -900,7 +914,16 @@ class TrafficSupervisor:
             
             # ┌─ Phân loại: Đèn đỏ
             if class_name in ['traffic_light_red', 'red_light'] and confidence > 0.3:
-                if red_light is None or confidence > red_light.confidence:
+                zone = self._classify_traffic_light_zone(bbox, image_shape)
+                # Reject side/irrelevant traffic lights outside configured ROI zones.
+                if zone is None:
+                    continue
+
+                preferred_zone = self.locked_zone if self.locked_zone in ('urban', 'rural_right') else 'urban'
+                zone_priority = 1 if zone == preferred_zone else 0
+                candidate_key = (zone_priority, confidence, -distance)
+
+                if red_light is None:
                     red_light = DetectionResult(
                         class_name='traffic_light_red',
                         confidence=confidence,
@@ -908,8 +931,37 @@ class TrafficSupervisor:
                         distance=distance,
                         signal_score=None  # Will compute later
                     )
-                    # Store relative_velocity for later use
                     red_light.relative_velocity_kmh = relative_velocity_kmh
+                    red_light_zone = zone
+                else:
+                    current_zone_priority = 1 if red_light_zone == preferred_zone else 0
+                    current_key = (current_zone_priority, red_light.confidence, -float(red_light.distance))
+                    if candidate_key > current_key:
+                        red_light = DetectionResult(
+                            class_name='traffic_light_red',
+                            confidence=confidence,
+                            bbox=bbox,
+                            distance=distance,
+                            signal_score=None
+                        )
+                        red_light.relative_velocity_kmh = relative_velocity_kmh
+                        red_light_zone = zone
+
+            # ┌─ Classification: Green traffic lights (for same-frame arbitration)
+            elif class_name in ['traffic_light_green', 'green_light'] and confidence > 0.3:
+                zone = self._classify_traffic_light_zone(bbox, image_shape)
+                if zone is None:
+                    continue
+                existing_green = best_green_by_zone.get(zone)
+                if existing_green is None or confidence > existing_green.confidence:
+                    green_det = DetectionResult(
+                        class_name='traffic_light_green',
+                        confidence=confidence,
+                        bbox=bbox,
+                        distance=distance,
+                        signal_score=None
+                    )
+                    best_green_by_zone[zone] = green_det
             
             # ┌─ Phân loại: Chướng ngại (Vehicle/Pedestrian)
             elif class_name in ['vehicle', 'pedestrian', 'car', 'truck', 'person', 'two_wheeler']:
@@ -941,11 +993,23 @@ class TrafficSupervisor:
                     )
                     stop_lines.append(stop_line_det)
         
+        # Green-vs-red arbitration (same frame):
+        # If a reliable urban green is visible, suppress rural red to avoid false stops at intersections.
+        urban_green = best_green_by_zone.get('urban')
+        if red_light is not None and red_light_zone == 'rural_right' and urban_green is not None:
+            green_margin = 0.05
+            if float(urban_green.confidence) >= float(red_light.confidence) + green_margin:
+                red_light = None
+                red_light_zone = None
+                self.green_immunity_counter = max(self.green_immunity_counter, 8)
+
         # Update zone locking state (using red_light)
         if red_light:
-            candidate_zone = self._select_zone_candidate_for_lock(
-                self.locked_zone, red_light, image_shape
-            )
+            candidate_zone = red_light_zone
+            if candidate_zone is None:
+                candidate_zone = self._select_zone_candidate_for_lock(
+                    self.locked_zone, red_light, image_shape
+                )
             self._update_locked_zone(candidate_zone, red_light)
 
         # V10: update obstacle tracks with IoU + kinematics
@@ -1276,6 +1340,13 @@ class TrafficSupervisor:
             elif self.locked_zone == 'rural_right':
                 safe_distance = safe_distance_rural
             else:
+                # No valid zone lock for signal => likely side-light / irrelevant light.
+                # Avoid default braking on ambiguous signal-only target.
+                if target_type == 'red_light':
+                    self._last_longitudinal_urgency = 0.0
+                    self._last_acc_urgency = 0.0
+                    self._last_ttc_urgency = float('-inf')
+                    return 0.0
                 safe_distance = safe_distance_default
 
             safe_distance = max(CRITICAL_DISTANCE + 0.1, safe_distance)
