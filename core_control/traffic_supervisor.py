@@ -124,6 +124,7 @@ class TrafficSupervisor:
         self.path_max_half_width_m = 2.8
         self.path_min_forward_m = 0.8
         self.path_max_forward_m = 35.0
+        self.path_horizon_scale = 0.82
         self.obstacle_base_distance_m = 8.0
         self.obstacle_stop_min_distance_m = 5.5
         self.obstacle_stop_max_distance_m = 18.0
@@ -395,14 +396,15 @@ class TrafficSupervisor:
             image_shape = (480, 640, 3)  # Default CARLA camera
         
         x_center = bbox[0] + bbox[2] / 2.0
-        y_center = bbox[1] + bbox[3] / 2.0
+        y_bottom = bbox[1] + bbox[3]
         img_width = image_shape[1]
         img_height = image_shape[0]
         
         x_ratio = x_center / img_width
-        y_ratio = y_center / max(1.0, float(img_height))
-        # Traffic lights are expected in upper image region.
-        if y_ratio > 0.60:
+        y_bottom_ratio = y_bottom / max(1.0, float(img_height))
+        # Keep exactly aligned with debug ROI overlay (top 60% of frame height):
+        # only accept traffic lights whose bottom point is still inside this band.
+        if y_bottom_ratio > 0.60:
             return None
         
         if 0.35 <= x_ratio <= 0.65:
@@ -474,6 +476,12 @@ class TrafficSupervisor:
           speed_term = 10.0 * (1.0 - math.exp(-speed_mps / 3.5))
           horizon_m = max(horizon_m, 12.0 + speed_term)
       horizon_m = min(horizon_m, self.path_max_forward_m)
+      # Keep obstacle corridor shorter in both logic and visualization.
+      # This scales the effective forward horizon before polygon sampling.
+      horizon_m = max(
+          self.path_min_forward_m + 2.0,
+          min(self.path_max_forward_m, horizon_m * float(self.path_horizon_scale)),
+      )
       
       # ─────────────────────────────────────────────────────────
       # Bước 3: Sample Points trong Vehicle-Space
