@@ -2,7 +2,7 @@ param(
     [string]$CarlaRoot = "E:\Carla",
     [string]$Config = "configs/carla_env.yaml",
     [string]$OutputRoot = "data/collected",
-    [string[]]$Towns = @("Town01", "Town02", "Town03"),
+    [string[]]$Towns = @("Town10HD"),
     [int]$TargetImagesPerCamera = 30000,
     [int]$ChunkTicks = 15000,
     [int]$SaveEveryN = 15,
