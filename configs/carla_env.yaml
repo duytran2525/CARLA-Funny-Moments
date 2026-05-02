@@ -45,6 +45,7 @@ cil:
   recovery_interval_frames: 100
   recovery_duration_frames: 10
   recovery_steer_offset: 0.3
+  use_pure_pursuit: false
 
 yolo:
   disable_autopilot_red_light: true
