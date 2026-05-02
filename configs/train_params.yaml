@@ -6,6 +6,11 @@
 # Environment: Kaggle GPU T4 x2 (32GB tổng, MultiGPU training)
 # ============================================================================
 
+# Kaggle dataset paths (update đúng tên dataset trên Kaggle của bạn)
+data_root: /kaggle/input/carla-waypoints
+csv_path: /kaggle/input/carla-waypoints/driving_log.csv
+work_dir: /kaggle/working
+
 epochs: 50                      # ⬆️ Tăng từ 40 → 50 (cần thêm thời gian fine-tune với batch lớn)
 
 batch_size: 48                  # ⬆️ Tăng từ 32 → 48 (tận dụng 32GB T4 memory, tốc độ nhanh hơn)

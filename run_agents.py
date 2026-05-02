@@ -11,6 +11,7 @@ import random
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Type
@@ -1969,6 +1970,7 @@ class LaneFollowAgent(BaseAgent):
         rgb = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGB)
         with self._frame_lock:
             self._latest_rgb = rgb
+            self._frame_history.append(rgb)
 
     def _on_depth_frame(self, image) -> None:
         depth_m = decode_carla_depth_to_meters(image)
@@ -2428,6 +2430,7 @@ class CILAgent(BaseAgent):
         self._device = None
         self._camera = None
         self._latest_rgb = None
+        self._frame_history = deque(maxlen=3)
         self._frame_lock = threading.Lock()
         self._waiting_frame_logged = False
         self._collector: Optional[DataCollector] = None
@@ -2559,11 +2562,9 @@ class CILAgent(BaseAgent):
                 "command_source",
                 "upcoming_command",
                 "reset_reason",
-                "steer_model",
-                "steer_assist",
-                "route_lateral_error_m",
-                "route_heading_error_deg",
-                "route_curve_strength",
+                "steer_source",
+                "uncertainty",
+                "ai_confused",
                 "steer",
                 "throttle",
                 "brake",
@@ -3727,6 +3728,16 @@ class CILAgent(BaseAgent):
             self._latest_rgb = None
         return frame
 
+    def _read_latest_triplet(self):
+        with self._frame_lock:
+            if not self._frame_history:
+                return None
+            frames = list(self._frame_history)
+        if len(frames) >= 3:
+            return frames[-3:]
+        last = frames[-1]
+        return [last] * (3 - len(frames)) + frames
+
     def _write_video_frame(self, rgb_frame) -> None:
         if self._video_writer is None:
             return
@@ -3849,6 +3860,103 @@ class CILAgent(BaseAgent):
 
         return throttle, brake
 
+    def _calculate_dynamic_speed(
+        self,
+        waypoints_2d: Any,
+        max_speed: float = 30.0,
+        min_speed: float = 12.0,
+    ) -> float:
+        if np is None:
+            return float(min_speed)
+        if waypoints_2d is None or len(waypoints_2d) < 5:
+            return float(min_speed)
+
+        p1 = waypoints_2d[0]
+        p2 = waypoints_2d[2]
+        p3 = waypoints_2d[4]
+
+        v1 = p2 - p1
+        v2 = p3 - p2
+
+        norm_v1 = float(np.linalg.norm(v1))
+        norm_v2 = float(np.linalg.norm(v2))
+
+        if norm_v1 < 1e-4 or norm_v2 < 1e-4:
+            return float(min_speed)
+
+        cos_theta = float(np.clip(np.dot(v1, v2) / (norm_v1 * norm_v2), -1.0, 1.0))
+        angle_deg = float(np.degrees(np.arccos(cos_theta)))
+
+        if angle_deg > 35.0:
+            target_speed = float(min_speed)
+        else:
+            speed_drop = (angle_deg / 35.0) * (float(max_speed) - float(min_speed))
+            target_speed = float(max_speed) - float(speed_drop)
+
+        return float(np.clip(target_speed, float(min_speed), float(max_speed)))
+
+    def _predict_cil_waypoints(
+        self,
+        rgb_frame,
+        speed_kmh: float,
+        command: int,
+    ) -> tuple[Any, float]:
+        if np is None or torch is None or cv2 is None:
+            return (np.zeros((5, 2), dtype=np.float32) if np is not None else None, 0.0)
+
+        if isinstance(rgb_frame, (list, tuple)):
+            frames = list(rgb_frame)
+        else:
+            frames = [rgb_frame]
+
+        if len(frames) == 0:
+            return (np.zeros((5, 2), dtype=np.float32), 0.0)
+        if len(frames) < 3:
+            last = frames[-1]
+            frames = [last] * (3 - len(frames)) + frames
+        if len(frames) > 3:
+            frames = frames[-3:]
+
+        yuv_frames = []
+        for frame in frames:
+            height = frame.shape[0]
+            cropped = frame[int(height * 0.45) :, :, :]
+            resized = cv2.resize(cropped, (200, 66), interpolation=cv2.INTER_AREA)
+            yuv_frames.append(cv2.cvtColor(resized, cv2.COLOR_RGB2YUV))
+
+        stacked = np.concatenate(yuv_frames, axis=-1)
+        image_tensor = torch.from_numpy(stacked).permute(2, 0, 1).float().div_(255.0)
+        image_tensor.sub_(0.5).div_(0.5)
+        image_tensor.unsqueeze_(0)
+
+        command_idx = max(0, min(3, int(command)))
+        command_tensor = torch.tensor([command_idx], dtype=torch.long)
+
+        image_tensor = image_tensor.to(self._device, non_blocking=True)
+        command_tensor = command_tensor.to(self._device, non_blocking=True)
+
+        with torch.inference_mode():
+            predictions = self._model(image_tensor, command_tensor)
+
+        if torch.is_tensor(predictions):
+            pred_tensor = predictions.detach().squeeze(0).cpu().float().numpy()
+            if pred_tensor.shape[0] == 15:
+                wp_array = pred_tensor[:10].reshape(5, 2)
+                mean_uncertainty = float(np.mean(pred_tensor[10:]))
+            else:
+                logging.error(
+                    "Shape Model Output bị sai: %s (Kỳ vọng: 15). Dùng Zeros.",
+                    pred_tensor.shape,
+                )
+                wp_array = np.zeros((5, 2), dtype=np.float32)
+                mean_uncertainty = 0.0
+        else:
+            logging.error("Model không trả về Tensor! Dùng Zeros.")
+            wp_array = np.zeros((5, 2), dtype=np.float32)
+            mean_uncertainty = 0.0
+
+        return wp_array, mean_uncertainty
+
     def _predict_cil_steering(self, rgb_frame, speed_kmh: float, command: int) -> float:
         height = rgb_frame.shape[0]
         cropped = rgb_frame[int(height * 0.45) :, :, :]
@@ -3926,7 +4034,7 @@ class CILAgent(BaseAgent):
         vehicle: Any,
         route_locations: list[Any],
         max_points: int = 5,
-    ) -> Optional[np.ndarray]:
+    ) -> Optional[Any]:
         if np is None or vehicle is None or not route_locations:
             return None
 
@@ -4344,15 +4452,35 @@ class CILAgent(BaseAgent):
         stage_times["nav"] = time.perf_counter() - nav_t0
 
         model_t0 = time.perf_counter()
-        model_steer = self._predict_cil_steering(frame, speed_kmh, command)
+        frame_triplet = self._read_latest_triplet() or [frame, frame, frame]
+        pred_waypoints, mean_uncertainty = self._predict_cil_waypoints(frame_triplet, speed_kmh, command)
         stage_times["model"] = time.perf_counter() - model_t0
 
         control_t0 = time.perf_counter()
-        steering_source = model_steer
-        if self._pure_pursuit is not None and self._use_pure_pursuit:
-            ego_waypoints = self._route_locations_to_ego_waypoints(vehicle, route_locations)
-            if ego_waypoints is not None:
-                steering_source = self._pure_pursuit.compute_steering(ego_waypoints, speed_kmh)
+        ai_is_confused = float(mean_uncertainty) > 1.5
+
+        if ai_is_confused:
+            logging.warning(
+                "[VETO] AI mất tự tin (Uncertainty=%.2f) -> PHANH KHẨN CẤP!",
+                float(mean_uncertainty),
+            )
+            adaptive_target_kmh = 0.0
+            throttle, brake = 0.0, 1.0
+            steering_source = self._last_steer
+        else:
+            adaptive_target_kmh = self._calculate_dynamic_speed(
+                pred_waypoints,
+                max_speed=30.0,
+                min_speed=12.0,
+            )
+            self._speed_controller.set_target_speed(adaptive_target_kmh)
+            throttle, brake = self._speed_controller.compute(speed_kmh)
+
+            if self._pure_pursuit is not None:
+                steering_source = self._pure_pursuit.compute_steering(pred_waypoints, speed_kmh)
+            else:
+                steering_source = 0.0
+                logging.error("PurePursuitController chưa được khởi tạo!")
 
         steering = self._stabilize_cil_steering(
             steering_raw=steering_source,
@@ -4360,30 +4488,6 @@ class CILAgent(BaseAgent):
             command=command,
             command_phase=str(command_debug.get("phase", "cruise")),
         )
-        route_assist, route_assist_debug = self._compute_route_centering_assist(
-            vehicle=vehicle,
-            speed_kmh=speed_kmh,
-            route_locations=route_locations,
-            command=command,
-            command_phase=str(command_debug.get("phase", "cruise")),
-        )
-        route_curve_strength, route_curve_debug = self._compute_route_curve_strength(
-            vehicle_location=vehicle_location,
-            route_locations=route_locations,
-            speed_kmh=speed_kmh,
-        )
-        # [TEST] Route centering assist disabled – using 100% raw model steering.
-        # steering = clamp(steering + float(route_assist), -1.0, 1.0)
-
-        throttle, brake = self._longitudinal_control_simple(
-            speed_kmh=speed_kmh,
-            destination_distance_m=destination_distance_m,
-            command=command,
-            command_phase=str(command_debug.get("phase", "cruise")),
-            distance_to_turn_m=float(command_debug.get("distance_to_turn_m", float("inf"))),
-            route_curve_strength=float(route_curve_strength),
-        )
-        adaptive_target_kmh = float(self._speed_controller.target_speed_kmh)
         control = carla.VehicleControl(
             throttle=float(throttle),
             steer=float(clamp(steering, -1.0, 1.0)),
@@ -4457,10 +4561,10 @@ class CILAgent(BaseAgent):
         stage_times["viz"] = time.perf_counter() - viz_t0
 
         telemetry_t0 = time.perf_counter()
-
+        
         if step_idx % 20 == 0:
             logging.info(
-                "cil tick=%d speed=%.1f km/h target=%.1f cmd=%d phase=%s next=%d src=%s reset=%s s_from_start=%.1f d_turn=%.1f d_junc=%.1f trigger=%.1f steer=%.3f model=%.3f assist=%.3f lat=%.2f hdg=%.1f curve=%.2f throttle=%.2f brake=%.2f",
+                "cil tick=%d speed=%.1f km/h target=%.1f cmd=%d phase=%s next=%d src=%s reset=%s s_from_start=%.1f d_turn=%.1f d_junc=%.1f trigger=%.1f steer=%.3f source=%.3f unc=%.3f veto=%s throttle=%.2f brake=%.2f",
                 step_idx,
                 speed_kmh,
                 adaptive_target_kmh,
@@ -4474,11 +4578,9 @@ class CILAgent(BaseAgent):
                 float(command_debug.get("distance_to_junction_m", float("inf"))),
                 float(command_debug.get("trigger_distance_m", 0.0)),
                 control.steer,
-                model_steer,
-                float(route_assist_debug.get("assist", 0.0)),
-                float(route_assist_debug.get("lateral_error_m", 0.0)),
-                float(route_assist_debug.get("heading_error_deg", 0.0)),
-                float(route_curve_debug.get("curve_strength", 0.0)),
+                steering_source,
+                float(mean_uncertainty),
+                str(ai_is_confused),
                 control.throttle,
                 control.brake,
             )
@@ -4496,11 +4598,9 @@ class CILAgent(BaseAgent):
                     str(command_debug.get("active_source", "none")),
                     int(command_debug.get("upcoming_command", 0)),
                     str(command_debug.get("reset_reason", "none")),
-                    f"{float(model_steer):.4f}",
-                    f"{float(route_assist_debug.get('assist', 0.0)):.4f}",
-                    f"{float(route_assist_debug.get('lateral_error_m', 0.0)):.4f}",
-                    f"{float(route_assist_debug.get('heading_error_deg', 0.0)):.4f}",
-                    f"{float(route_curve_debug.get('curve_strength', 0.0)):.4f}",
+                    f"{float(steering_source):.4f}",
+                    f"{float(mean_uncertainty):.4f}",
+                    str(ai_is_confused),
                     f"{float(control.steer):.4f}",
                     f"{float(control.throttle):.4f}",
                     f"{float(control.brake):.4f}",

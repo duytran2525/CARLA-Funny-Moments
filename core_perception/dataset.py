@@ -10,6 +10,7 @@ class WaypointCarlaDataset(Dataset):
     """
     Dataset V4.0 - Dự đoán Quỹ đạo Không-Thời gian (Spatio-Temporal Waypoints).
     Đã vá lỗi: Hỗ trợ WeightedRandomSampler, chuẩn hóa Shape [5, 2], tích hợp Transform.
+    Hỗ trợ cấu trúc Thư mục mới: /data/TownXX/center/ID.jpg
     """
     def __init__(self, csv_file, root_dir, transform=None, is_training=True, geometric_offset=0.35):
         self.root_dir = root_dir
@@ -28,6 +29,8 @@ class WaypointCarlaDataset(Dataset):
     def _prepare_data(self):
         print(f"Đang phân tích cấu trúc dữ liệu đa luồng (Multi-frame) từ {len(self.data_df)} dòng...")
         
+        missing_count = 0
+        
         for _, row in self.data_df.iterrows():
             command = int(row.get('command', 0))
             recovery_flag = float(row.get('recovery_flag', 0.0))
@@ -41,23 +44,36 @@ class WaypointCarlaDataset(Dataset):
                 row['wp_5_x'], row['wp_5_y']
             ], dtype=np.float32).reshape(5, 2)
             
-            img_id_t0 = str(row['img_id']).split('.')[0].zfill(8) + '.jpg'
-            img_id_t1 = str(row['img_id_tm03']).split('.')[0].zfill(8) + '.jpg'
-            img_id_t2 = str(row['img_id_tm06']).split('.')[0].zfill(8) + '.jpg'
+            # LẤY ĐƯỜNG DẪN ẢNH CHUẨN TỪ CSV
+            # File CSV do merge_data.py tạo ra có cột 'center_camera' chứa sẵn chữ "TownXX/center/ID.jpg"
+            # Ta sẽ trích xuất tên Town từ cột này để áp dụng cho các ảnh tm03 và tm06
+            if 'center_camera' not in row or pd.isna(row['center_camera']):
+                continue
+                
+            center_path_full = row['center_camera']
+            # center_path_full có dạng: "Town03/center/3.jpg" hoặc "Town03\center\3.jpg"
+            # Lấy tên thư mục Town:
+            town_folder = center_path_full.replace('\\', '/').split('/')[0] 
+            
+            # Tạo tên file ảnh cho 3 thời điểm
+            img_t0_name = f"{int(row['img_id'])}.jpg"
+            img_t1_name = f"{int(row['img_id_tm03'])}.jpg"
+            img_t2_name = f"{int(row['img_id_tm06'])}.jpg"
             
             configs = [
-                ('images_center', 0.0),
-                ('images_left', self.geometric_offset),
-                ('images_right', -self.geometric_offset)
+                ('center', 0.0),
+                ('left', self.geometric_offset),
+                ('right', -self.geometric_offset)
             ]
             
-            for sub_dir, offset in configs:
-                if not self.is_training and sub_dir != 'images_center':
+            for camera_type, offset in configs:
+                if not self.is_training and camera_type != 'center':
                     continue
                     
-                path_t0 = os.path.join(self.root_dir, sub_dir, img_id_t0)
-                path_t1 = os.path.join(self.root_dir, sub_dir, img_id_t1)
-                path_t2 = os.path.join(self.root_dir, sub_dir, img_id_t2)
+                # Ráp đường dẫn tuyệt đối: root_dir / TownXX / camera_type / ID.jpg
+                path_t0 = os.path.join(self.root_dir, town_folder, camera_type, img_t0_name)
+                path_t1 = os.path.join(self.root_dir, town_folder, camera_type, img_t1_name)
+                path_t2 = os.path.join(self.root_dir, town_folder, camera_type, img_t2_name)
                 
                 if os.path.exists(path_t0) and os.path.exists(path_t1) and os.path.exists(path_t2):
                     wp_cam = wp_car.copy()
@@ -71,13 +87,16 @@ class WaypointCarlaDataset(Dataset):
                     })
                     # [FIX A] Cập nhật danh sách cờ tương ứng với từng mẫu dữ liệu
                     self.recovery_flags.append(int(recovery_flag))
+                else:
+                    missing_count += 1
                     
         print(f"✅ Hoàn tất! Đã nạp thành công {len(self.samples)} khối lượng Tensor.")
+        if missing_count > 0:
+            print(f"⚠️ Bỏ qua {missing_count} mẫu do không tìm thấy đủ 3 khung hình ảnh trên ổ cứng.")
 
     def __len__(self):
         return len(self.samples)
 
-    # ... (CÁC HÀM AUGMENTATION GIỮ NGUYÊN NHƯ BẢN TRƯỚC) ...
     def _random_brightness(self, image):
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
         ratio = 1.0 + (random.random() - 0.5)
@@ -138,7 +157,11 @@ class WaypointCarlaDataset(Dataset):
 
         for path in paths:
             img = cv2.imread(path)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            if img is None:
+                # Fallback an toàn nếu ảnh bị hỏng
+                img = np.zeros((600, 800, 3), dtype=np.uint8) 
+            else:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
             h, w = img.shape[:2]
             img = img[int(h * 0.45):, :, :]

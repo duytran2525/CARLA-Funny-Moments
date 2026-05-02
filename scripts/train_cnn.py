@@ -51,7 +51,9 @@ def collate_waypoint_batch(batch):
         torch.stack(images),
         torch.stack(waypoints).float(),
         torch.stack(commands).long(),
-        torch.tensor(recovery_flags, dtype=torch.float32),
+        torch.stack(recovery_flags).float()
+        if torch.is_tensor(recovery_flags[0])
+        else torch.tensor(recovery_flags, dtype=torch.float32),
     )
 
 
@@ -72,8 +74,18 @@ def _build_recovery_sampler(flags: Optional[Iterable[int]], recovery_weight: flo
 def main():
     ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     config = load_config(os.path.join(ROOT_DIR, 'configs', 'train_params.yaml'))
-    DATA_DIR = os.path.join(ROOT_DIR, 'data')
-    CSV_PATH = os.path.join(DATA_DIR, 'driving_log.csv')
+    data_root = config.get('data_root', os.path.join(ROOT_DIR, 'data'))
+    if not os.path.isabs(data_root):
+        data_root = os.path.join(ROOT_DIR, str(data_root))
+
+    csv_path = config.get('csv_path') or config.get('data_csv')
+    if csv_path is None:
+        csv_path = os.path.join(data_root, 'driving_log.csv')
+    elif not os.path.isabs(csv_path):
+        csv_path = os.path.join(ROOT_DIR, str(csv_path))
+
+    DATA_DIR = data_root
+    CSV_PATH = csv_path
     MODEL_SAVE_PATH = os.path.join(ROOT_DIR, 'models', 'waypoint_predictor.pth')
     
     # ═══════════════════════════════════════════════════════════
@@ -118,8 +130,14 @@ def main():
     df = pd.read_csv(CSV_PATH)
     
     # Xóa file CSV tạm cũ để tránh load lại steering đã bị normalize
-    train_csv_path = os.path.join(DATA_DIR, 'train_split_log.csv')
-    val_csv_path = os.path.join(DATA_DIR, 'val_split_log.csv')
+    default_work_dir = "/kaggle/working" if os.path.isdir("/kaggle/working") else DATA_DIR
+    work_dir = config.get("work_dir", default_work_dir)
+    if not os.path.isabs(work_dir):
+        work_dir = os.path.join(ROOT_DIR, str(work_dir))
+    os.makedirs(work_dir, exist_ok=True)
+
+    train_csv_path = os.path.join(work_dir, 'train_split_log.csv')
+    val_csv_path = os.path.join(work_dir, 'val_split_log.csv')
     if os.path.exists(train_csv_path):
         os.remove(train_csv_path)
         print(f"Xóa file cache cũ: {train_csv_path}")
