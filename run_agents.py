@@ -5186,8 +5186,8 @@ class YoloDetectAgent(BaseAgent):
         1. Read frame + depth from camera
         2. Run YOLO detection
         3. Build danger_polygon from TrafficSupervisor
-        4. Compute supervisor brake signal
-        5. Apply control (nav_agent or TM autopilot)
+        4. Compute supervisor/advisory state
+        5. Pass through control from nav_agent or TM autopilot
         6. Draw annotations including YELLOW CORRIDOR
         7. Display & log
         """
@@ -5257,7 +5257,7 @@ class YoloDetectAgent(BaseAgent):
             debug_info = self._detector.get_last_debug_info() or {}
 
         # ─────────────────────────────────────────────────────────
-        # Step 4: Build Danger Polygon & Compute Supervisor Brake
+        # Step 4: Build Danger Polygon & Compute Supervisor Advisory
         # ─────────────────────────────────────────────────────────
         supervisor_brake = 0.0
         supervisor_state = "n/a"
@@ -5281,7 +5281,7 @@ class YoloDetectAgent(BaseAgent):
                 if speed_kmh is None:
                     speed_kmh = 0.0
 
-                # Compute supervisor brake signal
+                # Compute supervisor advisory signal for downstream code/debug only.
                 sup_dets = self._to_supervisor_detections(detections)
                 supervisor_brake = float(
                     self._traffic_supervisor.compute(
@@ -5309,7 +5309,7 @@ class YoloDetectAgent(BaseAgent):
         is_emergency = bool(detector_emergency or hard_supervisor_emergency)
 
         # ─────────────────────────────────────────────────────────
-        # Step 5: Apply Control (Navigation Agent or TM Autopilot)
+        # Step 5: Pass Through Control (Navigation Agent or TM Autopilot)
         # ─────────────────────────────────────────────────────────
         if vehicle is not None and self._nav_agent is not None:
             try:
@@ -5325,49 +5325,10 @@ class YoloDetectAgent(BaseAgent):
                 pass
 
             nav_control = self._nav_agent.run_step()
-            if is_emergency or supervisor_brake > 0.0:
-                nav_control.throttle = 0.0
-                emergency_floor = 1.0 if is_emergency else 0.0
-                nav_control.brake = float(
-                    clamp(
-                        max(float(nav_control.brake), supervisor_brake, emergency_floor),
-                        0.0,
-                        1.0,
-                    )
-                )
             vehicle.apply_control(nav_control)
             display_steer = float(nav_control.steer)
             display_throttle = float(nav_control.throttle)
             display_brake = float(nav_control.brake)
-
-        # Emergency override on top of CARLA autopilot (TM fallback)
-        elif is_emergency and vehicle is not None and self._nav_agent is None:
-            control = carla.VehicleControl()
-            control.throttle = 0.0
-            control.steer = float(0.0 if current_steer is None else current_steer)
-            control.brake = float(clamp(max(1.0, supervisor_brake), 0.0, 1.0))
-            control.hand_brake = False
-            vehicle.apply_control(control)
-            display_steer = float(control.steer)
-            display_throttle = float(control.throttle)
-            display_brake = float(control.brake)
-            logging.warning(
-                "[TICK %d] EMERGENCY BRAKE! Reason: detector=%s supervisor_state=%s target=%s",
-                step_idx,
-                debug_info.get("decision_reason", "dangerous object nearby"),
-                supervisor_state,
-                supervisor_reason,
-            )
-        elif supervisor_brake > 0.0 and vehicle is not None and self._nav_agent is None:
-            control = carla.VehicleControl()
-            control.throttle = 0.0
-            control.steer = float(0.0 if current_steer is None else current_steer)
-            control.brake = float(supervisor_brake)
-            control.hand_brake = False
-            vehicle.apply_control(control)
-            display_steer = float(control.steer)
-            display_throttle = float(control.throttle)
-            display_brake = float(control.brake)
 
         # ─────────────────────────────────────────────────────────
         # Step 6: Prepare Annotation Frame
@@ -5469,7 +5430,7 @@ class YoloDetectAgent(BaseAgent):
             status_text = f"SUPERVISOR {supervisor_state_upper} {brake_level:.2f}"
             if supervisor_reason not in ("n/a", "none", ""):
                 status_text = f"{status_text} ({supervisor_reason})"
-            # Color encodes actual brake intensity: green (0.0) -> red (1.0)
+            # Color encodes current brake intensity: green (0.0) -> red (1.0)
             status_color = (
                 0,
                 int(round(255.0 * (1.0 - brake_level))),
