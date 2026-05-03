@@ -173,57 +173,6 @@ def decode_carla_depth_to_meters(image) -> Any:
     return normalized * 1000.0
 
 
-def _camera_to_vehicle_rotation(camera_pitch_deg: float) -> Any:
-    pitch_rad = math.radians(-float(camera_pitch_deg))
-    rot_y = np.array(
-        [
-            [math.cos(pitch_rad), 0.0, math.sin(pitch_rad)],
-            [0.0, 1.0, 0.0],
-            [-math.sin(pitch_rad), 0.0, math.cos(pitch_rad)],
-        ],
-        dtype=np.float32,
-    )
-    base = np.array(
-        [
-            [0.0, 0.0, 1.0],   # z_cam -> x_vehicle
-            [1.0, 0.0, 0.0],   # x_cam -> y_vehicle
-            [0.0, -1.0, 0.0],  # -y_cam -> z_vehicle
-        ],
-        dtype=np.float32,
-    )
-    return rot_y @ base
-
-
-def _project_vehicle_to_image(
-    point_vehicle: Any,
-    frame_width: int,
-    frame_height: int,
-    camera_fov_deg: float,
-    camera_mount_xyz: tuple[float, float, float],
-    camera_pitch_deg: float,
-) -> Optional[tuple[int, int]]:
-    if np is None:
-        return None
-
-    fx = (frame_width / 2.0) / max(math.tan(math.radians(camera_fov_deg) / 2.0), 1e-6)
-    fy = fx
-    cx = frame_width / 2.0
-    cy = frame_height / 2.0
-
-    r_c2v = _camera_to_vehicle_rotation(camera_pitch_deg)
-    r_v2c = r_c2v.T
-    t = np.array(camera_mount_xyz, dtype=np.float32)
-    p_rel = point_vehicle.astype(np.float32) - t
-    p_cam = r_v2c @ p_rel
-    if p_cam[2] <= 0.15:
-        return None
-
-    u = fx * (p_cam[0] / p_cam[2]) + cx
-    v = fy * (p_cam[1] / p_cam[2]) + cy
-    if not np.isfinite(u) or not np.isfinite(v):
-        return None
-    return (int(round(u)), int(round(v)))
-
 def _draw_yellow_danger_corridor(
     frame_bgr: Any,
     debug_info: Dict[str, Any],
@@ -360,140 +309,6 @@ def _draw_red_light_zone_rois(
         return False
 
     return True
-
-def _draw_curved_obstacle_path(
-    frame_bgr: Any,
-    debug_info: Dict[str, Any],
-    camera_fov_deg: float,
-    camera_mount_xyz: tuple[float, float, float] = (1.5, 0.0, 2.2),
-    camera_pitch_deg: float = -8.0,
-) -> bool:
-    if np is None or cv2 is None:
-        return False
-
-    path_cfg = debug_info.get("obstacle_path_model", {}) or {}
-    road_plane = debug_info.get("road_plane", {}) or {}
-    if path_cfg.get("mode") != "curved_3d":
-        return False
-    if not bool(road_plane.get("valid", False)):
-        return False
-
-    normal_raw = road_plane.get("normal", [0.0, 0.0, 1.0])
-    if not isinstance(normal_raw, list) or len(normal_raw) != 3:
-        return False
-    normal = np.array(
-        [float(normal_raw[0]), float(normal_raw[1]), float(normal_raw[2])],
-        dtype=np.float32,
-    )
-    norm = float(np.linalg.norm(normal))
-    if norm < 1e-6:
-        return False
-    normal = normal / norm
-    if abs(float(normal[2])) < 1e-4:
-        return False
-    d = float(road_plane.get("d", 0.0))
-
-    steer = float(path_cfg.get("steer", 0.0))
-    curvature = float(path_cfg.get("curvature", 0.0))
-    horizon_m = float(path_cfg.get("horizon_m", 22.0))
-    min_forward_m = float(path_cfg.get("min_forward_m", 0.8))
-    base_half_width_m = float(path_cfg.get("base_half_width_m", 1.1))
-    width_growth_per_m = float(path_cfg.get("width_growth_per_m", 0.035))
-    curve_width_gain = float(path_cfg.get("curve_width_gain", 0.55))
-    max_half_width_m = float(path_cfg.get("max_half_width_m", 2.8))
-
-    horizon_m = max(min_forward_m + 2.0, min(horizon_m, 40.0))
-    sample_count = max(28, int(horizon_m * 2.5))
-    forward_values = np.linspace(min_forward_m, horizon_m, sample_count, dtype=np.float32)
-
-    left_pixels: list[tuple[int, int]] = []
-    right_pixels: list[tuple[int, int]] = []
-    center_pixels: list[tuple[int, int]] = []
-    frame_h, frame_w = frame_bgr.shape[:2]
-
-    for x in forward_values:
-        center_y = 0.5 * curvature * float(x) * float(x)
-        half_w = min(
-            max_half_width_m,
-            base_half_width_m + width_growth_per_m * float(x) + curve_width_gain * abs(curvature) * float(x),
-        )
-        y_left = center_y - half_w
-        y_right = center_y + half_w
-
-        z_center = -(float(normal[0]) * float(x) + float(normal[1]) * center_y + d) / float(normal[2])
-        z_left = -(float(normal[0]) * float(x) + float(normal[1]) * y_left + d) / float(normal[2])
-        z_right = -(float(normal[0]) * float(x) + float(normal[1]) * y_right + d) / float(normal[2])
-
-        p_center = np.array([float(x), float(center_y), float(z_center)], dtype=np.float32)
-        p_left = np.array([float(x), float(y_left), float(z_left)], dtype=np.float32)
-        p_right = np.array([float(x), float(y_right), float(z_right)], dtype=np.float32)
-
-        center_uv = _project_vehicle_to_image(
-            p_center,
-            frame_w,
-            frame_h,
-            camera_fov_deg,
-            camera_mount_xyz,
-            camera_pitch_deg,
-        )
-        left_uv = _project_vehicle_to_image(
-            p_left,
-            frame_w,
-            frame_h,
-            camera_fov_deg,
-            camera_mount_xyz,
-            camera_pitch_deg,
-        )
-        right_uv = _project_vehicle_to_image(
-            p_right,
-            frame_w,
-            frame_h,
-            camera_fov_deg,
-            camera_mount_xyz,
-            camera_pitch_deg,
-        )
-
-        if center_uv is not None:
-            center_pixels.append(center_uv)
-        if left_uv is not None:
-            left_pixels.append(left_uv)
-        if right_uv is not None:
-            right_pixels.append(right_uv)
-
-    if len(left_pixels) < 4 or len(right_pixels) < 4:
-        return False
-
-    corridor = np.array(left_pixels + right_pixels[::-1], dtype=np.int32).reshape((-1, 1, 2))
-    overlay = frame_bgr.copy()
-    fill_color = (30, 190, 255)
-    edge_color = (0, 255, 255)
-    center_color = (255, 255, 255)
-    cv2.fillPoly(overlay, [corridor], fill_color)
-    cv2.addWeighted(overlay, 0.22, frame_bgr, 0.78, 0.0, frame_bgr)
-    cv2.polylines(frame_bgr, [corridor], True, edge_color, 2)
-
-    if len(center_pixels) >= 2:
-        center_arr = np.array(center_pixels, dtype=np.int32).reshape((-1, 1, 2))
-        cv2.polylines(frame_bgr, [center_arr], False, center_color, 2)
-
-    label = (
-        f"Curved path | steer={steer:+.2f} | k={curvature:+.3f} 1/m | "
-        f"h={horizon_m:.1f}m"
-    )
-    anchor = center_pixels[0] if center_pixels else left_pixels[0]
-    text_x = max(8, min(frame_w - 320, int(anchor[0]) - 40))
-    text_y = max(24, min(frame_h - 8, int(anchor[1]) - 10))
-    cv2.putText(
-        frame_bgr,
-        label,
-        (text_x, text_y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
-        edge_color,
-        2,
-    )
-    return True
-
 
 def map_road_option_to_command(road_option) -> int:
     return shared_map_road_option_to_command(road_option)
@@ -2135,14 +1950,14 @@ class LaneFollowAgent(BaseAgent):
                 logging.warning("Lane-follow TrafficSupervisor compute failed: %s", exc)
 
         debug_info["supervisor_brake"] = float(supervisor_brake)
+        supervisor_target_type = "none"
         if sup_debug:
             target_type = str(sup_debug.get("selected_target_type", "none"))
+            supervisor_target_type = target_type
             debug_info["decision_reason"] = target_type
             debug_info["supervisor_state"] = str(sup_debug.get("state", "n/a"))
             debug_info["locked_zone"] = sup_debug.get("locked_zone")
             debug_info["green_immunity_counter"] = int(sup_debug.get("green_immunity_counter", 0))
-            debug_info["turn_phase_active"] = bool(sup_debug.get("in_turn_phase", False))
-            debug_info["turn_green_grace_counter"] = int(sup_debug.get("turn_grace_counter", 0))
             debug_info["red_light_active"] = bool(
                 supervisor_brake > 0.0 and target_type in ("red_light", "traffic_light_red", "stop_line")
             )
@@ -2161,7 +1976,9 @@ class LaneFollowAgent(BaseAgent):
                 debug_info["obstacle_danger_roi"] = obstacle_roi
 
         # In lane-follow, prefer supervisor as primary brake source when available.
-        hard_supervisor_emergency = supervisor_brake >= 0.95
+        hard_supervisor_emergency = (
+            supervisor_brake >= 0.60 and supervisor_target_type == "obstacle"
+        )
         if self._traffic_supervisor is not None:
             is_emergency = bool(hard_supervisor_emergency)
         else:
@@ -2169,63 +1986,15 @@ class LaneFollowAgent(BaseAgent):
 
         annotated_frame = frame_bgr.copy()
         _draw_red_light_zone_rois(annotated_frame, sup_debug)
-        for roi_region in debug_info.get("roi_regions", []):
-            x1, y1, x2, y2 = roi_region["box"]
-            is_active = bool(roi_region.get("active", False))
-            roi_color = (255, 180, 0) if is_active else (80, 80, 80)
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), roi_color, 2)
-            roi_label = (
-                f"ROI {roi_region['label']} < {roi_region['max_distance_m']:.0f}m"
-            )
-            cv2.putText(
-                annotated_frame,
-                roi_label,
-                (x1 + 4, min(y2 - 6, y1 + 20)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                roi_color,
-                1,
-            )
-
-        obstacle_roi = debug_info.get("obstacle_danger_roi", {})
-        drew_curved = _draw_curved_obstacle_path(
-            annotated_frame,
-            debug_info,
-            camera_fov_deg=float(self.config.camera_fov),
-            camera_mount_xyz=(1.5, 0.0, 2.2),
-            camera_pitch_deg=-8.0,
-        )
-        obstacle_polygon = obstacle_roi.get("polygon", [])
-        if (not drew_curved) and np is not None and len(obstacle_polygon) >= 3:
-            points = np.array(obstacle_polygon, dtype=np.int32).reshape((-1, 1, 2))
-            roi_color = (0, 255, 255)
-            cv2.polylines(annotated_frame, [points], True, roi_color, 2)
-            label = (
-                f"{obstacle_roi.get('label', 'Obstacle corridor')} < "
-                f"{float(obstacle_roi.get('distance_threshold_m', 5.0)):.1f}m"
-            )
-            anchor_x = int(obstacle_polygon[0][0])
-            anchor_y = max(18, int(obstacle_polygon[0][1]) - 8)
-            cv2.putText(
-                annotated_frame,
-                label,
-                (anchor_x, anchor_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                roi_color,
-                1,
-            )
+        _draw_yellow_danger_corridor(annotated_frame, debug_info, sup_debug)
 
         for det in detections:
             x1, y1, x2, y2 = det['box']
             class_name = det['class_name']
             conf = det['confidence']
             distance = det['distance']
-            distance_source = det.get("distance_source", "bbox")
-            roi_zone = det.get('roi_zone')
             in_danger_roi = bool(det.get("in_danger_roi", False))
             danger_match = bool(det.get("danger_match", False))
-            path_check_mode = det.get("path_check_mode")
 
             if class_name == "traffic_light_red":
                 color = (0, 0, 255)
@@ -2278,9 +2047,8 @@ class LaneFollowAgent(BaseAgent):
             2,
         )
         turn_text = (
-            f"TURN={bool(debug_info.get('turn_phase_active', False))} | "
-            f"grace={int(debug_info.get('turn_green_grace_counter', 0))} | "
-            f"suppress={bool(debug_info.get('turn_red_suppressed', False))}"
+            f"TARGET={debug_info.get('decision_reason', 'none')} | "
+            f"OBS={debug_info.get('obstacle_reason', 'none')}"
         )
         cv2.putText(
             annotated_frame,
@@ -5298,7 +5066,9 @@ class YoloDetectAgent(BaseAgent):
                 self._last_supervisor_debug_info = sup_debug
                 supervisor_state = str(sup_debug.get("state", "n/a"))
                 supervisor_reason = str(sup_debug.get("selected_target_type", "none"))
-                hard_supervisor_emergency = supervisor_brake >= 0.95
+                hard_supervisor_emergency = (
+                    supervisor_brake >= 0.60 and supervisor_reason == "obstacle"
+                )
                 
             except Exception as exc:
                 sup_debug = {}
@@ -5411,22 +5181,6 @@ class YoloDetectAgent(BaseAgent):
         # ─────────────────────────────────────────────────────────
         # Vẽ ROI regions (từ YOLO detector)
         # ─────────────────────────────────────────────────────────
-        for roi_region in debug_info.get("roi_regions", []):
-            x1, y1, x2, y2 = roi_region["box"]
-            is_active = bool(roi_region.get("active", False))
-            roi_color = (255, 180, 0) if is_active else (80, 80, 80)
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), roi_color, 2)
-            roi_label = f"ROI {roi_region['label']} < {roi_region['max_distance_m']:.0f}m"
-            cv2.putText(
-                annotated_frame,
-                roi_label,
-                (x1 + 4, min(y2 - 6, y1 + 20)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                roi_color,
-                1,
-            )
-
         # ─────────────────────────────────────────────────────────
         # Vẽ Detection Bounding Boxes
         # ─────────────────────────────────────────────────────────
@@ -5435,11 +5189,8 @@ class YoloDetectAgent(BaseAgent):
             class_name = det["class_name"]
             confidence = det["confidence"]
             distance = det["distance"]
-            distance_source = det.get("distance_source", "bbox")
-            roi_zone = det.get("roi_zone")
             in_danger_roi = bool(det.get("in_danger_roi", False))
             danger_match = bool(det.get("danger_match", False))
-            path_check_mode = det.get("path_check_mode")
 
             # Build label
             label = f"{class_name} {confidence:.2f} ({distance:.1f}m)"
@@ -5525,9 +5276,8 @@ class YoloDetectAgent(BaseAgent):
         )
 
         turn_text = (
-            f"TURN={bool(sup_debug.get('in_turn_phase', debug_info.get('turn_phase_active', False)))} | "
-            f"grace={int(sup_debug.get('turn_grace_counter', debug_info.get('turn_green_grace_counter', 0)))} | "
-            f"state={str(sup_debug.get('state', 'n/a')).upper()}"
+            f"TARGET={supervisor_reason} | "
+            f"OBS={sup_debug.get('obstacle_reason', debug_info.get('obstacle_reason', 'none'))}"
         )
         cv2.putText(
             annotated_frame,
