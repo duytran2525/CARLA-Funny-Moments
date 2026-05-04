@@ -181,7 +181,7 @@ def main():
     )
     
     # ⭐ FIX KAGGLE SILENT OOM: Tắt multiprocessing tránh rò rỉ RAM (Copy-on-write leak)
-    num_workers = 0
+    num_workers = 4
     pin_mem = torch.cuda.is_available()
     
     batch_size = config['batch_size']
