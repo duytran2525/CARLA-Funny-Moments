@@ -13,8 +13,8 @@
 
 vehicle:
   filter: "vehicle.tesla.model3"
-  spawn_point: 1
-  destination_point: 15
+  spawn_point: -1
+  destination_point: -1
   role_name: "hero"
 
 spectator:
