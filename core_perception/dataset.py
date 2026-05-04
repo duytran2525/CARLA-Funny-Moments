@@ -114,9 +114,9 @@ class WaypointCarlaDataset(Dataset):
             img_t2_name = _image_id(row['img_id_tm06'])
             
             configs = [
-                ('center', 0.0),
-                ('left', self.geometric_offset),
-                ('right', -self.geometric_offset)
+                ('images_center', 0.0),
+                ('images_left', self.geometric_offset),
+                ('images_right', -self.geometric_offset)
             ]
             
             for camera_type, offset in configs:
