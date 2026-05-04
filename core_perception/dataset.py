@@ -120,7 +120,7 @@ class WaypointCarlaDataset(Dataset):
             ]
             
             for camera_type, offset in configs:
-                if not self.is_training and camera_type != 'center':
+                if not self.is_training and camera_type != 'images_center':
                     continue
                     
                 path_t0 = os.path.join(self.root_dir, town_folder, camera_type, img_t0_name)

@@ -222,8 +222,10 @@ class WaypointPredictor(nn.Module):
         sigma = F.softplus(out[:, 10:])
 
         coords = coords.view(-1, 5, 2)
-        coords[..., 0] = coords[..., 0] * self.scaling.x_scale
-        coords[..., 1] = coords[..., 1] * self.scaling.y_scale
+        # Tạo một tensor chứa hệ số scale nằm trên cùng device (CPU/GPU) với coords
+        scale_factors = torch.tensor([self.scaling.x_scale, self.scaling.y_scale], device=coords.device)
+        # Nhân out-of-place (PyTorch sẽ tạo ra một tensor mới, không ghi đè đồ thị cũ)
+        coords = coords * scale_factors
         coords = coords.view(-1, 10)
 
         sigma = sigma * self.scaling.sigma_scale + self.scaling.sigma_eps
