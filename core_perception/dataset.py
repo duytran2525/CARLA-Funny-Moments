@@ -6,6 +6,7 @@ import sys
 from typing import Iterable
 
 import cv2
+cv2.setNumThreads(0)
 import numpy as np
 import pandas as pd
 import torch
@@ -84,6 +85,7 @@ class WaypointCarlaDataset(Dataset):
             
         self._prepare_data()
 
+        del self.data_df
     def _prepare_data(self):
         _safe_print(f"Đang phân tích cấu trúc dữ liệu đa luồng (Multi-frame) từ {len(self.data_df)} dòng...")
         
