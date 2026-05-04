@@ -180,8 +180,8 @@ def main():
         geometric_offset=float(config.get("geometric_offset", 0.35)),
     )
     
-    # ⭐ OPTIMIZE: num_workers dựa trên CPU cores
-    num_workers = min(8, (os.cpu_count() or 1) // 2)  # Use half CPU cores
+    # ⭐ FIX KAGGLE SILENT OOM: Tắt multiprocessing tránh rò rỉ RAM (Copy-on-write leak)
+    num_workers = 0
     pin_mem = torch.cuda.is_available()
     
     batch_size = config['batch_size']
