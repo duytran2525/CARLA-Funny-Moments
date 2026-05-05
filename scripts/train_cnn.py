@@ -157,6 +157,11 @@ def main():
     # Lưu ra 2 file CSV tạm thời
     train_df.to_csv(train_csv_path, index=False)
     val_df.to_csv(val_csv_path, index=False)
+    
+    # Bóp chết Dataframe để cứu 2-3GB RAM cực kỳ quan trọng
+    import gc
+    del df, train_df, val_df
+    gc.collect()
 
     if WaypointCarlaDataset is None:
         raise RuntimeError(
@@ -180,9 +185,9 @@ def main():
         geometric_offset=float(config.get("geometric_offset", 0.35)),
     )
     
-    # ⭐ FIX KAGGLE SILENT OOM: Tắt multiprocessing tránh rò rỉ RAM (Copy-on-write leak)
+    # ⭐ FIX KAGGLE OOM CUỐI CÙNG:
     num_workers = 0
-    pin_mem = torch.cuda.is_available()
+    pin_mem = False  # BẮT BUỘC FALSE: PyTorch Pin_Memory làm rò rỉ RAM trên luồng chính
     
     batch_size = config['batch_size']
     
@@ -357,6 +362,14 @@ def main():
         
         print(f"Epoch [{epoch+1:2d}/{epochs}] | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} {mem_str}")
         
+        # ──────────────────────────────────
+        # Dọn rác System RAM (Kaggle Life-saver)
+        # ──────────────────────────────────
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # ──────────────────────────────────
         # Scheduler step
         # ──────────────────────────────────
