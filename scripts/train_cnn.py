@@ -322,6 +322,11 @@ def main():
             # 🔥 XÓA RÁC TẠI MỖI BATCH: Tiêu diệt Tensor tránh phình RAM
             del images, waypoints, commands, recovery_flags
             del outputs, pred_wp, pred_sigma, target_wp, loss_wp, loss_gnll, loss
+            
+            # Ép máy dọn rác cực mạnh mỗi 200 batch để chống tràn RAM trên Kaggle
+            if i % 200 == 0:
+                import gc
+                gc.collect()
         
         train_loss = running_loss / len(train_loader)
         
@@ -356,6 +361,10 @@ def main():
                 # 🔥 XÓA RÁC Ở NHÁNH VALIDATION
                 del images, waypoints, commands, recovery_flags
                 del outputs, pred_wp, pred_sigma, target_wp, loss_wp, loss_gnll, loss
+                
+                # Ép máy dọn rác
+                import gc
+                gc.collect()
         
         val_loss = val_loss / len(val_loader)
         
