@@ -295,7 +295,8 @@ def main():
             commands = commands.to(primary_device, non_blocking=True)
             waypoints = waypoints.to(primary_device, non_blocking=True)
             
-            optimizer.zero_grad()
+            # Xóa sạch đồ thị tính toán cũ, cắt đứt con trỏ tham chiếu
+            optimizer.zero_grad(set_to_none=True)
             
             # Mixed precision training
             with torch.amp.autocast(device_type='cuda' if use_amp else 'cpu', enabled=use_amp):
@@ -317,6 +318,10 @@ def main():
             scaler.update()
             
             running_loss += loss.item()
+
+            # 🔥 XÓA RÁC TẠI MỖI BATCH: Tiêu diệt Tensor tránh phình RAM
+            del images, waypoints, commands, recovery_flags
+            del outputs, pred_wp, pred_sigma, target_wp, loss_wp, loss_gnll, loss
         
         train_loss = running_loss / len(train_loader)
         
@@ -347,6 +352,10 @@ def main():
                     loss = lambda_wp * loss_wp + lambda_gnll * loss_gnll
                 
                 val_loss += loss.item()
+
+                # 🔥 XÓA RÁC Ở NHÁNH VALIDATION
+                del images, waypoints, commands, recovery_flags
+                del outputs, pred_wp, pred_sigma, target_wp, loss_wp, loss_gnll, loss
         
         val_loss = val_loss / len(val_loader)
         
