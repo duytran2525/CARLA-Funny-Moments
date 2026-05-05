@@ -12,6 +12,8 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 import torchvision.transforms as transforms
 import numpy as np
 import pandas as pd
+import warnings
+warnings.filterwarnings("ignore")
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from core_perception.cnn_model import WaypointPredictor
@@ -327,6 +329,7 @@ def main():
             if i % 200 == 0:
                 import gc
                 gc.collect()
+                print(f"  [Train] Epoch {epoch+1} - Batch {i}/{len(train_loader)} - Loss: {loss.item():.4f}")
         
         train_loss = running_loss / len(train_loader)
         
@@ -337,11 +340,11 @@ def main():
         val_loss = 0.0
         
         with torch.no_grad():
-            for images, waypoints, commands, recovery_flags in val_loader:
+            for j, (images, waypoints, commands, recovery_flags) in enumerate(val_loader):
                 images = images.to(primary_device, non_blocking=True)
                 commands = commands.to(primary_device, non_blocking=True)
                 waypoints = waypoints.to(primary_device, non_blocking=True)
-                
+
                 with torch.amp.autocast(device_type='cuda' if use_amp else 'cpu', enabled=use_amp):
                     outputs = model(images, commands)
                     pred_wp = outputs[:, :10].view(-1, 5, 2)
@@ -355,17 +358,18 @@ def main():
                     lambda_wp = float(config.get("loss_lambda_wp", 1.0))
                     lambda_gnll = float(config.get("loss_lambda_gnll", 0.1))
                     loss = lambda_wp * loss_wp + lambda_gnll * loss_gnll
-                
+
                 val_loss += loss.item()
 
                 # 🔥 XÓA RÁC Ở NHÁNH VALIDATION
                 del images, waypoints, commands, recovery_flags
                 del outputs, pred_wp, pred_sigma, target_wp, loss_wp, loss_gnll, loss
-                
+
                 # Ép máy dọn rác
-                import gc
-                gc.collect()
-        
+                if j % 200 == 0:
+                    import gc
+                    gc.collect()
+                    print(f"  [Val] Epoch {epoch+1} - Batch {j}/{len(val_loader)}")
         val_loss = val_loss / len(val_loader)
         
         # ──────────────────────────────────
