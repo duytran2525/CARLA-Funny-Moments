@@ -3,14 +3,21 @@ from __future__ import annotations
 import os
 import random
 import sys
-from typing import Iterable
+from pathlib import Path
+from typing import Iterable, Optional
 
 import cv2
-cv2.setNumThreads(0)
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+
+
+CAMERA_DIR_ALIASES = {
+    "center": ("images_center", "center"),
+    "left": ("images_left", "left"),
+    "right": ("images_right", "right"),
+}
 
 
 def _safe_print(message: object = "") -> None:
@@ -30,6 +37,21 @@ def _image_id(value: object) -> str:
     if "." in stem:
         stem = stem.split(".", 1)[0]
     return stem.zfill(8) + ".jpg"
+
+
+def _normalize_relative_path(value: object) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def _normalize_image_filename(value: object) -> str:
+    text = _normalize_relative_path(value)
+    if not text or text.lower() == "nan":
+        return ""
+    leaf = Path(text).name
+    return leaf if Path(leaf).suffix else _image_id(leaf)
 
 
 def _filter_stationary_rows(
@@ -61,94 +83,228 @@ def _filter_stationary_rows(
 
 
 class WaypointCarlaDataset(Dataset):
-    """
-    Dataset V4.0 - Dự đoán Quỹ đạo Không-Thời gian (Spatio-Temporal Waypoints).
-    Đã vá lỗi: Hỗ trợ Cấu trúc Thư mục mới /TownXX/, và Filter xe đứng yên.
-    """
-    def __init__(self, csv_file, root_dir, transform=None, is_training=True, geometric_offset=0.35, filter_stationary=True, min_speed_kmh=1.0, min_wp5_x_m=3.0):
-        self.root_dir = root_dir
+    """Temporal CARLA dataset that supports both legacy and current collector layouts."""
+
+    def __init__(
+        self,
+        csv_file,
+        root_dir,
+        transform=None,
+        is_training=True,
+        geometric_offset=0.35,
+        filter_stationary=True,
+        min_speed_kmh=1.0,
+        min_wp5_x_m=3.0,
+    ):
+        self.root_dir = Path(root_dir).resolve()
         self.transform = transform
         self.is_training = bool(is_training)
         self.geometric_offset = float(geometric_offset)
         self.samples: list[dict[str, object]] = []
         self.recovery_flags: list[int] = []
+        self.csv_file = Path(csv_file).resolve()
 
-        self.data_df = pd.read_csv(csv_file)
-        
-        # Áp dụng bộ lọc thông minh của bạn
+        self.data_df = pd.read_csv(self.csv_file)
+        self._inject_dataset_subdir_from_csv_path()
+
         if filter_stationary:
             self.data_df = _filter_stationary_rows(
                 self.data_df,
                 min_speed_kmh=float(min_speed_kmh),
                 min_wp5_x_m=float(min_wp5_x_m),
             )
-            
+
         self._prepare_data()
 
-        del self.data_df
-    def _prepare_data(self):
-        _safe_print(f"Đang phân tích cấu trúc dữ liệu đa luồng (Multi-frame) từ {len(self.data_df)} dòng...")
-        
-        missing_count = 0
-        
-        for _, row in self.data_df.iterrows():
-            command = int(row.get('command', 0))
-            recovery_flag = float(row.get('recovery_flag', 0.0))
-            
-            # Đọc 10 giá trị Waypoint (5 cặp X, Y)
-            wp_car = np.array([
-                row['wp_1_x'], row['wp_1_y'],
-                row['wp_2_x'], row['wp_2_y'],
-                row['wp_3_x'], row['wp_3_y'],
-                row['wp_4_x'], row['wp_4_y'],
-                row['wp_5_x'], row['wp_5_y']
-            ], dtype=np.float32).reshape(5, 2)
-            
-            # LẤY ĐƯỜNG DẪN ẢNH CHUẨN TỪ CSV (Giữ nguyên bản vá quan trọng)
-            if 'center_camera' not in row or pd.isna(row['center_camera']):
-                continue
-                
-            center_path_full = row['center_camera']
-            town_folder = center_path_full.replace('\\', '/').split('/')[0] 
-            
-            img_t0_name = _image_id(row['img_id'])
-            img_t1_name = _image_id(row['img_id_tm03'])
-            img_t2_name = _image_id(row['img_id_tm06'])
-            
-            configs = [
-                ('images_center', 0.0),
-                ('images_left', self.geometric_offset),
-                ('images_right', -self.geometric_offset)
-            ]
-            
-            for camera_type, offset in configs:
-                if not self.is_training and camera_type != 'images_center':
+    def _inject_dataset_subdir_from_csv_path(self) -> None:
+        if "dataset_subdir" in self.data_df.columns:
+            return
+        try:
+            relative_parent = self.csv_file.parent.relative_to(self.root_dir)
+        except ValueError:
+            return
+        relative_text = relative_parent.as_posix()
+        if relative_text in {"", "."}:
+            return
+        self.data_df = self.data_df.copy()
+        self.data_df["dataset_subdir"] = relative_text
+
+    def _candidate_dataset_roots(self, row: dict[str, object]) -> list[Path]:
+        candidates: list[Path] = []
+
+        dataset_subdir = _normalize_relative_path(row.get("dataset_subdir", ""))
+        if dataset_subdir:
+            candidates.append((self.root_dir / dataset_subdir).resolve())
+
+        center_ref = _normalize_relative_path(row.get("center_camera", ""))
+        if center_ref:
+            parts = [part for part in center_ref.split("/") if part]
+            camera_dir_names = {name for names in CAMERA_DIR_ALIASES.values() for name in names}
+            for marker in CAMERA_DIR_ALIASES["center"]:
+                if marker not in parts:
                     continue
-                    
-                path_t0 = os.path.join(self.root_dir, town_folder, camera_type, img_t0_name)
-                path_t1 = os.path.join(self.root_dir, town_folder, camera_type, img_t1_name)
-                path_t2 = os.path.join(self.root_dir, town_folder, camera_type, img_t2_name)
-                
-                if os.path.exists(path_t0) and os.path.exists(path_t1) and os.path.exists(path_t2):
-                    wp_cam = wp_car.copy()
-                    wp_cam[:, 1] += offset
-                    
-                    self.samples.append({
-                        'paths': (path_t0, path_t1, path_t2),
-                        'waypoints': wp_cam,
-                        'command': command,
-                        'recovery_flag': recovery_flag
-                    })
-                    self.recovery_flags.append(int(recovery_flag))
-                else:
-                    missing_count += 1
-                    
-        _safe_print(f"✅ Hoàn tất! Đã nạp thành công {len(self.samples)} mẫu dữ liệu Tensor.")
-        if missing_count > 0:
-            _safe_print(f"⚠️ Bỏ qua {missing_count} mẫu do không tìm thấy đủ 3 khung hình ảnh trên ổ cứng.")
+                marker_idx = parts.index(marker)
+                prefix_parts = parts[:marker_idx]
+                for start_idx in range(len(prefix_parts)):
+                    candidate_rel = Path(*prefix_parts[start_idx:])
+                    candidates.append((self.root_dir / candidate_rel).resolve())
+            if parts:
+                first = parts[0]
+                if first not in camera_dir_names:
+                    candidates.append((self.root_dir / first).resolve())
+
+        candidates.append(self.root_dir)
+
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(candidate)
+        return unique
+
+    def _filename_for_time(self, row: dict[str, object], time_key: str) -> str:
+        if time_key == "t0":
+            direct_keys = ("image_filename", "center_camera", "img_id")
+        elif time_key == "tm03":
+            direct_keys = ("image_filename_tm03", "img_id_tm03")
+        else:
+            direct_keys = ("image_filename_tm06", "img_id_tm06")
+
+        for key in direct_keys:
+            value = row.get(key)
+            filename = _normalize_image_filename(value)
+            if filename:
+                return filename
+        return ""
+
+    def _resolve_image_path(
+        self,
+        base_dirs: list[Path],
+        camera_type: str,
+        filename: str,
+    ) -> Optional[str]:
+        if not filename:
+            return None
+
+        for base_dir in base_dirs:
+            for dir_name in CAMERA_DIR_ALIASES[camera_type]:
+                candidate = base_dir / dir_name / filename
+                if candidate.exists():
+                    return str(candidate)
+
+        if camera_type == "center":
+            center_ref = _normalize_relative_path(filename)
+            direct_candidate = Path(center_ref)
+            if direct_candidate.is_absolute() and direct_candidate.exists():
+                return str(direct_candidate)
+
+        return None
+
+    def _resolve_triplet_paths(self, row: dict[str, object], camera_type: str) -> Optional[tuple[str, str, str]]:
+        base_dirs = self._candidate_dataset_roots(row)
+        filenames = {
+            "t0": self._filename_for_time(row, "t0"),
+            "tm03": self._filename_for_time(row, "tm03"),
+            "tm06": self._filename_for_time(row, "tm06"),
+        }
+        if not all(filenames.values()):
+            return None
+
+        path_t0 = self._resolve_image_path(base_dirs, camera_type, filenames["t0"])
+        path_tm03 = self._resolve_image_path(base_dirs, camera_type, filenames["tm03"])
+        path_tm06 = self._resolve_image_path(base_dirs, camera_type, filenames["tm06"])
+
+        if path_t0 and path_tm03 and path_tm06:
+            return path_t0, path_tm03, path_tm06
+        return None
+
+    @staticmethod
+    def _extract_waypoints(row: dict[str, object]) -> Optional[np.ndarray]:
+        keys = (
+            "wp_1_x",
+            "wp_1_y",
+            "wp_2_x",
+            "wp_2_y",
+            "wp_3_x",
+            "wp_3_y",
+            "wp_4_x",
+            "wp_4_y",
+            "wp_5_x",
+            "wp_5_y",
+        )
+        try:
+            values = [float(row[key]) for key in keys]
+        except (KeyError, TypeError, ValueError):
+            return None
+        return np.asarray(values, dtype=np.float32).reshape(5, 2)
+
+    def _prepare_data(self) -> None:
+        _safe_print(f"Preparing temporal dataset from {len(self.data_df)} rows...")
+
+        missing_triplets = 0
+        invalid_rows = 0
+        camera_configs = [
+            ("center", 0.0),
+            ("left", self.geometric_offset),
+            ("right", -self.geometric_offset),
+        ]
+
+        for row in self.data_df.to_dict("records"):
+            waypoints = self._extract_waypoints(row)
+            if waypoints is None:
+                invalid_rows += 1
+                continue
+
+            try:
+                command = int(row.get("command", 0))
+            except (TypeError, ValueError):
+                command = 0
+            try:
+                recovery_flag = float(row.get("recovery_flag", 0.0))
+            except (TypeError, ValueError):
+                recovery_flag = 0.0
+
+            for camera_type, lateral_offset in camera_configs:
+                if not self.is_training and camera_type != "center":
+                    continue
+
+                paths = self._resolve_triplet_paths(row, camera_type)
+                if paths is None:
+                    missing_triplets += 1
+                    continue
+
+                wp_cam = waypoints.copy()
+                wp_cam[:, 1] += float(lateral_offset)
+                self.samples.append(
+                    {
+                        "paths": paths,
+                        "waypoints": wp_cam,
+                        "command": command,
+                        "recovery_flag": recovery_flag,
+                    }
+                )
+                self.recovery_flags.append(int(recovery_flag))
+
+        _safe_print(f"Loaded {len(self.samples)} temporal samples.")
+        if missing_triplets > 0:
+            _safe_print(f"Skipped {missing_triplets} camera triplets with missing files.")
+        if invalid_rows > 0:
+            _safe_print(f"Skipped {invalid_rows} rows with invalid waypoint metadata.")
+        if not self.samples:
+            _safe_print(
+                "Dataset is empty. Expected either legacy columns "
+                "('center_camera', 'img_id*') or current collector columns "
+                "('image_filename*', optional 'dataset_subdir')."
+            )
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    def get_recovery_flags(self) -> Iterable[int]:
+        return list(self.recovery_flags)
 
     def _random_brightness(self, image: np.ndarray) -> np.ndarray:
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
@@ -220,15 +376,14 @@ class WaypointCarlaDataset(Dataset):
         do_cutout = self.is_training and random.random() > 0.5
 
         for path in paths:
-            img = cv2.imread(path)
+            img = cv2.imread(str(path))
             if img is None:
-                img = np.zeros((600, 800, 3), dtype=np.uint8) 
-            else:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            
-            h, w = img.shape[:2]
-            img = img[int(h * 0.45):, :, :]
-            
+                raise FileNotFoundError(f"Failed to read dataset image: {path}")
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+            h, _w = img.shape[:2]
+            img = img[int(h * 0.45) :, :, :]
+
             if self.is_training:
                 if do_brightness:
                     img = self._random_brightness(img)
@@ -251,7 +406,7 @@ class WaypointCarlaDataset(Dataset):
 
         stacked_image = np.concatenate(images, axis=-1)
         stacked_tensor = torch.from_numpy(stacked_image).permute(2, 0, 1).float() / 255.0
-        
+
         if self.transform:
             stacked_tensor = self.transform(stacked_tensor)
 
@@ -265,5 +420,5 @@ class WaypointCarlaDataset(Dataset):
         waypoint_tensor = torch.tensor(waypoints, dtype=torch.float32)
         command_tensor = torch.tensor(command, dtype=torch.long)
         recovery_tensor = torch.tensor(recovery_flag, dtype=torch.float32)
-        
+
         return stacked_tensor, waypoint_tensor, command_tensor, recovery_tensor

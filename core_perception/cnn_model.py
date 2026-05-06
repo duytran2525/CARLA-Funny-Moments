@@ -1,11 +1,43 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Any, Mapping, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def unwrap_state_dict(checkpoint: Any) -> Mapping[str, Any]:
+    state_dict = checkpoint
+    if isinstance(checkpoint, Mapping):
+        if "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        elif "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+    if not isinstance(state_dict, Mapping):
+        raise TypeError("Checkpoint does not contain a state_dict mapping.")
+
+    cleaned = {}
+    for key, value in state_dict.items():
+        clean_key = str(key)
+        if clean_key.startswith("module."):
+            clean_key = clean_key.replace("module.", "", 1)
+        cleaned[clean_key] = value
+    return cleaned
+
+
+def classify_checkpoint_state_dict(state_dict: Mapping[str, Any]) -> str:
+    keys = {str(key) for key in state_dict.keys()}
+    if "stem.conv.weight" in keys or "film.embedding.weight" in keys or "head.4.weight" in keys:
+        return "waypoint"
+    if any(key.startswith("speed_branch.") for key in keys) or any(key.startswith("command_heads.") for key in keys):
+        return "conditional_steering"
+    if any(".running_mean" in key for key in keys):
+        return "steering_v2"
+    if "conv_layers.0.weight" in keys and "dense_layers.0.weight" in keys:
+        return "steering"
+    return "unknown"
 
 
 @dataclass(frozen=True)
@@ -170,9 +202,9 @@ class WaypointPredictor(nn.Module):
         self.scaling = scaling or WaypointScaling()
         self.stem = AggressiveStem(in_channels=9, out_channels=32)
 
-        self.block1 = DepthwiseBlock(32, 64, stride=2)   # P3: [64, 17, 50]
-        self.block2 = DepthwiseBlock(64, 128, stride=2)  # P4: [128, 9, 25]
-        self.block3 = DepthwiseBlock(128, 256, stride=2) # P5: [256, 5, 13]
+        self.block1 = DepthwiseBlock(32, 64, stride=2)
+        self.block2 = DepthwiseBlock(64, 128, stride=2)
+        self.block3 = DepthwiseBlock(128, 256, stride=2)
 
         self.cbam = CBAM(256)
         self.film = FiLM(num_commands=4, emb_dim=64, channels=256)
@@ -214,7 +246,9 @@ class WaypointPredictor(nn.Module):
 
         f3, f4, f5 = self.fpn(p3, p4, p5)
         fused = f3 + F.interpolate(f4, size=f3.shape[-2:], mode="nearest") + F.interpolate(
-            f5, size=f3.shape[-2:], mode="nearest"
+            f5,
+            size=f3.shape[-2:],
+            mode="nearest",
         )
 
         out = self.head(fused)
@@ -222,11 +256,171 @@ class WaypointPredictor(nn.Module):
         sigma = F.softplus(out[:, 10:])
 
         coords = coords.view(-1, 5, 2)
-        # Tạo một tensor chứa hệ số scale nằm trên cùng device (CPU/GPU) với coords
-        scale_factors = torch.tensor([self.scaling.x_scale, self.scaling.y_scale], device=coords.device)
-        # Nhân out-of-place (PyTorch sẽ tạo ra một tensor mới, không ghi đè đồ thị cũ)
-        coords = coords * scale_factors
+        coords[..., 0] = coords[..., 0] * self.scaling.x_scale
+        coords[..., 1] = coords[..., 1] * self.scaling.y_scale
         coords = coords.view(-1, 10)
 
         sigma = sigma * self.scaling.sigma_scale + self.scaling.sigma_eps
         return torch.cat([coords, sigma], dim=1)
+
+
+class CIL_NvidiaCNN(WaypointPredictor):
+    """Compatibility alias for the temporal waypoint model used by CIL."""
+
+
+class NvidiaCNN(nn.Module):
+    """Legacy single-frame steering model without batch normalization."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(3, 24, kernel_size=5, stride=2),
+            nn.ELU(inplace=True),
+            nn.Conv2d(24, 36, kernel_size=5, stride=2),
+            nn.ELU(inplace=True),
+            nn.Conv2d(36, 48, kernel_size=5, stride=2),
+            nn.ELU(inplace=True),
+            nn.Conv2d(48, 64, kernel_size=3, stride=1),
+            nn.ELU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ELU(inplace=True),
+        )
+        self.dense_layers = nn.Sequential(
+            nn.Linear(1152, 100),
+            nn.ELU(inplace=True),
+            nn.Linear(100, 50),
+            nn.ELU(inplace=True),
+            nn.Linear(50, 10),
+            nn.ELU(inplace=True),
+            nn.Linear(10, 1),
+        )
+
+    def forward(self, x: torch.Tensor, *_args: Any, **_kwargs: Any) -> torch.Tensor:
+        features = self.conv_layers(x)
+        flattened = torch.flatten(features, start_dim=1)
+        return self.dense_layers(flattened)
+
+
+class NvidiaCNNV2(nn.Module):
+    """Legacy single-frame steering model with batch normalization."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(3, 24, kernel_size=5, stride=2),
+            nn.BatchNorm2d(24),
+            nn.ELU(inplace=True),
+            nn.Conv2d(24, 36, kernel_size=5, stride=2),
+            nn.BatchNorm2d(36),
+            nn.ELU(inplace=True),
+            nn.Conv2d(36, 48, kernel_size=5, stride=2),
+            nn.BatchNorm2d(48),
+            nn.ELU(inplace=True),
+            nn.Conv2d(48, 64, kernel_size=3, stride=1),
+            nn.BatchNorm2d(64),
+            nn.ELU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.BatchNorm2d(64),
+            nn.ELU(inplace=True),
+        )
+        self.dense_layers = nn.Sequential(
+            nn.Linear(1152, 100),
+            nn.ELU(inplace=True),
+            nn.Dropout(p=0.5),
+            nn.Linear(100, 50),
+            nn.ELU(inplace=True),
+            nn.Dropout(p=0.25),
+            nn.Linear(50, 10),
+            nn.ELU(inplace=True),
+            nn.Dropout(p=0.10),
+            nn.Linear(10, 1),
+        )
+
+    def forward(self, x: torch.Tensor, *_args: Any, **_kwargs: Any) -> torch.Tensor:
+        features = self.conv_layers(x)
+        flattened = torch.flatten(features, start_dim=1)
+        return self.dense_layers(flattened)
+
+
+class ConditionalSteeringCNN(nn.Module):
+    """Legacy command-conditioned steering model used by older checkpoints."""
+
+    num_commands = 4
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(3, 24, kernel_size=5, stride=2),
+            nn.BatchNorm2d(24),
+            nn.ELU(inplace=True),
+            nn.Conv2d(24, 36, kernel_size=5, stride=2),
+            nn.BatchNorm2d(36),
+            nn.ELU(inplace=True),
+            nn.Conv2d(36, 48, kernel_size=5, stride=2),
+            nn.BatchNorm2d(48),
+            nn.ELU(inplace=True),
+            nn.Conv2d(48, 64, kernel_size=3, stride=1),
+            nn.BatchNorm2d(64),
+            nn.ELU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.BatchNorm2d(64),
+            nn.ELU(inplace=True),
+        )
+        self.speed_branch = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.ELU(inplace=True),
+            nn.Linear(64, 32),
+            nn.ELU(inplace=True),
+        )
+        self.command_heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(1184, 256),
+                    nn.ELU(inplace=True),
+                    nn.Dropout(p=0.5),
+                    nn.Linear(256, 64),
+                    nn.ELU(inplace=True),
+                    nn.Dropout(p=0.25),
+                    nn.Linear(64, 1),
+                )
+                for _ in range(self.num_commands)
+            ]
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        speed: torch.Tensor | None = None,
+        command: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch_size = int(x.shape[0])
+        if speed is None:
+            speed = torch.zeros(batch_size, device=x.device, dtype=x.dtype)
+        if command is None:
+            command = torch.zeros(batch_size, device=x.device, dtype=torch.long)
+
+        speed = speed.view(batch_size, 1).to(dtype=x.dtype, device=x.device)
+        command = command.view(batch_size).to(dtype=torch.long, device=x.device).clamp_(0, self.num_commands - 1)
+
+        features = self.conv_layers(x)
+        flattened = torch.flatten(features, start_dim=1)
+        speed_features = self.speed_branch(speed)
+        fused = torch.cat([flattened, speed_features], dim=1)
+
+        outputs = []
+        for row_idx in range(batch_size):
+            head = self.command_heads[int(command[row_idx].item())]
+            outputs.append(head(fused[row_idx : row_idx + 1]))
+        return torch.cat(outputs, dim=0)
+
+
+__all__ = [
+    "CIL_NvidiaCNN",
+    "ConditionalSteeringCNN",
+    "NvidiaCNN",
+    "NvidiaCNNV2",
+    "WaypointPredictor",
+    "WaypointScaling",
+    "classify_checkpoint_state_dict",
+    "unwrap_state_dict",
+]
