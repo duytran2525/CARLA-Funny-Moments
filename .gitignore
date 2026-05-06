@@ -8,14 +8,21 @@ outputs/*
 models/*.pth
 models/*.pt
 models/*.onnx
+models/*.engine
 !models/.gitkeep
+*.pt
+*.onnx
+*.engine
 # Log và kết quả chạy
 *.log
+*.mp4
 # tensorboard_logs/
 # demo_videos/
 
 # Môi trường ảo & Python rác
 venv/
+.venv/
+.venv-1/
 .env
 __pycache__/
 *.pyc
