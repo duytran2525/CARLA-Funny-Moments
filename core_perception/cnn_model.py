@@ -255,10 +255,10 @@ class WaypointPredictor(nn.Module):
         coords = torch.tanh(out[:, :10])
         sigma = F.softplus(out[:, 10:])
 
-        coords = coords.view(-1, 5, 2).clone()
-        coords[..., 0] = coords[..., 0] * self.scaling.x_scale
-        coords[..., 1] = coords[..., 1] * self.scaling.y_scale
-        coords = coords.view(-1, 10)
+        coords_view = coords.view(-1, 5, 2)
+        x_scaled = coords_view[..., 0] * self.scaling.x_scale
+        y_scaled = coords_view[..., 1] * self.scaling.y_scale
+        coords = torch.stack([x_scaled, y_scaled], dim=-1).view(-1, 10)
 
         sigma = sigma * self.scaling.sigma_scale + self.scaling.sigma_eps
         return torch.cat([coords, sigma], dim=1)
