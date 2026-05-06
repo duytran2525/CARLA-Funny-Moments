@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Mapping, Tuple
@@ -255,7 +255,7 @@ class WaypointPredictor(nn.Module):
         coords = torch.tanh(out[:, :10])
         sigma = F.softplus(out[:, 10:])
 
-        coords = coords.view(-1, 5, 2)
+        coords = coords.view(-1, 5, 2).clone()
         coords[..., 0] = coords[..., 0] * self.scaling.x_scale
         coords[..., 1] = coords[..., 1] * self.scaling.y_scale
         coords = coords.view(-1, 10)
