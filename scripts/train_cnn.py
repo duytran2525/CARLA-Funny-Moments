@@ -390,7 +390,7 @@ def main():
 
             # FIX KAGGLE INTRA-EPOCH OOM: Dọn rác
             del images, waypoints, commands, outputs, pred_wp, pred_sigma, target_wp, loss_wp, loss_gnll, loss
-            if i % 400 == 0:
+            if i % 100 == 0:
                 import gc
                 gc.collect()
                 print(f"  [Train] Epoch {epoch + 1} - Batch {i}/{len(train_loader)}", flush=True)
@@ -421,7 +421,7 @@ def main():
 
                 # FIX KAGGLE VALIDATION OOM: Dọn rác
                 del images, waypoints, commands, outputs, pred_wp, pred_sigma, target_wp, loss_wp, loss_gnll, loss
-                if i % 200 == 0:
+                if i % 50 == 0:
                     import gc
                     gc.collect()
                     print(f"  [Val] Epoch {epoch + 1} - Batch {i}/{len(val_loader)}", flush=True)
