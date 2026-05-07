@@ -13,7 +13,7 @@ work_dir: /kaggle/working
 
 epochs: 50                      # ⬆️ Tăng từ 40 → 50 (cần thêm thời gian fine-tune với batch lớn)
 
-batch_size: 48                  # ⬆️ Tăng từ 32 → 48 (tận dụng 32GB T4 memory, tốc độ nhanh hơn)
+batch_size: 32                  # ⬇️ Hạ xuống 32 để xoa dịu tắc nghẽn IO và RAM
 
 learning_rate: 0.001            # ✅ An toàn hơn cho GNLL (giảm nguy cơ NaN ở giai đoạn đầu)
 

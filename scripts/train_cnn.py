@@ -274,8 +274,8 @@ def main():
     if len(val_dataset) == 0:
         raise RuntimeError("Validation dataset is empty after split/path resolution. Adjust data split or dataset root.")
 
-    # FIX KAGGLE SYSTEM RAM OOM: Ép chặt num_workers = 0 và pin_memory = False
-    num_workers = 0
+    # FIX KAGGLE IO BOTTLENECK: Tăng worker lên để đọc file, giảm batch_size
+    num_workers = 2
     pin_mem = False
     batch_size = int(config["batch_size"])
 
