@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
 os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
-os.environ["PYTHONUNBUFFERED"] = "1"
 
 import random
 import sys
@@ -35,6 +34,20 @@ except ImportError:  # pragma: no cover
 def load_config(config_path):
     with open(config_path, "r", encoding="utf-8") as file:
         return yaml.safe_load(file)
+
+
+def _to_bool(value, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
 
 
 def set_seed(seed: Optional[int]) -> None:
@@ -175,6 +188,12 @@ def _print_split_summary(label: str, df: pd.DataFrame) -> None:
         print(f"  dataset_counts={counts}")
 
 
+def _maybe_cap_rows(df: pd.DataFrame, limit: int, *, seed: int) -> pd.DataFrame:
+    if limit <= 0 or len(df) <= limit:
+        return df
+    return df.sample(n=int(limit), random_state=seed).reset_index(drop=True)
+
+
 def main():
     root_dir = Path(__file__).resolve().parent.parent
     config = load_config(root_dir / "configs" / "train_params.yaml")
@@ -182,6 +201,10 @@ def main():
     seed = int(config.get("seed", 42))
     set_seed(seed)
     print(f"Seed: {seed}")
+    torch.set_float32_matmul_precision("high")
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     data_root = Path(config.get("data_root", root_dir / "data"))
     if not data_root.is_absolute():
@@ -196,6 +219,7 @@ def main():
     if not model_save_path.is_absolute():
         model_save_path = (root_dir / model_save_path).resolve()
     model_save_path.parent.mkdir(parents=True, exist_ok=True)
+    batch_size = int(config["batch_size"])
 
     print("\n" + "=" * 70)
     print("GPU SETUP")
@@ -205,12 +229,18 @@ def main():
     print_gpu_info()
     torch.backends.cudnn.benchmark = torch.cuda.is_available()
 
+    requested_multi_gpu = config.get("use_multi_gpu")
     if num_gpus > 0:
         primary_device = torch.device("cuda:0")
-        use_multi_gpu = num_gpus > 1
+        if requested_multi_gpu is None:
+            use_multi_gpu = num_gpus > 1 and batch_size >= 64
+        else:
+            use_multi_gpu = num_gpus > 1 and _to_bool(requested_multi_gpu, True)
         print(f"Using device: {num_gpus} GPU(s)")
         if use_multi_gpu:
             print("Mode: DataParallel")
+        elif num_gpus > 1:
+            print("Mode: Single GPU (DataParallel disabled by config/heuristic)")
     else:
         primary_device = torch.device("cpu")
         use_multi_gpu = False
@@ -241,6 +271,8 @@ def main():
 
     train_split_ratio = float(config.get("train_split", 0.75))
     train_df, val_df = _stratified_split(df, train_split_ratio, seed)
+    train_df = _maybe_cap_rows(train_df, int(config.get("max_train_rows", 0) or 0), seed=seed)
+    val_df = _maybe_cap_rows(val_df, int(config.get("max_val_rows", 0) or 0), seed=seed)
 
     _print_split_summary("Train split", train_df)
     _print_split_summary("Val split", val_df)
@@ -254,12 +286,14 @@ def main():
             "Fix the dataset module before training."
         )
 
+    include_side_cameras_train = _to_bool(config.get("include_side_cameras_train"), True)
     train_dataset = WaypointCarlaDataset(
         csv_file=train_csv_path,
         root_dir=data_root,
         transform=transform,
         is_training=True,
         geometric_offset=float(config.get("geometric_offset", 0.35)),
+        include_side_cameras=include_side_cameras_train,
     )
     val_dataset = WaypointCarlaDataset(
         csv_file=val_csv_path,
@@ -267,6 +301,7 @@ def main():
         transform=transform,
         is_training=False,
         geometric_offset=float(config.get("geometric_offset", 0.35)),
+        include_side_cameras=False,
     )
 
     if len(train_dataset) == 0:
@@ -274,10 +309,15 @@ def main():
     if len(val_dataset) == 0:
         raise RuntimeError("Validation dataset is empty after split/path resolution. Adjust data split or dataset root.")
 
-    # FIX KAGGLE IO BOTTLENECK: Tăng worker lên để đọc file, giảm batch_size
-    num_workers = 2
-    pin_mem = False
-    batch_size = int(config["batch_size"])
+    num_workers_cfg = config.get("num_workers")
+    if num_workers_cfg is None:
+        num_workers = min(4, max(1, os.cpu_count() or 2))
+    else:
+        num_workers = max(0, int(num_workers_cfg))
+    pin_mem = torch.cuda.is_available()
+    prefetch_factor = max(2, int(config.get("prefetch_factor", 2)))
+    log_every_batches = max(0, int(config.get("log_every_batches", 0)))
+    val_log_every_batches = max(0, int(config.get("val_log_every_batches", 0)))
 
     recovery_weight = float(config.get("recovery_weight", 2.0))
     sampler = _build_recovery_sampler(_get_recovery_flags(train_dataset), recovery_weight)
@@ -302,8 +342,8 @@ def main():
         "persistent_workers": num_workers > 0,
     }
     if num_workers > 0:
-        train_loader_kwargs["prefetch_factor"] = 2
-        val_loader_kwargs["prefetch_factor"] = 2
+        train_loader_kwargs["prefetch_factor"] = prefetch_factor
+        val_loader_kwargs["prefetch_factor"] = prefetch_factor
 
     train_loader = DataLoader(train_dataset, **train_loader_kwargs)
     val_loader = DataLoader(val_dataset, **val_loader_kwargs)
@@ -319,6 +359,8 @@ def main():
     print("=" * 70)
 
     model = WaypointPredictor().to(primary_device)
+    if primary_device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
     if use_multi_gpu:
         model = nn.DataParallel(model, device_ids=list(range(num_gpus)))
         print(f"Wrapped model with DataParallel ({num_gpus} GPUs)")
@@ -368,6 +410,8 @@ def main():
         for i, (images, waypoints, commands, recovery_flags) in enumerate(train_loader):
             del recovery_flags
             images = images.to(primary_device, non_blocking=True)
+            if primary_device.type == "cuda":
+                images = images.contiguous(memory_format=torch.channels_last)
             commands = commands.to(primary_device, non_blocking=True)
             waypoints = waypoints.to(primary_device, non_blocking=True)
 
@@ -387,13 +431,8 @@ def main():
             scaler.step(optimizer)
             scaler.update()
             running_loss += float(loss.item())
-
-            # FIX KAGGLE INTRA-EPOCH OOM: Dọn rác
-            del images, waypoints, commands, outputs, pred_wp, pred_sigma, target_wp, loss_wp, loss_gnll, loss
-            if i % 100 == 0:
-                import gc
-                gc.collect()
-                print(f"  [Train] Epoch {epoch + 1} - Batch {i}/{len(train_loader)}", flush=True)
+            if log_every_batches > 0 and (i == 0 or (i + 1) % log_every_batches == 0):
+                print(f"  [Train] Epoch {epoch + 1} - Batch {i + 1}/{len(train_loader)}")
 
         train_loss = running_loss / len(train_loader)
 
@@ -404,6 +443,8 @@ def main():
             for i, (images, waypoints, commands, recovery_flags) in enumerate(val_loader):
                 del recovery_flags
                 images = images.to(primary_device, non_blocking=True)
+                if primary_device.type == "cuda":
+                    images = images.contiguous(memory_format=torch.channels_last)
                 commands = commands.to(primary_device, non_blocking=True)
                 waypoints = waypoints.to(primary_device, non_blocking=True)
 
@@ -418,13 +459,8 @@ def main():
                     loss = lambda_wp * loss_wp + lambda_gnll * loss_gnll.mean()
 
                 val_loss += float(loss.item())
-
-                # FIX KAGGLE VALIDATION OOM: Dọn rác
-                del images, waypoints, commands, outputs, pred_wp, pred_sigma, target_wp, loss_wp, loss_gnll, loss
-                if i % 50 == 0:
-                    import gc
-                    gc.collect()
-                    print(f"  [Val] Epoch {epoch + 1} - Batch {i}/{len(val_loader)}", flush=True)
+                if val_log_every_batches > 0 and (i == 0 or (i + 1) % val_log_every_batches == 0):
+                    print(f"  [Val] Epoch {epoch + 1} - Batch {i + 1}/{len(val_loader)}")
 
         val_loss = val_loss / len(val_loader)
 
@@ -453,6 +489,9 @@ def main():
             if epochs_no_improve >= early_stopping_patience:
                 print(f"\nEarly stopping after epoch {epoch + 1}")
                 break
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     print("\n" + "=" * 70)
     print("TRAINING COMPLETE")

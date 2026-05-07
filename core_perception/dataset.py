@@ -95,14 +95,17 @@ class WaypointCarlaDataset(Dataset):
         filter_stationary=True,
         min_speed_kmh=1.0,
         min_wp5_x_m=3.0,
+        include_side_cameras=True,
     ):
         self.root_dir = Path(root_dir).resolve()
         self.transform = transform
         self.is_training = bool(is_training)
         self.geometric_offset = float(geometric_offset)
-        self.samples: list[tuple[int, str, float]] = []
+        self.include_side_cameras = bool(include_side_cameras)
+        self.samples: list[dict[str, object]] = []
         self.recovery_flags: list[int] = []
         self.csv_file = Path(csv_file).resolve()
+        self._resolved_image_cache: dict[tuple[str, str, str], Optional[str]] = {}
 
         self.data_df = pd.read_csv(self.csv_file)
         self._inject_dataset_subdir_from_csv_path()
@@ -191,9 +194,17 @@ class WaypointCarlaDataset(Dataset):
 
         for base_dir in base_dirs:
             for dir_name in CAMERA_DIR_ALIASES[camera_type]:
+                cache_key = (str(base_dir), dir_name, filename)
+                cached = self._resolved_image_cache.get(cache_key)
+                if cached is not None:
+                    return cached
+
                 candidate = base_dir / dir_name / filename
                 if candidate.exists():
-                    return str(candidate)
+                    resolved = str(candidate)
+                    self._resolved_image_cache[cache_key] = resolved
+                    return resolved
+                self._resolved_image_cache[cache_key] = None
 
         if camera_type == "center":
             center_ref = _normalize_relative_path(filename)
@@ -246,11 +257,14 @@ class WaypointCarlaDataset(Dataset):
 
         missing_triplets = 0
         invalid_rows = 0
-        camera_configs = [
-            ("center", 0.0),
-            ("left", self.geometric_offset),
-            ("right", -self.geometric_offset),
-        ]
+        camera_configs = [("center", 0.0)]
+        if self.is_training and self.include_side_cameras:
+            camera_configs.extend(
+                [
+                    ("left", self.geometric_offset),
+                    ("right", -self.geometric_offset),
+                ]
+            )
 
         for row_idx, row in enumerate(self.data_df.to_dict("records")):
             waypoints = self._extract_waypoints(row)
@@ -268,15 +282,23 @@ class WaypointCarlaDataset(Dataset):
                 recovery_flag = 0.0
 
             for camera_type, lateral_offset in camera_configs:
-                if not self.is_training and camera_type != "center":
-                    continue
-
                 paths = self._resolve_triplet_paths(row, camera_type)
                 if paths is None:
                     missing_triplets += 1
                     continue
 
-                self.samples.append((int(row_idx), camera_type, float(lateral_offset)))
+                wp_cam = waypoints.copy()
+                wp_cam[:, 1] += float(lateral_offset)
+                self.samples.append(
+                    {
+                        "paths": paths,
+                        "waypoints": wp_cam,
+                        "command": command,
+                        "recovery_flag": recovery_flag,
+                        "row_idx": int(row_idx),
+                        "camera_type": camera_type,
+                    }
+                )
                 self.recovery_flags.append(int(recovery_flag))
 
         _safe_print(f"Loaded {len(self.samples)} temporal samples.")
@@ -351,26 +373,11 @@ class WaypointCarlaDataset(Dataset):
         return image
 
     def __getitem__(self, idx: int):
-        row_idx, camera_type, lateral_offset = self.samples[idx]
-        row = self.data_df.iloc[row_idx]
-        paths = self._resolve_triplet_paths(row, camera_type)
-        if paths is None:
-            raise FileNotFoundError(f"Failed to resolve image triplet for row index {row_idx} and camera {camera_type}")
-
-        waypoints = self._extract_waypoints(row)
-        if waypoints is None:
-            raise ValueError(f"Invalid waypoint metadata at row index {row_idx}")
-        waypoints = np.asarray(waypoints, dtype=np.float32).copy()
-        waypoints[:, 1] += float(lateral_offset)
-
-        try:
-            command = int(row.get("command", 0))
-        except (TypeError, ValueError):
-            command = 0
-        try:
-            recovery_flag = float(row.get("recovery_flag", 0.0))
-        except (TypeError, ValueError):
-            recovery_flag = 0.0
+        sample = self.samples[idx]
+        paths = sample["paths"]
+        waypoints = np.asarray(sample["waypoints"], dtype=np.float32).copy()
+        command = int(sample["command"])
+        recovery_flag = float(sample["recovery_flag"])
 
         images = []
         do_flip = self.is_training and random.random() > 0.5

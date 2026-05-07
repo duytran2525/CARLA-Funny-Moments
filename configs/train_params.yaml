@@ -11,9 +11,9 @@ data_root: /kaggle/input/datasets/yudtrann/data-carlav3/data_carlav2
 csv_path: /kaggle/input/datasets/yudtrann/data-carlav3/data_carlav2/driving_log.csv
 work_dir: /kaggle/working
 
-epochs: 50                      # ⬆️ Tăng từ 40 → 50 (cần thêm thời gian fine-tune với batch lớn)
+epochs: 20                      # Thực dụng hơn cho Kaggle; early stopping sẽ dừng sớm nếu không cải thiện
 
-batch_size: 32                  # ⬇️ Hạ xuống 32 để xoa dịu tắc nghẽn IO và RAM
+batch_size: 64                  # Tăng batch để giảm steps/epoch trên Kaggle
 
 learning_rate: 0.001            # ✅ An toàn hơn cho GNLL (giảm nguy cơ NaN ở giai đoạn đầu)
 
@@ -37,7 +37,11 @@ lr_factor: 0.7                  # ✅ Giữ nguyên
 early_stopping_patience: 12     # ⬆️ Tăng từ 10 → 12 (match với tăng epochs)
 seed: 42
 model_save_path: models/waypoint_predictor.pth
-# num_workers: 4
+num_workers: 4
+prefetch_factor: 4
+include_side_cameras_train: false
+log_every_batches: 250
+val_log_every_batches: 0
 
 # ============================================================================
 # GPU OPTIMIZATION NOTES:
