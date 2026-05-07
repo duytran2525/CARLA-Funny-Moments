@@ -68,8 +68,8 @@ runtime:
   ticks: 0
   tick_interval: 0.03
   fps_log_interval_ticks: 30
-  cil_enable_hud: true
+  cil_enable_hud: false
   cil_enable_route_map: false
-  cil_enable_telemetry_csv: true
-  cil_profile_tick_timing: true
+  cil_enable_telemetry_csv: false
+  cil_profile_tick_timing: false
   cil_profile_log_interval_ticks: 60

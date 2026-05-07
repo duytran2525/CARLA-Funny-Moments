@@ -52,11 +52,21 @@ except ImportError:
     yaml = None
 
 try:
-    from core_perception.cnn_model import CIL_NvidiaCNN, NvidiaCNN, NvidiaCNNV2
+    from core_perception.cnn_model import (
+        CIL_NvidiaCNN,
+        ConditionalSteeringCNN,
+        NvidiaCNN,
+        NvidiaCNNV2,
+        classify_checkpoint_state_dict,
+        unwrap_state_dict,
+    )
 except Exception:
     CIL_NvidiaCNN = None
+    ConditionalSteeringCNN = None
     NvidiaCNN = None
     NvidiaCNNV2 = None
+    classify_checkpoint_state_dict = None
+    unwrap_state_dict = None
 
 try:
     from core_perception.yolo_detector import YoloDetector
@@ -504,15 +514,27 @@ def resolve_model_path(model_path: str) -> Path:
             reverse=True,
         )
 
+    def is_steering_candidate(path: Path) -> bool:
+        if torch is None or unwrap_state_dict is None or classify_checkpoint_state_dict is None:
+            return True
+        try:
+            checkpoint = torch.load(path, map_location="cpu")
+            state_dict = unwrap_state_dict(checkpoint)
+            kind = classify_checkpoint_state_dict(state_dict)
+        except Exception:
+            return True
+        return kind in {"steering", "steering_v2", "conditional_steering"}
+
     preferred = newest("cnn_steering TL=*.pth")
     if preferred:
         return preferred[0]
 
     steering_models = newest("cnn_steering*.pth")
+    steering_models = [path for path in steering_models if is_steering_candidate(path)]
     if steering_models:
         return steering_models[0]
 
-    any_pth = newest("*.pth")
+    any_pth = [path for path in newest("*.pth") if is_steering_candidate(path)]
     if any_pth:
         return any_pth[0]
 
@@ -529,7 +551,7 @@ def resolve_cil_model_path(model_path: str) -> Path:
 
     models_dir = project_root / "models"
     if not models_dir.exists():
-        return (project_root / "models" / "cil_nvidia.pth").resolve()
+        return (project_root / "models" / "waypoint_predictor.pth").resolve()
 
     def newest(pattern: str) -> list[Path]:
         return sorted(
@@ -538,19 +560,47 @@ def resolve_cil_model_path(model_path: str) -> Path:
             reverse=True,
         )
 
+    def is_waypoint_candidate(path: Path) -> bool:
+        if torch is None or unwrap_state_dict is None or classify_checkpoint_state_dict is None:
+            return False
+        try:
+            checkpoint = torch.load(path, map_location="cpu")
+            state_dict = unwrap_state_dict(checkpoint)
+            kind = classify_checkpoint_state_dict(state_dict)
+        except Exception:
+            return False
+        return kind == "waypoint"
+
+    preferred = newest("waypoint_predictor*.pth")
+    preferred = [path for path in preferred if is_waypoint_candidate(path)]
+    if preferred:
+        return preferred[0]
+
+    preferred = newest("waypoint*.pth")
+    preferred = [path for path in preferred if is_waypoint_candidate(path)]
+    if preferred:
+        return preferred[0]
+
+    preferred = newest("*waypoint*.pth")
+    preferred = [path for path in preferred if is_waypoint_candidate(path)]
+    if preferred:
+        return preferred[0]
+
     preferred = newest("cil*.pth")
+    preferred = [path for path in preferred if is_waypoint_candidate(path)]
     if preferred:
         return preferred[0]
 
     preferred = newest("*cil*.pth")
+    preferred = [path for path in preferred if is_waypoint_candidate(path)]
     if preferred:
         return preferred[0]
 
-    any_pth = newest("*.pth")
+    any_pth = [path for path in newest("*.pth") if is_waypoint_candidate(path)]
     if any_pth:
         return any_pth[0]
 
-    return (models_dir / "cil_nvidia.pth").resolve()
+    return (models_dir / "waypoint_predictor.pth").resolve()
 
 
 def resolve_yolo_model_path(model_path: str) -> Path:
@@ -1536,11 +1586,13 @@ class AutopilotAgent(BaseAgent):
 
 class LaneFollowAgent(BaseAgent):
     name = "lane_follow"
+    STEERING_SPEED_NORM_KMH = 120.0
 
     def __init__(self, config: RunConfig) -> None:
         super().__init__(config)
         self._enabled = False
         self._model = None
+        self._model_kind = "unknown"
         self._device = None
         self._camera = None
         self._depth_camera = None
@@ -1756,8 +1808,8 @@ class LaneFollowAgent(BaseAgent):
             raise RuntimeError("opencv-python is required for lane_follow agent.")
         if np is None:
             raise RuntimeError("numpy is required for lane_follow agent.")
-        if NvidiaCNN is None:
-            raise RuntimeError("Cannot import NvidiaCNN from core_perception.cnn_model.")
+        if NvidiaCNN is None or unwrap_state_dict is None or classify_checkpoint_state_dict is None:
+            raise RuntimeError("Cannot import lane-follow model definitions from core_perception.cnn_model.")
 
         model_path = resolve_model_path(self.config.model_path)
         if self.config.model_path.lower() == "auto":
@@ -1779,30 +1831,27 @@ class LaneFollowAgent(BaseAgent):
         self._device = torch.device(device_name)
 
         checkpoint = torch.load(model_path, map_location=self._device)
-        state_dict = checkpoint
-        if isinstance(checkpoint, dict):
-            if "state_dict" in checkpoint:
-                state_dict = checkpoint["state_dict"]
-            elif "model_state_dict" in checkpoint:
-                state_dict = checkpoint["model_state_dict"]
-        if not isinstance(state_dict, dict):
-            raise RuntimeError("Unsupported checkpoint format. Expected state_dict.")
+        state_dict = unwrap_state_dict(checkpoint)
+        model_kind = classify_checkpoint_state_dict(state_dict)
 
-        if any(key.startswith("module.") for key in state_dict.keys()):
-            state_dict = {
-                key.replace("module.", "", 1): value for key, value in state_dict.items()
-            }
-
-        # Auto-detect V2 architecture (has BatchNorm layers)
-        is_v2 = any("running_mean" in k for k in state_dict.keys())
-        if is_v2:
-            logging.info("Detected V2 architecture (BatchNorm) for %s", model_path)
+        if model_kind == "conditional_steering":
+            if ConditionalSteeringCNN is None:
+                raise RuntimeError("ConditionalSteeringCNN is unavailable for this checkpoint.")
+            model = ConditionalSteeringCNN().to(self._device)
+        elif model_kind == "steering_v2":
+            logging.info("Detected V2 steering architecture for %s", model_path)
             model = NvidiaCNNV2().to(self._device)
-        else:
+        elif model_kind == "steering":
             model = NvidiaCNN().to(self._device)
+        else:
+            raise RuntimeError(
+                f"Incompatible lane-follow checkpoint '{model_path.name}' detected as '{model_kind}'. "
+                "Use a steering checkpoint such as cnn_steering*.pth."
+            )
 
         model.load_state_dict(state_dict, strict=True)
         model.eval()
+        self._model_kind = model_kind
         logging.info("Loaded model from %s on %s", model_path, self._device)
         return model
 
@@ -1870,7 +1919,7 @@ class LaneFollowAgent(BaseAgent):
         if self._video_frames_written >= self._video_max_frames:
             self._stop_requested = True
 
-    def _predict_steering(self, rgb_frame) -> float:
+    def _predict_steering(self, rgb_frame, speed_kmh: float = 0.0, command: int = 0) -> float:
         height = rgb_frame.shape[0]
         cropped = rgb_frame[int(height * 0.45) :, :, :]
         resized = cv2.resize(cropped, (200, 66), interpolation=cv2.INTER_AREA)
@@ -1882,7 +1931,13 @@ class LaneFollowAgent(BaseAgent):
         tensor.unsqueeze_(0)
         tensor = tensor.to(self._device, non_blocking=True)
         with torch.inference_mode():
-            steering = self._model(tensor).item()
+            if self._model_kind == "conditional_steering":
+                speed_norm = clamp(float(speed_kmh) / self.STEERING_SPEED_NORM_KMH, 0.0, 1.0)
+                speed_tensor = torch.tensor([speed_norm], dtype=torch.float32, device=self._device)
+                command_tensor = torch.tensor([max(0, min(3, int(command)))], dtype=torch.long, device=self._device)
+                steering = self._model(tensor, speed_tensor, command_tensor).item()
+            else:
+                steering = self._model(tensor).item()
         return clamp(steering, -1.0, 1.0)
 
     def _current_speed_kmh(self) -> float:
@@ -2105,7 +2160,7 @@ class LaneFollowAgent(BaseAgent):
             logging.info("Video duration target reached, stopping agent loop.")
             return
 
-        steering_raw = self._predict_steering(frame)
+        steering_raw = self._predict_steering(frame, speed_kmh=speed_kmh, command=0)
         alpha = clamp(self.config.steer_smoothing, 0.0, 0.99)
         steering = alpha * self._last_steer + (1.0 - alpha) * steering_raw
         self._last_steer = steering
@@ -2341,6 +2396,9 @@ class CILAgent(BaseAgent):
         self._ensure_vehicle_on_driving_lane(world, vehicle)
 
         self._model = self._load_cil_model()
+        with self._frame_lock:
+            self._latest_rgb = None
+            self._frame_history.clear()
         self._camera = self._spawn_camera(world, vehicle)
         self._camera.listen(self._on_camera_frame)
         self._init_navigation_agent(world, vehicle)
@@ -3428,8 +3486,8 @@ class CILAgent(BaseAgent):
             raise RuntimeError("opencv-python is required for CIL agent.")
         if np is None:
             raise RuntimeError("numpy is required for CIL agent.")
-        if CIL_NvidiaCNN is None:
-            raise RuntimeError("Cannot import CIL_NvidiaCNN from core_perception.cnn_model.")
+        if CIL_NvidiaCNN is None or unwrap_state_dict is None or classify_checkpoint_state_dict is None:
+            raise RuntimeError("Cannot import CIL waypoint model definitions from core_perception.cnn_model.")
 
         model_path = resolve_cil_model_path(self.config.cil_model_path)
         if self.config.cil_model_path.lower() == "auto":
@@ -3451,19 +3509,13 @@ class CILAgent(BaseAgent):
         self._device = torch.device(device_name)
 
         checkpoint = torch.load(model_path, map_location=self._device)
-        state_dict = checkpoint
-        if isinstance(checkpoint, dict):
-            if "state_dict" in checkpoint:
-                state_dict = checkpoint["state_dict"]
-            elif "model_state_dict" in checkpoint:
-                state_dict = checkpoint["model_state_dict"]
-        if not isinstance(state_dict, dict):
-            raise RuntimeError("Unsupported CIL checkpoint format. Expected state_dict.")
-
-        if any(key.startswith("module.") for key in state_dict.keys()):
-            state_dict = {
-                key.replace("module.", "", 1): value for key, value in state_dict.items()
-            }
+        state_dict = unwrap_state_dict(checkpoint)
+        model_kind = classify_checkpoint_state_dict(state_dict)
+        if model_kind != "waypoint":
+            raise RuntimeError(
+                f"Incompatible CIL checkpoint '{model_path.name}' detected as '{model_kind}'. "
+                "Train or provide a waypoint predictor checkpoint such as models/waypoint_predictor.pth."
+            )
 
         model = CIL_NvidiaCNN().to(self._device)
         model.load_state_dict(state_dict, strict=True)

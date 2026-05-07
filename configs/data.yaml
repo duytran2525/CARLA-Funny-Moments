@@ -1,0 +1,13 @@
+path: ../data/yolo
+train: images/train
+val: images/val
+test: images/val
+
+names:
+  0: pedestrian
+  1: vehicle
+  2: two_wheeler
+  3: traffic_sign
+  4: traffic_light_red
+  5: traffic_light_green
+  6: stop_line

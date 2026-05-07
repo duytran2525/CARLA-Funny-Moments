@@ -7,8 +7,8 @@
 # ============================================================================
 
 # Kaggle dataset paths (update đúng tên dataset trên Kaggle của bạn)
-data_root: /kaggle/input/datasets/yudtrann/data-carlav3/data_carlav2
-csv_path: /kaggle/input/datasets/yudtrann/data-carlav3/data_carlav2/driving_log.csv
+data_root: /kaggle/input/carla-waypoints
+csv_path: /kaggle/input/carla-waypoints/driving_log.csv
 work_dir: /kaggle/working
 
 epochs: 50                      # ⬆️ Tăng từ 40 → 50 (cần thêm thời gian fine-tune với batch lớn)
@@ -35,6 +35,9 @@ lr_factor: 0.7                  # ✅ Giữ nguyên
 # Early Stopping
 # Dừng training nếu validation loss không cải thiện sau {patience} epochs
 early_stopping_patience: 12     # ⬆️ Tăng từ 10 → 12 (match với tăng epochs)
+seed: 42
+model_save_path: models/waypoint_predictor.pth
+# num_workers: 4
 
 # ============================================================================
 # GPU OPTIMIZATION NOTES:

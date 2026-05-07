@@ -1,0 +1,17 @@
+# Core ML / data
+numpy
+pandas
+PyYAML
+
+# Vision
+opencv-python
+ultralytics
+
+# PyTorch
+torch
+torchvision
+
+# Optional local verification
+pytest
+
+# CARLA is usually installed separately because versioning is tied to the simulator build.
