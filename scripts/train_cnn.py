@@ -389,7 +389,7 @@ def main():
             if i % 200 == 0:
                 import gc
                 gc.collect()
-                print(f"  [Train] Epoch {epoch + 1} - Batch {i}/{len(train_loader)}")
+                # Giữ im lặng để tránh IOStream.flush timed out trên Kaggle
 
         train_loss = running_loss / len(train_loader)
 
