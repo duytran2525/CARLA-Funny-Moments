@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import os
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
+os.environ["PYTHONUNBUFFERED"] = "1"
+
 import random
 import sys
 import warnings
@@ -386,10 +390,10 @@ def main():
 
             # FIX KAGGLE INTRA-EPOCH OOM: Dọn rác
             del images, waypoints, commands, outputs, pred_wp, pred_sigma, target_wp, loss_wp, loss_gnll, loss
-            if i % 200 == 0:
+            if i % 400 == 0:
                 import gc
                 gc.collect()
-                # Giữ im lặng để tránh IOStream.flush timed out trên Kaggle
+                print(f"  [Train] Epoch {epoch + 1} - Batch {i}/{len(train_loader)}", flush=True)
 
         train_loss = running_loss / len(train_loader)
 
@@ -420,6 +424,7 @@ def main():
                 if i % 200 == 0:
                     import gc
                     gc.collect()
+                    print(f"  [Val] Epoch {epoch + 1} - Batch {i}/{len(val_loader)}", flush=True)
 
         val_loss = val_loss / len(val_loader)
 
