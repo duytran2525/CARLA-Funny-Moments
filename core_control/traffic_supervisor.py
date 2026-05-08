@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 from enum import Enum
@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-
 
 class SupervisorState(Enum):
     CRUISING = "cruising"

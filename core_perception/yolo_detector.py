@@ -8,11 +8,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 import torch
-from ultralytics import YOLO
+from ultralytics import YOLO, RTDETR
 
 from core_perception.object_tracker import KalmanObjectTracker
 from core_perception.spatial_math import CameraIntrinsics, DynamicIPM
-
 
 class YoloDetector:
     """
@@ -76,9 +75,13 @@ class YoloDetector:
         self._predict_device: Any = 0 if self.device.type == "cuda" else "cpu"
         self._use_half_precision = self.device.type == "cuda" and not self._is_exported_model
         self._warmed_up = False
+        
         if self.device.type == "cuda":
             torch.backends.cudnn.benchmark = True
-        self.model = YOLO(model_path, task="detect")
+        if "rtdetr" in model_path.lower():
+            self.model = RTDETR(model_path)
+        else:
+            self.model = YOLO(model_path, task="detect")
         if not self._is_exported_model:
             self.model = self.model.to(self.device)
         self.class_names = self.model.names
