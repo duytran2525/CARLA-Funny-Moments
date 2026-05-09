@@ -4659,6 +4659,14 @@ class YoloDetectAgent(BaseAgent):
         self._cached_detector_emergency = False
         self._cached_debug_info: Dict[str, Any] = {}
         self._last_detection_runtime_ms: Optional[float] = None
+        self._tracking_metrics_dir: Optional[Path] = None
+        self._tracking_predictions_path: Optional[Path] = None
+        self._tracking_ground_truth_path: Optional[Path] = None
+        self._tracking_seqinfo_path: Optional[Path] = None
+        self._tracking_seq_name: str = ""
+        self._tracking_gt_logs: list[str] = []
+        self._tracking_gt_frame_id = 0
+        self._tracking_image_size: tuple[int, int] = (0, 0)
 
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
@@ -4676,6 +4684,14 @@ class YoloDetectAgent(BaseAgent):
         self._cached_detector_emergency = False
         self._cached_debug_info = {}
         self._last_detection_runtime_ms = None
+        self._tracking_gt_logs = []
+        self._tracking_gt_frame_id = 0
+        self._tracking_image_size = (0, 0)
+        self._tracking_metrics_dir = None
+        self._tracking_predictions_path = None
+        self._tracking_ground_truth_path = None
+        self._tracking_seqinfo_path = None
+        self._tracking_seq_name = ""
         vehicle = session.ego_vehicle
         world = session.world
         if vehicle is None or world is None:
@@ -4707,7 +4723,9 @@ class YoloDetectAgent(BaseAgent):
             camera_mount_y_m=0.0,
             camera_mount_z_m=2.2,
             camera_pitch_deg=-8.0,
+            enable_tracking_metrics_logging=True,
         )
+        self._init_tracking_metrics_workspace(model_path)
         self._use_depth_camera = bool(getattr(self._detector, "uses_depth_input", False))
         warmup_fn = getattr(self._detector, "warmup", None)
         if callable(warmup_fn):
@@ -5129,6 +5147,227 @@ class YoloDetectAgent(BaseAgent):
             return None
         return clamp(float(steer_value), -1.0, 1.0) * max_steer_angle_deg
 
+    def _init_tracking_metrics_workspace(self, model_path: Path) -> None:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        model_stem = Path(model_path).stem
+        self._tracking_seq_name = f"carla_{self.name}_{timestamp}"
+        metrics_root = (Path(__file__).resolve().parent / "outputs" / "tracking_metrics" / self._tracking_seq_name).resolve()
+        metrics_root.mkdir(parents=True, exist_ok=True)
+        self._tracking_metrics_dir = metrics_root
+        self._tracking_predictions_path = metrics_root / f"{model_stem}_tracker_predictions.txt"
+        self._tracking_ground_truth_path = metrics_root / "ground_truth.txt"
+        self._tracking_seqinfo_path = metrics_root / "seqinfo.ini"
+        self._tracking_gt_logs = []
+        self._tracking_gt_frame_id = 0
+        logging.info("Tracking metrics workspace: %s", metrics_root)
+
+    def _camera_intrinsics_matrix(self, image_width: int, image_height: int) -> Any:
+        if np is None:
+            return None
+        fov_rad = math.radians(float(self.config.camera_fov))
+        fx = (float(image_width) / 2.0) / max(math.tan(fov_rad / 2.0), 1e-6)
+        fy = fx
+        cx = float(image_width) / 2.0
+        cy = float(image_height) / 2.0
+        return np.array(
+            [
+                [fx, 0.0, cx],
+                [0.0, fy, cy],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+
+    def _project_world_location_to_image(
+        self,
+        world_location: Any,
+        world_to_camera: Any,
+        intrinsics: Any,
+    ) -> Optional[tuple[float, float, float]]:
+        if np is None:
+            return None
+
+        point_world = np.array(
+            [float(world_location.x), float(world_location.y), float(world_location.z), 1.0],
+            dtype=np.float64,
+        )
+        point_camera = world_to_camera @ point_world
+        # UE -> camera convention.
+        point_camera = np.array(
+            [point_camera[1], -point_camera[2], point_camera[0]],
+            dtype=np.float64,
+        )
+        depth = float(point_camera[2])
+        if depth <= 1e-3:
+            return None
+
+        point_img = intrinsics @ point_camera
+        if abs(float(point_img[2])) <= 1e-6:
+            return None
+        u = float(point_img[0] / point_img[2])
+        v = float(point_img[1] / point_img[2])
+        if not (math.isfinite(u) and math.isfinite(v)):
+            return None
+        return u, v, depth
+
+    @staticmethod
+    def _infer_gt_class_name(actor: Any) -> Optional[str]:
+        type_id = str(getattr(actor, "type_id", "")).lower()
+        if type_id.startswith("walker."):
+            return "pedestrian"
+        if type_id.startswith("vehicle."):
+            # Match detector's two_wheeler class for bikes/motorbikes.
+            two_wheel_tokens = (
+                "bike",
+                "bicycle",
+                "motorcycle",
+                "motorbike",
+                "vespa",
+                "yamaha",
+                "harley",
+                "kawasaki",
+            )
+            if any(token in type_id for token in two_wheel_tokens):
+                return "two_wheeler"
+            return "vehicle"
+        return None
+
+    def _log_ground_truth_frame(self, frame_shape: tuple[int, int, int], ego_vehicle: Any) -> None:
+        if (
+            np is None
+            or self.session is None
+            or self.session.world is None
+            or self._camera is None
+            or ego_vehicle is None
+        ):
+            return
+
+        image_h = int(frame_shape[0])
+        image_w = int(frame_shape[1])
+        if image_h <= 0 or image_w <= 0:
+            return
+        self._tracking_image_size = (image_w, image_h)
+
+        intrinsics = self._camera_intrinsics_matrix(image_w, image_h)
+        if intrinsics is None:
+            return
+
+        try:
+            world_to_camera = np.array(
+                self._camera.get_transform().get_inverse_matrix(),
+                dtype=np.float64,
+            )
+        except Exception:
+            return
+
+        self._tracking_gt_frame_id += 1
+        frame_id = int(self._tracking_gt_frame_id)
+
+        try:
+            actors = self.session.world.get_actors()
+        except Exception:
+            return
+
+        for actor in actors:
+            try:
+                actor_id = int(actor.id)
+            except Exception:
+                continue
+            if actor_id == int(ego_vehicle.id):
+                continue
+
+            class_name = self._infer_gt_class_name(actor)
+            if class_name is None:
+                continue
+
+            bbox_3d = getattr(actor, "bounding_box", None)
+            if bbox_3d is None:
+                continue
+
+            try:
+                bbox_vertices = bbox_3d.get_world_vertices(actor.get_transform())
+            except Exception:
+                continue
+            if not bbox_vertices:
+                continue
+
+            pixels: list[tuple[float, float]] = []
+            for vertex in bbox_vertices:
+                projected = self._project_world_location_to_image(
+                    world_location=vertex,
+                    world_to_camera=world_to_camera,
+                    intrinsics=intrinsics,
+                )
+                if projected is None:
+                    continue
+                u, v, _ = projected
+                pixels.append((u, v))
+
+            if len(pixels) < 2:
+                continue
+
+            xs = [p[0] for p in pixels]
+            ys = [p[1] for p in pixels]
+            x1 = max(0.0, min(xs))
+            y1 = max(0.0, min(ys))
+            x2 = min(float(image_w - 1), max(xs))
+            y2 = min(float(image_h - 1), max(ys))
+            width = max(0.0, x2 - x1)
+            height = max(0.0, y2 - y1)
+            if width < 1.0 or height < 1.0:
+                continue
+
+            # MOTChallenge GT format:
+            # <frame>,<id>,<bb_left>,<bb_top>,<bb_width>,<bb_height>,<conf>,<x>,<y>,<z>
+            # conf=1 marks valid GT object.
+            gt_line = (
+                f"{frame_id},{actor_id},"
+                f"{x1:.2f},{y1:.2f},{width:.2f},{height:.2f},1,-1,-1,-1"
+            )
+            self._tracking_gt_logs.append(gt_line)
+
+    def _save_tracking_metrics_outputs(self) -> None:
+        if self._detector is not None and self._tracking_predictions_path is not None:
+            try:
+                self._detector.save_tracking_metrics_log(str(self._tracking_predictions_path))
+            except Exception as exc:
+                logging.warning("Failed to save tracker predictions log: %s", exc)
+
+        if self._tracking_ground_truth_path is not None:
+            try:
+                self._tracking_ground_truth_path.parent.mkdir(parents=True, exist_ok=True)
+                with self._tracking_ground_truth_path.open("w", encoding="utf-8") as file_obj:
+                    for line in self._tracking_gt_logs:
+                        file_obj.write(f"{line}\n")
+            except Exception as exc:
+                logging.warning("Failed to save GT tracking log: %s", exc)
+
+        seq_len = int(self._tracking_gt_frame_id)
+        image_w, image_h = self._tracking_image_size
+        if self._tracking_seqinfo_path is not None and seq_len > 0 and image_w > 0 and image_h > 0:
+            try:
+                fps = int(round(1.0 / max(1e-3, float(self.config.fixed_delta)))) if self.config.sync else int(round(self.config.video_fps))
+                fps = max(1, fps)
+                with self._tracking_seqinfo_path.open("w", encoding="utf-8") as file_obj:
+                    file_obj.write("[Sequence]\n")
+                    file_obj.write(f"name={self._tracking_seq_name}\n")
+                    file_obj.write(f"imDir=img1\n")
+                    file_obj.write(f"frameRate={fps}\n")
+                    file_obj.write(f"seqLength={seq_len}\n")
+                    file_obj.write(f"imWidth={image_w}\n")
+                    file_obj.write(f"imHeight={image_h}\n")
+                    file_obj.write("imExt=.jpg\n")
+            except Exception as exc:
+                logging.warning("Failed to save seqinfo.ini for tracking metrics: %s", exc)
+
+        if self._tracking_metrics_dir is not None:
+            logging.info(
+                "[Metrics] Tracking logs exported: predictions=%s | ground_truth=%s | seqinfo=%s",
+                self._tracking_predictions_path,
+                self._tracking_ground_truth_path,
+                self._tracking_seqinfo_path,
+            )
+
     def run_step(self, step_idx: int) -> None:
         """
         Main detection & control loop for YOLO agent.
@@ -5211,6 +5450,7 @@ class YoloDetectAgent(BaseAgent):
                 vehicle_steer=current_steer,
                 speed_kmh=speed_kmh,
             )
+            self._log_ground_truth_frame(frame_bgr.shape, vehicle)
             self._last_detection_runtime_ms = (time.perf_counter() - detector_t0) * 1000.0
             debug_info = {}
             if hasattr(self._detector, "get_last_debug_info"):
@@ -5579,6 +5819,7 @@ class YoloDetectAgent(BaseAgent):
             )
 
     def teardown(self) -> None:
+        self._save_tracking_metrics_outputs()
         if self._tm_autopilot_enabled and self.session is not None and self.session.ego_vehicle is not None:
             try:
                 self.session.ego_vehicle.set_autopilot(False, self.config.tm_port)
