@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -12,12 +13,11 @@ import numpy as np
 import torch
 from ultralytics import YOLO, RTDETR
 
-from core_perception.object_tracker import KalmanObjectTracker
 from core_perception.spatial_math import CameraIntrinsics, DynamicIPM
 
 class YoloDetector:
     """
-    YOLO + Kalman Tracker + Dynamic IPM pipeline.
+    YOLO + Ultralytics tracker (BoT-SORT/ByteTrack) + Dynamic IPM pipeline.
 
     This module intentionally does NOT compute emergency brake flag.
     """
@@ -52,8 +52,17 @@ class YoloDetector:
         tracker_min_hits: int = 1,
         tracker_process_noise: float = 1.0,
         tracker_measurement_noise: float = 10.0,
+        tracker_config: str = "botsort.yaml",
+        enable_tracking_metrics_logging: bool = False,
     ) -> None:
-        _ = obstacle_base_distance_m  # retained only for backward compatibility
+        _ = (
+            obstacle_base_distance_m,
+            tracker_iou_threshold,
+            tracker_max_age,
+            tracker_min_hits,
+            tracker_process_noise,
+            tracker_measurement_noise,
+        )  # retained only for backward compatibility
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"YOLO model file not found: {model_path}")
 
@@ -101,14 +110,12 @@ class YoloDetector:
             "stop-line": "stop_line",
             "stop_line_marking": "stop_line",
         }
-
-        self._tracker = KalmanObjectTracker(
-            iou_threshold=float(tracker_iou_threshold),
-            max_age=int(tracker_max_age),
-            min_hits=int(tracker_min_hits),
-            process_noise=float(tracker_process_noise),
-            measurement_noise=float(tracker_measurement_noise),
-        )
+        self.tracker_config = str(tracker_config or "botsort.yaml")
+        self._track_persist = True
+        self._enable_tracking_metrics_logging = bool(enable_tracking_metrics_logging)
+        self._metrics_eval_classes = {"vehicle", "pedestrian", "two_wheeler"}
+        self.current_frame_id = 0
+        self.tracking_logs: List[str] = []
 
         self._spatial: Optional[DynamicIPM] = None
         self._spatial_resolution: Optional[Tuple[int, int]] = None
@@ -221,6 +228,44 @@ class YoloDetector:
             self.inference_imgsz = corrected_imgsz
             return self._predict_once(image_bgr)
 
+    def _track_once(self, image_bgr: np.ndarray):
+        track_kwargs: Dict[str, Any] = {
+            "source": image_bgr,
+            "conf": self.conf_threshold,
+            "verbose": False,
+            "device": self._predict_device,
+            "persist": self._track_persist,
+            "tracker": self.tracker_config,
+        }
+        if self.inference_imgsz is not None:
+            track_kwargs["imgsz"] = self.inference_imgsz
+        if self._use_half_precision:
+            track_kwargs["half"] = True
+        return self.model.track(**track_kwargs)
+
+    def _track(self, image_bgr: np.ndarray):
+        try:
+            return self._track_once(image_bgr)
+        except AssertionError as exc:
+            if not self._is_exported_model:
+                raise
+
+            static_hw = self._extract_static_export_hw(exc)
+            if static_hw is None:
+                raise
+
+            corrected_imgsz = self._imgsz_from_hw(*static_hw)
+            if self.inference_imgsz == corrected_imgsz:
+                raise
+
+            logging.warning(
+                "Overriding incompatible inference_imgsz=%s with exported model input size %s.",
+                self.inference_imgsz,
+                corrected_imgsz,
+            )
+            self.inference_imgsz = corrected_imgsz
+            return self._track_once(image_bgr)
+
     def warmup(self, width: int, height: int) -> None:
         if self._warmed_up:
             return
@@ -268,6 +313,72 @@ class YoloDetector:
             )
         return detections
 
+    def detect_and_track(self, image_bgr: np.ndarray) -> List[Dict[str, Any]]:
+        """Use Ultralytics built-in tracker (BoT-SORT/ByteTrack)."""
+        frame_bgr = self._prepare_bgr(image_bgr)
+        if self.current_frame_id <= 0:
+            self.current_frame_id = 1
+        results = self._track(frame_bgr)
+        tracked_objects: List[Dict[str, Any]] = []
+
+        if len(results) == 0:
+            return tracked_objects
+
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            return tracked_objects
+
+        xyxy = boxes.xyxy.round().to(dtype=torch.int32).cpu().numpy()
+        confs = boxes.conf.float().cpu().numpy()
+        class_ids = boxes.cls.to(dtype=torch.int32).cpu().numpy()
+        if boxes.id is not None:
+            track_ids: Sequence[Any] = boxes.id.to(dtype=torch.int32).cpu().numpy()
+        else:
+            track_ids = [None] * len(boxes)
+
+        for coords, conf, cls_id, t_id in zip(xyxy, confs, class_ids, track_ids):
+            class_name = self._resolve_class_name(int(cls_id))
+            if class_name not in self.display_classes:
+                continue
+
+            conf = float(conf)
+            if conf < self.conf_threshold:
+                continue
+
+            x1, y1, x2, y2 = [int(v) for v in coords.tolist()]
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            track_id: Optional[int] = None
+            if t_id is not None:
+                try:
+                    track_id = int(t_id)
+                except Exception:
+                    track_id = None
+            track_id_val = int(track_id) if track_id is not None else -1
+
+            tracked_objects.append(
+                {
+                    "class": class_name,
+                    "bbox": [x1, y1, x2, y2],
+                    "raw_bbox": [x1, y1, x2, y2],
+                    "conf": conf,
+                    "track_id": track_id,
+                }
+            )
+
+            if self._enable_tracking_metrics_logging and class_name in self._metrics_eval_classes:
+                # MOTChallenge tracking-results format:
+                # <frame>,<id>,<bb_left>,<bb_top>,<bb_width>,<bb_height>,<conf>,<x>,<y>,<z>
+                w = int(x2 - x1)
+                h = int(y2 - y1)
+                log_line = (
+                    f"{int(self.current_frame_id)},{int(track_id_val)},{int(x1)},{int(y1)},"
+                    f"{int(w)},{int(h)},{float(conf):.4f},-1,-1,-1"
+                )
+                self.tracking_logs.append(log_line)
+        return tracked_objects
+
     def process_frame(
         self,
         raw_image: np.ndarray,
@@ -281,8 +392,8 @@ class YoloDetector:
         self._ensure_spatial(width, height)
 
         ts = time.time() if timestamp is None else float(timestamp)
-        raw_detections = self.detect(image_bgr)
-        tracked = self._tracker.update(raw_detections, timestamp=ts)
+        self.current_frame_id += 1
+        tracked = self.detect_and_track(image_bgr)
 
         if self._spatial is None:
             spatial_objects: List[Dict[str, Any]] = []
@@ -296,7 +407,7 @@ class YoloDetector:
             )
 
         return {
-            "raw_detections": raw_detections,
+            "raw_detections": tracked,
             "tracked_objects": tracked,
             "spatial_objects": spatial_objects,
             "frame_size": (height, width),
@@ -411,4 +522,19 @@ class YoloDetector:
 
     def get_last_debug_info(self) -> Dict[str, Any]:
         return self._last_debug_info
+
+    def save_tracking_metrics_log(self, save_path: str = "tracker_predictions.txt") -> None:
+        """Save tracker predictions as MOT-format txt for post-run evaluation."""
+        path = Path(save_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as file_obj:
+            for line in self.tracking_logs:
+                file_obj.write(f"{line}\n")
+        logging.info(
+            "[Metrics] Saved %d tracking detections to %s",
+            len(self.tracking_logs),
+            path,
+        )
+        self.tracking_logs = []
+        self.current_frame_id = 0
 

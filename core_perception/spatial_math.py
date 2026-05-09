@@ -70,6 +70,8 @@ class DynamicIPM:
         self._homography: Optional[np.ndarray] = None
         self._last_h_signature: Optional[Tuple[float, float]] = None
         self._track_history: Dict[int, Tuple[float, float, float]] = {}
+        self._track_history_keep_seconds = 3.0
+        self._track_history_max_items = 4096
 
     def project_to_bev(
         self,
@@ -338,6 +340,7 @@ class DynamicIPM:
 
         prev = self._track_history.get(tid)
         self._track_history[tid] = (float(timestamp), float(x_m), float(y_m))
+        self._prune_track_history(float(timestamp))
         if prev is None:
             return 0.0
 
@@ -348,3 +351,21 @@ class DynamicIPM:
 
         dist_m = math.hypot(float(x_m) - float(prev_x), float(y_m) - float(prev_y))
         return float((dist_m / dt) * 3.6)
+
+    def _prune_track_history(self, now_ts: float) -> None:
+        if not self._track_history:
+            return
+        keep_s = max(0.5, float(self._track_history_keep_seconds))
+        cutoff = float(now_ts) - keep_s
+        stale_ids = [tid for tid, item in self._track_history.items() if float(item[0]) < cutoff]
+        for tid in stale_ids:
+            self._track_history.pop(tid, None)
+
+        max_items = max(128, int(self._track_history_max_items))
+        if len(self._track_history) <= max_items:
+            return
+        # Safety cap: drop oldest timestamps first.
+        ordered = sorted(self._track_history.items(), key=lambda kv: float(kv[1][0]))
+        drop_n = len(ordered) - max_items
+        for i in range(drop_n):
+            self._track_history.pop(int(ordered[i][0]), None)
