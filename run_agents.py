@@ -672,6 +672,8 @@ class RunConfig:
     recovery_steer_offset: float
     autopilot_backend: str
     nav_agent_type: str
+    yolo_backend: str
+    yolo_nav_agent_type: str
     yolo_disable_autopilot_red_light: bool
     yolo_inference_every_n_ticks: int
     yolo_visualize: bool
@@ -4588,6 +4590,7 @@ class YoloDetectAgent(BaseAgent):
         self._hud_ema_fps: Optional[float] = None
         self._hud_last_tick_time: Optional[float] = None
         self._vehicle_max_steer_angle_deg: Optional[float] = None
+        self._control_backend_name = "planner"
         self._last_detection_step: Optional[int] = None
         self._cached_detections: list[dict[str, Any]] = []
         self._cached_detector_emergency = False
@@ -4604,6 +4607,7 @@ class YoloDetectAgent(BaseAgent):
         self._hud_ema_fps = None
         self._hud_last_tick_time = None
         self._vehicle_max_steer_angle_deg = None
+        self._control_backend_name = "planner"
         self._last_detection_step = None
         self._cached_detections = []
         self._cached_detector_emergency = False
@@ -4687,22 +4691,36 @@ class YoloDetectAgent(BaseAgent):
         if self._nav_agent is not None:
             logging.info(
                 "YOLO detection enabled with %s planner autopilot. Model: %s",
-                self.config.nav_agent_type,
+                self.config.yolo_nav_agent_type,
                 model_path,
             )
         else:
-            logging.info("YOLO detection enabled with TM autopilot fallback. Model: %s", model_path)
+            logging.info(
+                "YOLO detection enabled with %s. Model: %s",
+                self._control_backend_name,
+                model_path,
+            )
 
     def _init_navigation_agent(self, world, vehicle) -> None:
         self._spawn_points = world.get_map().get_spawn_points()
+        yolo_backend = str(self.config.yolo_backend).lower()
+        if yolo_backend == "tm":
+            self._nav_agent = None
+            self._enable_tm_autopilot(vehicle)
+            self._tm_fallback_mode = True
+            self._control_backend_name = "TM native autopilot"
+            logging.info("YOLO backend initialized: TM native autopilot (explicit).")
+            return
+
         if not self._spawn_points:
             logging.warning("No spawn points found for YOLO route planner, using TM autopilot fallback.")
             self._enable_tm_autopilot(vehicle)
             self._tm_fallback_mode = True
+            self._control_backend_name = "TM autopilot fallback"
             return
 
         ensure_navigation_agent_imports()
-        nav_type = self.config.nav_agent_type.lower()
+        nav_type = self.config.yolo_nav_agent_type.lower()
         try:
             if nav_type == "behavior":
                 if BehaviorAgent is None:
@@ -4715,10 +4733,12 @@ class YoloDetectAgent(BaseAgent):
             self._configure_nav_agent_traffic_lights()
             self._set_new_destination(vehicle)
             self._tm_fallback_mode = False
+            self._control_backend_name = f"{nav_type} planner autopilot"
         except Exception as exc:
             self._nav_agent = None
             self._enable_tm_autopilot(vehicle)
             self._tm_fallback_mode = True
+            self._control_backend_name = "TM autopilot fallback"
             logging.info(
                 "YOLO planner unavailable, using TM autopilot fallback (set CARLA_PYTHONAPI to enable BasicAgent/BehaviorAgent). Reason: %s",
                 exc,
@@ -5949,6 +5969,18 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     if autopilot_backend not in {"planner", "tm"}:
         logging.warning("Unsupported autopilot_backend=%s. Falling back to 'planner'.", autopilot_backend)
         autopilot_backend = "planner"
+    yolo_backend = str(_cfg_get(env_cfg, "yolo", "backend", "planner")).lower()
+    if yolo_backend not in {"planner", "tm"}:
+        logging.warning("Unsupported yolo.backend=%s. Falling back to 'planner'.", yolo_backend)
+        yolo_backend = "planner"
+    yolo_nav_agent_type = str(_cfg_get(env_cfg, "yolo", "nav_agent_type", nav_agent_type)).lower()
+    if yolo_nav_agent_type not in {"basic", "behavior"}:
+        logging.warning(
+            "Unsupported yolo.nav_agent_type=%s. Falling back to '%s'.",
+            yolo_nav_agent_type,
+            nav_agent_type,
+        )
+        yolo_nav_agent_type = nav_agent_type
 
     yolo_disable_autopilot_red_light = _to_bool(
         args.yolo_disable_autopilot_red_light,
@@ -5967,12 +5999,30 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     )
     yolo_visualize = _to_bool(
         args.yolo_visualize,
-        _to_bool(_cfg_get(env_cfg, "yolo", "visualize", True), True),
+        _to_bool(
+            _cfg_get(
+                env_cfg,
+                "yolo",
+                "debug_window",
+                _cfg_get(env_cfg, "yolo", "visualize", True),
+            ),
+            True,
+        ),
     )
     yolo_draw_overlay = _to_bool(
         args.yolo_draw_overlay,
-        _to_bool(_cfg_get(env_cfg, "yolo", "draw_overlay", True), True),
+        _to_bool(
+            _cfg_get(
+                env_cfg,
+                "yolo",
+                "debug_overlay",
+                _cfg_get(env_cfg, "yolo", "draw_overlay", True),
+            ),
+            True,
+        ),
     )
+    if not yolo_visualize:
+        yolo_draw_overlay = False
     yolo_inference_imgsz = max(
         0,
         int(
@@ -6084,6 +6134,8 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         recovery_steer_offset=recovery_steer_offset,
         autopilot_backend=autopilot_backend,
         nav_agent_type=nav_agent_type,
+        yolo_backend=yolo_backend,
+        yolo_nav_agent_type=yolo_nav_agent_type,
         yolo_disable_autopilot_red_light=bool(yolo_disable_autopilot_red_light),
         yolo_inference_every_n_ticks=int(yolo_inference_every_n_ticks),
         yolo_visualize=bool(yolo_visualize),

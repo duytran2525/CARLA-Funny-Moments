@@ -26,6 +26,10 @@ import warnings
 from pathlib import Path
 
 import cv2
+
+# CRITICAL: Disable HDF5 file locking BEFORE importing h5py.
+# Without this, multiple DataLoader workers deadlock on the same H5 file.
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 import h5py
 import numpy as np
 import pandas as pd
@@ -144,6 +148,7 @@ class WaypointCarlaDatasetH5(Dataset):
         self.h5_path = str(h5_path)
         self.transform = transform
         self.is_training = is_training
+        self._h5_handle: h5py.File | None = None  # lazy per-worker cache
 
         # ── Build H5 key lookup (set of filenames per town/camera) ──
         print("  📂 Đang quét cấu trúc H5...")
@@ -293,6 +298,13 @@ class WaypointCarlaDatasetH5(Dataset):
     def get_recovery_flags(self) -> list[int]:
         return list(self.recovery_flags)
 
+    # ── Lazy H5 handle (one per DataLoader worker) ──
+    def _get_h5(self) -> h5py.File:
+        """Return a cached h5py.File handle. Opened once per worker process."""
+        if self._h5_handle is None:
+            self._h5_handle = h5py.File(self.h5_path, "r", swmr=True)
+        return self._h5_handle
+
     # ── Image loading ──
     def _read_jpeg_from_h5(self, f: h5py.File, path: str) -> np.ndarray:
         """Read a JPEG blob from H5 and decode to BGR numpy array."""
@@ -367,39 +379,39 @@ class WaypointCarlaDatasetH5(Dataset):
         do_contrast = self.is_training and random.random() > 0.5
         do_cutout = self.is_training and random.random() > 0.5
 
-        # ── Load 3 temporal images from H5 ──
+        # ── Load 3 temporal images from H5 (cached handle) ──
         fnames = [sample["fn_t0"], sample["fn_tm03"], sample["fn_tm06"]]
         images = []
-        with h5py.File(self.h5_path, "r") as f:
-            for fn in fnames:
-                h5_key = f"{town}/{cam_dir}/{fn}"
-                img = self._read_jpeg_from_h5(f, h5_key)
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        f = self._get_h5()
+        for fn in fnames:
+            h5_key = f"{town}/{cam_dir}/{fn}"
+            img = self._read_jpeg_from_h5(f, h5_key)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-                # Crop top 45% (sky removal)
-                h = img.shape[0]
-                img = img[int(h * 0.45):, :, :]
+            # Crop top 45% (sky removal)
+            h = img.shape[0]
+            img = img[int(h * 0.45):, :, :]
 
-                # Augmentations (applied consistently across 3 temporal frames)
-                if self.is_training:
-                    if do_brightness:
-                        img = self._random_brightness(img)
-                    if do_shadow:
-                        img = self._random_shadow(img)
-                    if do_blur:
-                        img = self._random_blur(img)
-                    if do_noise:
-                        img = self._random_noise(img)
-                    if do_contrast:
-                        img = self._random_contrast(img)
-                    if do_cutout:
-                        img = self._random_cutout(img)
-                    if do_flip:
-                        img = cv2.flip(img, 1)
+            # Augmentations (applied consistently across 3 temporal frames)
+            if self.is_training:
+                if do_brightness:
+                    img = self._random_brightness(img)
+                if do_shadow:
+                    img = self._random_shadow(img)
+                if do_blur:
+                    img = self._random_blur(img)
+                if do_noise:
+                    img = self._random_noise(img)
+                if do_contrast:
+                    img = self._random_contrast(img)
+                if do_cutout:
+                    img = self._random_cutout(img)
+                if do_flip:
+                    img = cv2.flip(img, 1)
 
-                img = cv2.resize(img, (200, 66))
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2YUV)
-                images.append(img)
+            img = cv2.resize(img, (200, 66))
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2YUV)
+            images.append(img)
 
         # Stack 3 temporal frames → (66, 200, 9) → (9, 66, 200)
         stacked = np.concatenate(images, axis=-1)
@@ -504,7 +516,14 @@ def main():
         )
 
     batch_size = int(config.get("batch_size", 32))
-    num_workers = 2
+    num_workers = 2  # h5py + multiprocessing is fragile; 2 is safest
+
+    # Reset h5py handle in each worker after fork to prevent inherited dead FDs
+    def worker_init_fn(worker_id):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            dataset = worker_info.dataset
+            dataset._h5_handle = None  # Force lazy re-open in this worker
 
     rec_flags = train_dataset.get_recovery_flags()
     rec_weight = float(config.get("recovery_weight", 2.0))
@@ -514,12 +533,14 @@ def main():
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, sampler=sampler,
         num_workers=num_workers, pin_memory=True, collate_fn=collate_fn,
-        persistent_workers=True, prefetch_factor=2,
+        persistent_workers=True, prefetch_factor=4,
+        worker_init_fn=worker_init_fn,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True, collate_fn=collate_fn,
         persistent_workers=True, prefetch_factor=2,
+        worker_init_fn=worker_init_fn,
     )
 
     print(f"DataLoader: batch={batch_size}, workers={num_workers}")

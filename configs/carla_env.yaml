@@ -48,11 +48,23 @@ cil:
   use_pure_pursuit: false
 
 yolo:
+  # backend:
+  # - "tm": native CARLA Traffic Manager autopilot
+  # - "planner": BasicAgent/BehaviorAgent route planner
+  backend: "tm"
+  # Chỉ dùng khi backend="planner"
+  nav_agent_type: "basic"
   disable_autopilot_red_light: true
   inference_every_n_ticks: 2
   inference_imgsz: 0
-  visualize: false
-  draw_overlay: false
+  # Bật cửa sổ debug YOLO kiểu cũ.
+  # true  = mở màn hình cv2 của yolo_detect để quan sát trực tiếp.
+  # false = không mở màn hình, tiết kiệm FPS/tài nguyên.
+  debug_window: true
+  # Khi debug_window=true:
+  # true  = vẽ box, HUD, corridor như giao diện debug cũ.
+  # false = chỉ hiện raw camera feed.
+  debug_overlay: true
 
 traffic_spawn:
   vehicle_count: 60
