@@ -1,54 +1,62 @@
 # ============================================================================
 # CIL Model Training Parameters (Optimized for Kaggle GPU T4 x2)
 # ============================================================================
-# Generated: 2026-04-09
+# Updated: 2026-05-09 (v2 - GNLL stability fixes)
 # Data Size: 49.9k training + 16.7k validation
-# Environment: Kaggle GPU T4 x2 (32GB tổng, MultiGPU training)
+# Environment: Kaggle GPU T4 x2 (32GB total, MultiGPU training)
 # ============================================================================
 
-# Kaggle dataset paths (update đúng tên dataset trên Kaggle của bạn)
+# Kaggle dataset paths
 data_root: /kaggle/input/datasets/yudtrann/data-carlav3/data_carlav2
 csv_path: /kaggle/input/datasets/yudtrann/data-carlav3/data_carlav2/driving_log.csv
 work_dir: /kaggle/working
 
-epochs: 20                      # Thực dụng hơn cho Kaggle; early stopping sẽ dừng sớm nếu không cải thiện
+epochs: 25                      # 20 → 25 (warmup consumes 1 epoch)
+batch_size: 48                  # 64 → 48 (safe for T4 16GB with 9-ch + FPN)
+learning_rate: 0.0005           # 1e-3 → 5e-4 (more stable for GNLL, warmup compensates)
 
-batch_size: 64                  # Tăng batch để giảm steps/epoch trên Kaggle
+# GNLL stability (NEW)
+warmup_epochs: 1                # Linear LR warmup for first epoch
+grad_clip_norm: 1.0             # Gradient norm clipping (prevents GNLL explosion)
+sigma_min: 0.01                 # Floor for sigma (prevents log(0))
+sigma_max: 10.0                 # Ceiling for sigma (prevents lazy large-sigma predictions)
 
-learning_rate: 0.001            # ✅ An toàn hơn cho GNLL (giảm nguy cơ NaN ở giai đoạn đầu)
+# Data
+geometric_offset: 0.35
+augmentation_prob: 0.75
+train_split: 0.75
+include_side_cameras_train: false
+recovery_weight: 2.0
 
-geometric_offset: 0.35          # ✅ Offset vật lý cho camera trái/phải (Waypoint V4.0)
-
-augmentation_prob: 0.75         # ✅ Giữ nguyên (tốt cho data diversity)
-
-train_split: 0.75               # ✅ Giữ nguyên (75% train, 25% val)
-
-# Loss weights (Waypoint V4.0)
+# Loss weights
 loss_lambda_wp: 1.0
-loss_lambda_gnll: 0.1
+loss_lambda_gnll: 0.05          # 0.1 → 0.05 (reduce GNLL influence early in training)
 
 # Learning Rate Scheduler
-# Giảm LR nếu validation loss không cải thiện sau {lr_patience} epochs
-lr_patience: 5                 # ✅ Giữ nguyên
-lr_factor: 0.7                  # ✅ Giữ nguyên
+lr_patience: 3                  # 5 → 3 (react faster to plateau)
+lr_factor: 0.5                  # 0.7 → 0.5 (cut harder when plateau)
 
 # Early Stopping
-# Dừng training nếu validation loss không cải thiện sau {patience} epochs
-early_stopping_patience: 12     # ⬆️ Tăng từ 10 → 12 (match với tăng epochs)
+early_stopping_patience: 8      # 12 → 8 (sufficient with warmup + faster LR decay)
+
+# Reproducibility & I/O
 seed: 42
 model_save_path: models/waypoint_predictor.pth
 num_workers: 4
 prefetch_factor: 4
-include_side_cameras_train: false
-log_every_batches: 250
+log_every_batches: 200          # 250 → 200 (more frequent logging for GNLL monitoring)
 val_log_every_batches: 0
 
+# Multi-GPU
+use_multi_gpu: true
+
 # ============================================================================
-# GPU OPTIMIZATION NOTES:
-# - Batch 48: ~3.6-5.4GB per GPU (9-ch input + FPN) → Safe & efficient
-# - Learning rate: 0.001 (ổn định GNLL ở giai đoạn đầu)
-# - Epochs 50: Cho model dùm cơ hội fine-tune, early stop tự động
-# - Multi-GPU: DataParallel trong train_cnn.py (sử dụng cả 2 GPU T4)
-# - Expected training time: ~25-30 minutes (vs 40 minutes single GPU)
-# - Expected Val MAE: 0.020-0.022 (vs 0.028 trước)
+# CHANGELOG v2:
+# - Gradient clipping + NaN batch skip to prevent GNLL explosion
+# - Warmup 1 epoch for initial GNLL stability
+# - Sigma clamping [0.01, 10.0] (model already has softplus, this adds bounds)
+# - lr 1e-3 → 5e-4, lambda_gnll 0.1 → 0.05, batch 64 → 48
+# - Val MAE logging added
+# - Checkpoint saves metadata dict (backward compatible via unwrap_state_dict)
+# Expected: Val MAE 0.018-0.022, training time ~30-35 min on T4 x2
 # ============================================================================

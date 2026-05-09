@@ -233,7 +233,7 @@ def main():
     if num_gpus > 0:
         primary_device = torch.device("cuda:0")
         if requested_multi_gpu is None:
-            use_multi_gpu = num_gpus > 1 and batch_size >= 64
+            use_multi_gpu = num_gpus > 1 and batch_size >= 48
         else:
             use_multi_gpu = num_gpus > 1 and _to_bool(requested_multi_gpu, True)
         print(f"Using device: {num_gpus} GPU(s)")
@@ -376,36 +376,49 @@ def main():
     print("=" * 70)
 
     huber_loss = nn.SmoothL1Loss(reduction="mean")
-    optimizer = optim.Adam(model.parameters(), lr=float(config["learning_rate"]))
+    base_lr = float(config["learning_rate"])
+    optimizer = optim.Adam(model.parameters(), lr=base_lr)
     lr_patience = int(config.get("lr_patience", 3))
-    lr_factor = float(config.get("lr_factor", 0.7))
+    lr_factor = float(config.get("lr_factor", 0.5))
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=lr_factor,
-        patience=lr_patience,
+        optimizer, mode="min", factor=lr_factor, patience=lr_patience,
     )
     use_amp = torch.cuda.is_available()
     scaler = torch.amp.GradScaler("cuda" if use_amp else "cpu", enabled=use_amp)
     lambda_wp = float(config.get("loss_lambda_wp", 1.0))
-    lambda_gnll = float(config.get("loss_lambda_gnll", 0.1))
+    lambda_gnll = float(config.get("loss_lambda_gnll", 0.05))
 
-    print(f"Optimizer: Adam (lr={float(config['learning_rate'])})")
+    # GNLL stability params
+    grad_clip_norm = float(config.get("grad_clip_norm", 1.0))
+    sigma_min = float(config.get("sigma_min", 0.01))
+    sigma_max = float(config.get("sigma_max", 10.0))
+    warmup_epochs = int(config.get("warmup_epochs", 1))
+
+    print(f"Optimizer: Adam (lr={base_lr})")
     print(f"Loss weights: waypoint={lambda_wp} gnll={lambda_gnll}")
     print(f"Mixed precision: {'enabled' if use_amp else 'disabled'}")
+    print(f"Grad clip: {grad_clip_norm}, sigma range: [{sigma_min}, {sigma_max}]")
+    print(f"Warmup epochs: {warmup_epochs}")
 
     print("\n" + "=" * 70)
     print("TRAINING")
     print("=" * 70 + "\n")
 
     epochs = int(config["epochs"])
-    early_stopping_patience = int(config.get("early_stopping_patience", 10))
+    early_stopping_patience = int(config.get("early_stopping_patience", 8))
     best_val_loss = float("inf")
     epochs_no_improve = 0
 
     for epoch in range(epochs):
+        # Linear LR warmup
+        if epoch < warmup_epochs:
+            warmup_lr = base_lr * (epoch + 1) / max(1, warmup_epochs)
+            for pg in optimizer.param_groups:
+                pg["lr"] = warmup_lr
+
         model.train()
         running_loss = 0.0
+        nan_batches = 0
 
         for i, (images, waypoints, commands, recovery_flags) in enumerate(train_loader):
             del recovery_flags
@@ -420,24 +433,46 @@ def main():
             with torch.amp.autocast(device_type="cuda" if use_amp else "cpu", enabled=use_amp):
                 outputs = model(images, commands)
                 pred_wp = outputs[:, :10].view(-1, 5, 2)
-                pred_sigma = outputs[:, 10:].view(-1, 5, 1).expand(-1, 5, 2).clamp_min(1e-4)
+                # Model already applies softplus (cnn_model.py L256) — only clamp here
+                pred_sigma = outputs[:, 10:].view(-1, 5, 1).expand(-1, 5, 2).clamp(sigma_min, sigma_max)
                 target_wp = waypoints.view(-1, 5, 2)
 
                 loss_wp = huber_loss(pred_wp, target_wp)
                 loss_gnll = 0.5 * ((target_wp - pred_wp) ** 2 / pred_sigma + torch.log(pred_sigma))
                 loss = lambda_wp * loss_wp + lambda_gnll * loss_gnll.mean()
 
+            # Skip NaN/Inf batches to protect optimizer state
+            if not torch.isfinite(loss):
+                nan_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             scaler.scale(loss).backward()
+
+            # Unscale before clipping (required for correct AMP gradient clipping)
+            if grad_clip_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
             scaler.step(optimizer)
             scaler.update()
             running_loss += float(loss.item())
             if log_every_batches > 0 and (i == 0 or (i + 1) % log_every_batches == 0):
-                print(f"  [Train] Epoch {epoch + 1} - Batch {i + 1}/{len(train_loader)}")
+                current_lr = optimizer.param_groups[0]["lr"]
+                print(
+                    f"  [Train] Epoch {epoch + 1} - Batch {i + 1}/{len(train_loader)} "
+                    f"| loss={loss.item():.4f} | lr={current_lr:.2e}"
+                )
 
-        train_loss = running_loss / len(train_loader)
+        n_valid = max(1, len(train_loader) - nan_batches)
+        train_loss = running_loss / n_valid
+        if nan_batches > 0:
+            print(f"  Skipped {nan_batches} NaN/Inf batches")
 
         model.eval()
         val_loss = 0.0
+        val_mae = 0.0
+        val_samples = 0
 
         with torch.no_grad():
             for i, (images, waypoints, commands, recovery_flags) in enumerate(val_loader):
@@ -451,18 +486,22 @@ def main():
                 with torch.amp.autocast(device_type="cuda" if use_amp else "cpu", enabled=use_amp):
                     outputs = model(images, commands)
                     pred_wp = outputs[:, :10].view(-1, 5, 2)
-                    pred_sigma = outputs[:, 10:].view(-1, 5, 1).expand(-1, 5, 2).clamp_min(1e-4)
+                    pred_sigma = outputs[:, 10:].view(-1, 5, 1).expand(-1, 5, 2).clamp(sigma_min, sigma_max)
                     target_wp = waypoints.view(-1, 5, 2)
 
                     loss_wp = huber_loss(pred_wp, target_wp)
                     loss_gnll = 0.5 * ((target_wp - pred_wp) ** 2 / pred_sigma + torch.log(pred_sigma))
                     loss = lambda_wp * loss_wp + lambda_gnll * loss_gnll.mean()
 
-                val_loss += float(loss.item())
+                bs = images.size(0)
+                val_loss += float(loss.item()) * bs
+                val_mae += float((pred_wp - target_wp).abs().mean().item()) * bs
+                val_samples += bs
                 if val_log_every_batches > 0 and (i == 0 or (i + 1) % val_log_every_batches == 0):
                     print(f"  [Val] Epoch {epoch + 1} - Batch {i + 1}/{len(val_loader)}")
 
-        val_loss = val_loss / len(val_loader)
+        val_loss = val_loss / max(1, val_samples)
+        val_mae = val_mae / max(1, val_samples)
 
         if torch.cuda.is_available() and num_gpus > 0:
             mem_allocated = torch.cuda.memory_allocated(primary_device) / 1024**3
@@ -472,18 +511,25 @@ def main():
             mem_str = ""
 
         print(
-            f"Epoch [{epoch + 1:2d}/{epochs}] | Train Loss: {train_loss:.4f} | "
-            f"Val Loss: {val_loss:.4f} {mem_str}"
+            f"Epoch [{epoch + 1:2d}/{epochs}] | "
+            f"Train: {train_loss:.4f} | Val: {val_loss:.4f} (MAE={val_mae:.4f}) {mem_str}"
         )
 
-        scheduler.step(val_loss)
+        # Only step scheduler after warmup
+        if epoch >= warmup_epochs:
+            scheduler.step(val_loss)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
             model_state = model.module.state_dict() if use_multi_gpu else model.state_dict()
-            torch.save(model_state, model_save_path)
-            print(f"  Saved best model -> {model_save_path} (val_loss={val_loss:.4f})")
+            # Save with metadata (backward compatible via unwrap_state_dict)
+            torch.save(
+                {"model_state_dict": model_state, "epoch": epoch + 1,
+                 "val_loss": val_loss, "val_mae": val_mae},
+                model_save_path,
+            )
+            print(f"  Saved best -> {model_save_path} (val={val_loss:.4f}, MAE={val_mae:.4f})")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= early_stopping_patience:

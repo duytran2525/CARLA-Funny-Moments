@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+import re
 import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -170,7 +172,19 @@ class YoloDetector:
             return raw_image
         return np.ascontiguousarray(raw_image)
 
-    def _predict(self, image_bgr: np.ndarray):
+    @staticmethod
+    def _extract_static_export_hw(exc: BaseException) -> Optional[Tuple[int, int]]:
+        message = str(exc)
+        match = re.search(r"max model size\s*\(\s*\d+\s*,\s*\d+\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", message)
+        if match is None:
+            return None
+        return int(match.group(1)), int(match.group(2))
+
+    @staticmethod
+    def _imgsz_from_hw(height: int, width: int) -> int | Tuple[int, int]:
+        return int(height) if int(height) == int(width) else (int(height), int(width))
+
+    def _predict_once(self, image_bgr: np.ndarray):
         predict_kwargs: Dict[str, Any] = {
             "source": image_bgr,
             "conf": self.conf_threshold,
@@ -182,6 +196,30 @@ class YoloDetector:
         if self._use_half_precision:
             predict_kwargs["half"] = True
         return self.model.predict(**predict_kwargs)
+
+    def _predict(self, image_bgr: np.ndarray):
+        try:
+            return self._predict_once(image_bgr)
+        except AssertionError as exc:
+            if not self._is_exported_model:
+                raise
+
+            static_hw = self._extract_static_export_hw(exc)
+            if static_hw is None:
+                raise
+
+            corrected_imgsz = self._imgsz_from_hw(*static_hw)
+            if self.inference_imgsz == corrected_imgsz:
+                raise
+
+            logging.warning(
+                "Overriding incompatible inference_imgsz=%s with exported model input size %s for %s.",
+                self.inference_imgsz,
+                corrected_imgsz,
+                os.path.basename(str(self.model)),
+            )
+            self.inference_imgsz = corrected_imgsz
+            return self._predict_once(image_bgr)
 
     def warmup(self, width: int, height: int) -> None:
         if self._warmed_up:

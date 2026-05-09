@@ -673,6 +673,10 @@ class RunConfig:
     autopilot_backend: str
     nav_agent_type: str
     yolo_disable_autopilot_red_light: bool
+    yolo_inference_every_n_ticks: int
+    yolo_visualize: bool
+    yolo_draw_overlay: bool
+    yolo_inference_imgsz: int
     cil_command_prep_time_s: float
     cil_command_trigger_min_m: float
     cil_command_trigger_max_m: float
@@ -4584,6 +4588,11 @@ class YoloDetectAgent(BaseAgent):
         self._hud_ema_fps: Optional[float] = None
         self._hud_last_tick_time: Optional[float] = None
         self._vehicle_max_steer_angle_deg: Optional[float] = None
+        self._last_detection_step: Optional[int] = None
+        self._cached_detections: list[dict[str, Any]] = []
+        self._cached_detector_emergency = False
+        self._cached_debug_info: Dict[str, Any] = {}
+        self._last_detection_runtime_ms: Optional[float] = None
 
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
@@ -4595,6 +4604,11 @@ class YoloDetectAgent(BaseAgent):
         self._hud_ema_fps = None
         self._hud_last_tick_time = None
         self._vehicle_max_steer_angle_deg = None
+        self._last_detection_step = None
+        self._cached_detections = []
+        self._cached_detector_emergency = False
+        self._cached_debug_info = {}
+        self._last_detection_runtime_ms = None
         vehicle = session.ego_vehicle
         world = session.world
         if vehicle is None or world is None:
@@ -4611,10 +4625,15 @@ class YoloDetectAgent(BaseAgent):
         model_path = resolve_yolo_model_path(self.config.yolo_model_path)
         if not model_path.exists():
             raise FileNotFoundError(f"YOLO model file not found: {model_path}")
+        detector_imgsz: Optional[int] = None
+        if int(self.config.yolo_inference_imgsz) > 0:
+            detector_imgsz = int(self.config.yolo_inference_imgsz)
+        elif model_path.suffix.lower() != ".engine":
+            detector_imgsz = 448
 
         self._detector = YoloDetector(
             str(model_path),
-            inference_imgsz=448,
+            inference_imgsz=detector_imgsz,
             camera_fov_deg=self.config.camera_fov,
             obstacle_base_distance_m=8.0,
             camera_mount_x_m=1.5,
@@ -4631,6 +4650,13 @@ class YoloDetectAgent(BaseAgent):
                 "YOLO detector warmup completed in %.1f ms.",
                 (time.perf_counter() - warmup_t0) * 1000.0,
             )
+        logging.info(
+            "YOLO runtime config: every_n_ticks=%d visualize=%s draw_overlay=%s imgsz=%s",
+            int(self.config.yolo_inference_every_n_ticks),
+            bool(self.config.yolo_visualize),
+            bool(self.config.yolo_draw_overlay),
+            detector_imgsz if detector_imgsz is not None else "engine-default",
+        )
         if TrafficSupervisor is None:
             logging.warning("TrafficSupervisor unavailable. yolo_detect will run without supervisor brake fusion.")
             self._traffic_supervisor = None
@@ -5065,16 +5091,42 @@ class YoloDetectAgent(BaseAgent):
         # ─────────────────────────────────────────────────────────
         # Step 3: Run YOLO Detection
         # ─────────────────────────────────────────────────────────
-        detections, detector_emergency = self._detector.detect_and_evaluate(
-            frame_bgr,
-            distance_threshold=None,
-            depth_map_m=depth_map_m,
-            vehicle_steer=current_steer,
-            speed_kmh=speed_kmh,
+        detect_every_n = max(1, int(self.config.yolo_inference_every_n_ticks))
+        should_run_detector = (
+            self._last_detection_step is None
+            or detect_every_n <= 1
+            or (step_idx - int(self._last_detection_step)) >= detect_every_n
         )
-        debug_info = {}
-        if hasattr(self._detector, "get_last_debug_info"):
-            debug_info = self._detector.get_last_debug_info() or {}
+        if should_run_detector:
+            detector_t0 = time.perf_counter()
+            detections, detector_emergency = self._detector.detect_and_evaluate(
+                frame_bgr,
+                distance_threshold=None,
+                depth_map_m=depth_map_m,
+                vehicle_steer=current_steer,
+                speed_kmh=speed_kmh,
+            )
+            self._last_detection_runtime_ms = (time.perf_counter() - detector_t0) * 1000.0
+            debug_info = {}
+            if hasattr(self._detector, "get_last_debug_info"):
+                debug_info = self._detector.get_last_debug_info() or {}
+            debug_info = dict(debug_info)
+            debug_info["detector_cache_hit"] = False
+            debug_info["detector_cache_age_ticks"] = 0
+            debug_info["detector_last_run_ms"] = self._last_detection_runtime_ms
+            self._cached_detections = [dict(det) for det in detections]
+            self._cached_detector_emergency = bool(detector_emergency)
+            self._cached_debug_info = dict(debug_info)
+            self._last_detection_step = int(step_idx)
+        else:
+            detections = [dict(det) for det in self._cached_detections]
+            detector_emergency = bool(self._cached_detector_emergency)
+            debug_info = dict(self._cached_debug_info)
+            debug_info["detector_cache_hit"] = True
+            debug_info["detector_cache_age_ticks"] = (
+                step_idx - int(self._last_detection_step) if self._last_detection_step is not None else 0
+            )
+            debug_info["detector_last_run_ms"] = self._last_detection_runtime_ms
 
         # ─────────────────────────────────────────────────────────
         # Step 4: Build Danger Polygon & Compute Supervisor Advisory
@@ -5207,167 +5259,154 @@ class YoloDetectAgent(BaseAgent):
         # ─────────────────────────────────────────────────────────
         # Step 6: Prepare Annotation Frame
         # ─────────────────────────────────────────────────────────
-        annotated_frame = frame_bgr.copy()
-        _draw_red_light_zone_rois(annotated_frame, sup_debug)
         hud_fps = self._update_hud_fps()
         steer_angle_deg = self._steer_to_angle_deg(vehicle, display_steer)
         speed_text = f"{float(speed_kmh):.1f} km/h" if speed_kmh is not None else "n/a"
         steer_text = f"STEER={display_steer:+.3f}"
         if steer_angle_deg is not None:
             steer_text = f"{steer_text} ({steer_angle_deg:+.1f} deg)"
+        yellow_drew = False
+        annotated_frame = None
 
-        # ════════════════════════════════════════════════════════════════
-        # 🎨 VẼ YELLOW DANGER CORRIDOR (LUÔN HIỂN THỊ) - PHẦN QUAN TRỌNG
-        # ════════════════════════════════════════════════════════════════
-        yellow_drew = _draw_yellow_danger_corridor(
-            annotated_frame,
-            debug_info,
-            sup_debug,
-        )
+        if self.config.yolo_visualize:
+            annotated_frame = frame_bgr.copy()
+            if self.config.yolo_draw_overlay:
+                _draw_red_light_zone_rois(annotated_frame, sup_debug)
 
-        if not yellow_drew:
-            logging.debug("[TICK %d] Yellow corridor not drawn (no polygon available)", step_idx)
-        else:
-            logging.debug("[TICK %d] Yellow corridor drawn successfully", step_idx)
+                yellow_drew = _draw_yellow_danger_corridor(
+                    annotated_frame,
+                    debug_info,
+                    sup_debug,
+                )
 
-        # ─────────────────────────────────────────────────────────
-        # Vẽ ROI regions (từ YOLO detector)
-        # ─────────────────────────────────────────────────────────
-        # ─────────────────────────────────────────────────────────
-        # Vẽ Detection Bounding Boxes
-        # ─────────────────────────────────────────────────────────
-        for det in detections:
-            x1, y1, x2, y2 = det["box"]
-            class_name = det["class_name"]
-            confidence = det["confidence"]
-            distance = det["distance"]
-            in_danger_roi = bool(det.get("in_danger_roi", False))
-            danger_match = bool(det.get("danger_match", False))
+                if not yellow_drew:
+                    logging.debug("[TICK %d] Yellow corridor not drawn (no polygon available)", step_idx)
+                else:
+                    logging.debug("[TICK %d] Yellow corridor drawn successfully", step_idx)
 
-            # Build label
-            label = f"{class_name} {confidence:.2f} ({distance:.1f}m)"
+                for det in detections:
+                    x1, y1, x2, y2 = det["box"]
+                    class_name = det["class_name"]
+                    confidence = det["confidence"]
+                    distance = det["distance"]
+                    in_danger_roi = bool(det.get("in_danger_roi", False))
+                    danger_match = bool(det.get("danger_match", False))
 
-            # Determine color
-            if class_name == "traffic_light_red":
-                color = (0, 0, 255)  # Red
-            elif class_name == "traffic_light_green":
-                color = (0, 255, 0)  # Green
-            elif danger_match:
-                color = (0, 0, 255)  # Red (brake)
-            elif in_danger_roi and distance < 10.0:
-                color = (0, 165, 255)  # Orange
-            elif distance < 5.0:
-                color = (255, 200, 0)  # Cyan
-            else:
-                color = (0, 255, 0)  # Green
+                    label = f"{class_name} {confidence:.2f} ({distance:.1f}m)"
 
-            bx1, by1, bx2, by2 = int(x1), int(y1), int(x2), int(y2)
-            cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), color, 2)
-            cv2.putText(
-                annotated_frame,
-                label,
-                (bx1, by1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                2,
-            )
+                    if class_name == "traffic_light_red":
+                        color = (0, 0, 255)
+                    elif class_name == "traffic_light_green":
+                        color = (0, 255, 0)
+                    elif danger_match:
+                        color = (0, 0, 255)
+                    elif in_danger_roi and distance < 10.0:
+                        color = (0, 165, 255)
+                    elif distance < 5.0:
+                        color = (255, 200, 0)
+                    else:
+                        color = (0, 255, 0)
 
-            # Draw ground touch point
-            cv2.circle(annotated_frame, (int((bx1 + bx2) / 2), by2), 5, color, -1)
+                    bx1, by1, bx2, by2 = int(x1), int(y1), int(x2), int(y2)
+                    cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), color, 2)
+                    cv2.putText(
+                        annotated_frame,
+                        label,
+                        (bx1, by1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        color,
+                        2,
+                    )
+                    cv2.circle(annotated_frame, (int((bx1 + bx2) / 2), by2), 5, color, -1)
 
-        # ─────────────────────────────────────────────────────────
-        # Draw Status Text Overlays
-        # ─────────────────────────────────────────────────────────
-        brake_level = float(clamp(display_brake, 0.0, 1.0))
-        if self._traffic_supervisor is not None:
-            supervisor_state_upper = str(sup_debug.get("state", "cruising")).upper()
-            status_text = f"SUPERVISOR {supervisor_state_upper} {brake_level:.2f}"
-            if supervisor_reason not in ("n/a", "none", ""):
-                status_text = f"{status_text} ({supervisor_reason})"
-            # Color encodes current brake intensity: green (0.0) -> red (1.0)
-            status_color = (
-                0,
-                int(round(255.0 * (1.0 - brake_level))),
-                int(round(255.0 * brake_level)),
-            )
-        elif is_emergency:
-            status_text = f"EMERGENCY BRAKE {brake_level:.2f}"
-            status_color = (0, 0, 255)
-        else:
-            status_text = f"NORMAL {brake_level:.2f}"
-            status_color = (0, 255, 0)
+                brake_level = float(clamp(display_brake, 0.0, 1.0))
+                if self._traffic_supervisor is not None:
+                    supervisor_state_upper = str(sup_debug.get("state", "cruising")).upper()
+                    status_text = f"SUPERVISOR {supervisor_state_upper} {brake_level:.2f}"
+                    if supervisor_reason not in ("n/a", "none", ""):
+                        status_text = f"{status_text} ({supervisor_reason})"
+                    status_color = (
+                        0,
+                        int(round(255.0 * (1.0 - brake_level))),
+                        int(round(255.0 * brake_level)),
+                    )
+                elif is_emergency:
+                    status_text = f"EMERGENCY BRAKE {brake_level:.2f}"
+                    status_color = (0, 0, 255)
+                else:
+                    status_text = f"NORMAL {brake_level:.2f}"
+                    status_color = (0, 255, 0)
 
-        cv2.putText(
-            annotated_frame,
-            status_text,
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            status_color,
-            2,
-        )
+                cv2.putText(
+                    annotated_frame,
+                    status_text,
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    status_color,
+                    2,
+                )
 
-        lock_zone = sup_debug.get("locked_zone", debug_info.get("locked_zone"))
-        if lock_zone:
-            lock_text = (
-                f"LOCK={lock_zone} | immunity="
-                f"{sup_debug.get('green_immunity_counter', debug_info.get('green_immunity_counter', 0))}"
-            )
-        else:
-            lock_text = "LOCK=None"
+                lock_zone = sup_debug.get("locked_zone", debug_info.get("locked_zone"))
+                if lock_zone:
+                    lock_text = (
+                        f"LOCK={lock_zone} | immunity="
+                        f"{sup_debug.get('green_immunity_counter', debug_info.get('green_immunity_counter', 0))}"
+                    )
+                else:
+                    lock_text = "LOCK=None"
 
-        cv2.putText(
-            annotated_frame,
-            lock_text,
-            (10, 58),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 0),
-            2,
-        )
+                cv2.putText(
+                    annotated_frame,
+                    lock_text,
+                    (10, 58),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 0),
+                    2,
+                )
 
-        turn_text = (
-            f"TARGET={supervisor_reason} | "
-            f"OBS={sup_debug.get('obstacle_reason', debug_info.get('obstacle_reason', 'none'))}"
-        )
-        cv2.putText(
-            annotated_frame,
-            turn_text,
-            (10, 84),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (200, 255, 200),
-            2,
-        )
+                turn_text = (
+                    f"TARGET={supervisor_reason} | "
+                    f"OBS={sup_debug.get('obstacle_reason', debug_info.get('obstacle_reason', 'none'))}"
+                )
+                cv2.putText(
+                    annotated_frame,
+                    turn_text,
+                    (10, 84),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (200, 255, 200),
+                    2,
+                )
 
-        demo_text = f"{steer_text} | FPS={hud_fps:.1f} | SPEED={speed_text}"
-        cv2.putText(
-            annotated_frame,
-            demo_text,
-            (10, 110),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.60,
-            (40, 220, 255),
-            2,
-        )
+                demo_text = f"{steer_text} | FPS={hud_fps:.1f} | SPEED={speed_text}"
+                cv2.putText(
+                    annotated_frame,
+                    demo_text,
+                    (10, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.60,
+                    (40, 220, 255),
+                    2,
+                )
 
-        control_text = f"THR={display_throttle:.2f} | BRK={display_brake:.2f} | DETS={len(detections)}"
-        cv2.putText(
-            annotated_frame,
-            control_text,
-            (10, 136),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (220, 220, 220),
-            2,
-        )
+                control_text = (
+                    f"THR={display_throttle:.2f} | BRK={display_brake:.2f} | DETS={len(detections)}"
+                )
+                cv2.putText(
+                    annotated_frame,
+                    control_text,
+                    (10, 136),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (220, 220, 220),
+                    2,
+                )
 
-        # ─────────────────────────────────────────────────────────
-        # Step 7: Display Frame
-        # ─────────────────────────────────────────────────────────
-        cv2.imshow(self._window_name, annotated_frame)
-        cv2.waitKey(1)
+            cv2.imshow(self._window_name, annotated_frame)
+            cv2.waitKey(1)
 
         # ─────────────────────────────────────────────────────────
         # Step 8: Log Information
@@ -5375,7 +5414,8 @@ class YoloDetectAgent(BaseAgent):
         if step_idx % 20 == 0:
             logging.info(
                 "yolo_detect tick=%d fps=%.1f speed=%s steer=%.3f angle=%s throttle=%.2f brake=%.2f "
-                "detections=%d emergency=%s supervisor_brake=%.2f state=%s reason=%s yellow_polygon=%s",
+                "detections=%d emergency=%s supervisor_brake=%.2f state=%s reason=%s yellow_polygon=%s "
+                "detector_cache=%s cache_age=%s detector_ms=%s",
                 step_idx,
                 hud_fps,
                 speed_text,
@@ -5388,7 +5428,12 @@ class YoloDetectAgent(BaseAgent):
                 supervisor_brake,
                 supervisor_state,
                 supervisor_reason,
-                "drawn" if yellow_drew else "missing",
+                "drawn" if yellow_drew else ("raw" if self.config.yolo_visualize else "disabled"),
+                bool(debug_info.get("detector_cache_hit", False)),
+                debug_info.get("detector_cache_age_ticks", 0),
+                f"{float(debug_info['detector_last_run_ms']):.1f}ms"
+                if debug_info.get("detector_last_run_ms") is not None
+                else "n/a",
             )
 
     def teardown(self) -> None:
@@ -5582,6 +5627,44 @@ def parse_args() -> argparse.Namespace:
         "--yolo-model-path",
         default="best.pt",
         help="Path to YOLO .pt model used by yolo_detect agent.",
+    )
+    parser.add_argument(
+        "--yolo-imgsz",
+        type=int,
+        default=None,
+        help="Override YOLO/RT-DETR inference image size. For static TensorRT engines leave unset or match export size.",
+    )
+    parser.add_argument(
+        "--yolo-every-n-ticks",
+        type=int,
+        default=None,
+        help="Run YOLO detection every N ticks and reuse cached detections in between.",
+    )
+    parser.add_argument(
+        "--yolo-visualize",
+        dest="yolo_visualize",
+        action="store_true",
+        default=None,
+        help="Show YOLO camera window during yolo_detect.",
+    )
+    parser.add_argument(
+        "--no-yolo-visualize",
+        dest="yolo_visualize",
+        action="store_false",
+        help="Disable YOLO camera window for higher FPS.",
+    )
+    parser.add_argument(
+        "--yolo-draw-overlay",
+        dest="yolo_draw_overlay",
+        action="store_true",
+        default=None,
+        help="Draw YOLO boxes/HUD overlays when visualization is enabled.",
+    )
+    parser.add_argument(
+        "--no-yolo-draw-overlay",
+        dest="yolo_draw_overlay",
+        action="store_false",
+        help="Show raw YOLO camera feed without overlay drawing.",
     )
     parser.add_argument(
         "--device",
@@ -5871,6 +5954,36 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         args.yolo_disable_autopilot_red_light,
         _to_bool(_cfg_get(env_cfg, "yolo", "disable_autopilot_red_light", False), False),
     )
+    yolo_inference_every_n_ticks = max(
+        1,
+        int(
+            pick(
+                args.yolo_every_n_ticks,
+                "yolo",
+                "inference_every_n_ticks",
+                1,
+            )
+        ),
+    )
+    yolo_visualize = _to_bool(
+        args.yolo_visualize,
+        _to_bool(_cfg_get(env_cfg, "yolo", "visualize", True), True),
+    )
+    yolo_draw_overlay = _to_bool(
+        args.yolo_draw_overlay,
+        _to_bool(_cfg_get(env_cfg, "yolo", "draw_overlay", True), True),
+    )
+    yolo_inference_imgsz = max(
+        0,
+        int(
+            pick(
+                args.yolo_imgsz,
+                "yolo",
+                "inference_imgsz",
+                0,
+            )
+        ),
+    )
 
     weather_preset = str(_cfg_get(env_cfg, "weather", "preset", "ClearNoon"))
     yaml_random_weather = _to_bool(_cfg_get(env_cfg, "weather", "random", False), False)
@@ -5972,6 +6085,10 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         autopilot_backend=autopilot_backend,
         nav_agent_type=nav_agent_type,
         yolo_disable_autopilot_red_light=bool(yolo_disable_autopilot_red_light),
+        yolo_inference_every_n_ticks=int(yolo_inference_every_n_ticks),
+        yolo_visualize=bool(yolo_visualize),
+        yolo_draw_overlay=bool(yolo_draw_overlay),
+        yolo_inference_imgsz=int(yolo_inference_imgsz),
         cil_command_prep_time_s=cil_command_prep_time_s,
         cil_command_trigger_min_m=cil_command_trigger_min_m,
         cil_command_trigger_max_m=cil_command_trigger_max_m,

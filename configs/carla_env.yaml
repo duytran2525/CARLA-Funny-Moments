@@ -49,6 +49,10 @@ cil:
 
 yolo:
   disable_autopilot_red_light: true
+  inference_every_n_ticks: 2
+  inference_imgsz: 0
+  visualize: false
+  draw_overlay: false
 
 traffic_spawn:
   vehicle_count: 60
