@@ -43,6 +43,8 @@ class TrafficSupervisor:
         self.config.setdefault("red_stopline_approach_floor_brake_near", 0.35)
         self.config.setdefault("red_stopline_approach_max_brake", 0.95)
         self.config.setdefault("red_stopline_vehicle_max_decel_mps2", 8.0)
+        self.config.setdefault("red_hard_stop_hold_seconds", 1.5)
+        self.config.setdefault("red_hard_stop_min_brake", 1.0)
         self.config.setdefault("rural_red_trigger_distance_m", 8.0)
         self.config.setdefault("green_release_margin", 0.05)
         self.config.setdefault("green_immunity_frames", 10)
@@ -113,6 +115,8 @@ class TrafficSupervisor:
         self._green_release_zone: Optional[str] = None
         self._last_red_stopline_distance_m = float("inf")
         self._last_red_approach_brake = 0.0
+        self._red_hard_stop_latch_s = 0.0
+        self._red_hard_stop_active = False
         self._last_stop_line_crawl_brake = 0.0
         self._last_stop_line_distance_m = float("inf")
         self._last_stop_line_mode = "none"
@@ -780,6 +784,24 @@ class TrafficSupervisor:
             final_brake = stop_line_crawl_brake
             selected_target = "stop_line_crawl"
 
+        # Red hard-stop latch:
+        # keep brake command continuous even when detection flickers for a few frames.
+        hold_seconds = max(0.0, float(self.config.get("red_hard_stop_hold_seconds", 1.5)))
+        hold_min_brake = float(self._clamp(self.config.get("red_hard_stop_min_brake", 1.0), 0.0, 1.0))
+        should_refresh_latch = bool(
+            red_brake >= 0.99 and red_target == "stop_line"
+        )
+        if should_refresh_latch:
+            self._red_hard_stop_latch_s = max(self._red_hard_stop_latch_s, hold_seconds)
+
+        if self._red_hard_stop_latch_s > 0.0:
+            final_brake = max(final_brake, hold_min_brake)
+            if selected_target in ("none", "stop_line_crawl"):
+                selected_target = "stop_line"
+            self._red_hard_stop_latch_s = max(0.0, self._red_hard_stop_latch_s - max(1e-3, float(dt)))
+
+        self._red_hard_stop_active = self._red_hard_stop_latch_s > 1e-6
+
         # Timeout escape to avoid permanent deadlock.
         max_stopped_time = float(self.config.get("max_stopped_time", 30.0))
         if self.state == SupervisorState.STOPPED and self.stopped_time > max_stopped_time:
@@ -827,6 +849,8 @@ class TrafficSupervisor:
                 None if not np.isfinite(self._last_red_stopline_distance_m) else float(self._last_red_stopline_distance_m)
             ),
             "red_stopline_approach_brake": float(self._last_red_approach_brake),
+            "red_hard_stop_active": bool(self._red_hard_stop_active),
+            "red_hard_stop_latch_s": float(self._red_hard_stop_latch_s),
             "stop_line_crawl_brake": float(self._last_stop_line_crawl_brake),
             "stop_line_distance_m": (
                 None if not np.isfinite(self._last_stop_line_distance_m) else float(self._last_stop_line_distance_m)

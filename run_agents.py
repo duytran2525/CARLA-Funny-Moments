@@ -2017,6 +2017,8 @@ class LaneFollowAgent(BaseAgent):
             debug_info["supervisor_state"] = str(sup_debug.get("state", "n/a"))
             debug_info["locked_zone"] = sup_debug.get("locked_zone")
             debug_info["green_immunity_counter"] = int(sup_debug.get("green_immunity_counter", 0))
+            debug_info["red_hard_stop_active"] = bool(sup_debug.get("red_hard_stop_active", False))
+            debug_info["red_hard_stop_latch_s"] = float(sup_debug.get("red_hard_stop_latch_s", 0.0))
             debug_info["red_light_active"] = bool(
                 supervisor_brake > 0.0 and target_type in ("red_light", "traffic_light_red", "stop_line")
             )
@@ -2170,18 +2172,28 @@ class LaneFollowAgent(BaseAgent):
         self._last_steer = steering
 
         throttle, brake = self._longitudinal_control(speed_kmh)
+        supervisor_reason = str(yolo_debug_info.get("decision_reason", "none")).strip().lower()
+        red_hard_stop_active = bool(yolo_debug_info.get("red_hard_stop_active", False))
+        hold_hand_brake = bool(
+            red_hard_stop_active
+            and supervisor_brake >= 0.99
+            and supervisor_reason in ("stop_line", "red_light", "traffic_light_red")
+            and float(speed_kmh) <= 2.0
+        )
 
         # Apply emergency/supervisor braking if YOLO detects danger.
         if is_emergency or supervisor_brake > 0.0:
             throttle = 0.0
             emergency_floor = self.config.max_brake if is_emergency else 0.0
             brake = max(brake, supervisor_brake, emergency_floor)
+            if hold_hand_brake:
+                brake = max(brake, 1.0)
 
         control = carla.VehicleControl(
             throttle=float(throttle),
             steer=float(clamp(steering, -1.0, 1.0)),
             brake=float(brake),
-            hand_brake=False,
+            hand_brake=bool(hold_hand_brake),
             reverse=False,
         )
         self.session.ego_vehicle.apply_control(control)
@@ -5135,6 +5147,7 @@ class YoloDetectAgent(BaseAgent):
         supervisor_state = "n/a"
         supervisor_reason = "n/a"
         hard_supervisor_emergency = False
+        red_hard_stop_active = False
         sup_debug = {}
         
         if self._traffic_supervisor is not None:
@@ -5170,6 +5183,7 @@ class YoloDetectAgent(BaseAgent):
                 self._last_supervisor_debug_info = sup_debug
                 supervisor_state = str(sup_debug.get("state", "n/a"))
                 supervisor_reason = str(sup_debug.get("selected_target_type", "none"))
+                red_hard_stop_active = bool(sup_debug.get("red_hard_stop_active", False))
                 hard_supervisor_emergency = (
                     supervisor_brake >= 0.60 and supervisor_reason == "obstacle"
                 )
@@ -5200,6 +5214,13 @@ class YoloDetectAgent(BaseAgent):
 
             nav_control = self._nav_agent.run_step()
             final_control = nav_control
+            hold_hand_brake = bool(
+                red_hard_stop_active
+                and supervisor_brake >= 0.99
+                and str(supervisor_reason).strip().lower() in ("stop_line", "red_light", "traffic_light_red")
+                and speed_kmh is not None
+                and float(speed_kmh) <= 2.0
+            )
 
             # IMPORTANT: supervisor brake must override planner throttle/brake.
             if is_emergency or supervisor_brake > 0.0:
@@ -5214,7 +5235,9 @@ class YoloDetectAgent(BaseAgent):
                         1.0,
                     )
                 )
-                final_control.hand_brake = False
+                if hold_hand_brake:
+                    final_control.brake = 1.0
+                final_control.hand_brake = bool(hold_hand_brake)
                 logging.debug(
                     "[TICK %d] Supervisor override planner control: emergency=%s supervisor_brake=%.2f planner_brake=%.2f final_brake=%.2f",
                     step_idx,
@@ -5229,6 +5252,13 @@ class YoloDetectAgent(BaseAgent):
             display_throttle = float(final_control.throttle)
             display_brake = float(final_control.brake)
         elif vehicle is not None and self._tm_fallback_mode:
+            hold_hand_brake = bool(
+                red_hard_stop_active
+                and supervisor_brake >= 0.99
+                and str(supervisor_reason).strip().lower() in ("stop_line", "red_light", "traffic_light_red")
+                and speed_kmh is not None
+                and float(speed_kmh) <= 2.0
+            )
             if is_emergency or supervisor_brake > 0.0:
                 emergency_floor = 0.6 if is_emergency else 0.0
                 current_control = vehicle.get_control()
@@ -5242,7 +5272,9 @@ class YoloDetectAgent(BaseAgent):
                         1.0,
                     )
                 )
-                final_control.hand_brake = False
+                if hold_hand_brake:
+                    final_control.brake = 1.0
+                final_control.hand_brake = bool(hold_hand_brake)
                 vehicle.apply_control(final_control)
                 display_steer = float(final_control.steer)
                 display_throttle = float(final_control.throttle)
