@@ -49,11 +49,15 @@ class TrafficSupervisor:
         self.config.setdefault("green_release_margin", 0.05)
         self.config.setdefault("green_immunity_frames", 10)
         self.config.setdefault("zone_release_missing_frames", 3)
-        self.config.setdefault("stop_line_crawl_start_distance_m", 30.0)
-        self.config.setdefault("stop_line_crawl_end_distance_m", 2.5)
+        self.config.setdefault("stop_line_crawl_start_distance_m", 18.0)
+        self.config.setdefault("stop_line_crawl_end_distance_m", 7.0)
         self.config.setdefault("stop_line_crawl_max_brake", 0.2)
-        self.config.setdefault("stop_line_crawl_target_speed_kmh", 20.0)
+        self.config.setdefault("stop_line_crawl_target_speed_kmh", 12.0)
         self.config.setdefault("stop_line_crawl_preview_brake", 0.03)
+        self.config.setdefault("stop_line_crawl_release_distance_m", 0.3)
+        self.config.setdefault("stop_line_tracking_max_missing_seconds", 3.5)
+        self.config.setdefault("stop_line_tracking_max_distance_m", 35.0)
+        self.config.setdefault("stop_line_tracking_jump_tolerance_m", 6.0)
 
         # Obstacle brake profile.
         self.config.setdefault("obstacle_linear_full_brake_distance_m", 6.0)
@@ -117,9 +121,14 @@ class TrafficSupervisor:
         self._last_red_approach_brake = 0.0
         self._red_hard_stop_latch_s = 0.0
         self._red_hard_stop_active = False
+        self._red_hard_stop_locked = False
+        self._red_suppressed_by_green_immunity = False
         self._last_stop_line_crawl_brake = 0.0
         self._last_stop_line_distance_m = float("inf")
         self._last_stop_line_mode = "none"
+        self._tracked_stop_line_distance_m = float("inf")
+        self._stop_line_missing_s = float("inf")
+        self._stop_line_observed_this_frame = False
 
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
@@ -395,6 +404,7 @@ class TrafficSupervisor:
         active_zone: Optional[str] = None
         self._green_release_active = False
         self._green_release_zone = None
+        self._red_suppressed_by_green_immunity = False
 
         if urban_red is not None or urban_green is not None:
             active_zone = "urban"
@@ -421,8 +431,61 @@ class TrafficSupervisor:
             immunity_frames = max(0, int(self.config.get("green_immunity_frames", 10)))
             self.green_immunity_counter = max(self.green_immunity_counter, immunity_frames)
             selected_red = None
+        elif selected_red is not None and self.green_immunity_counter > 0:
+            self._red_suppressed_by_green_immunity = True
+            selected_red = None
 
         return selected_red, active_zone
+
+    def _update_stop_line_tracking(
+        self,
+        stop_line_distances: List[float],
+        speed_kmh: float,
+        dt: float,
+    ) -> List[float]:
+        self._stop_line_observed_this_frame = False
+
+        max_track_distance = float(self.config.get("stop_line_tracking_max_distance_m", 35.0))
+        finite_distances = [
+            float(d)
+            for d in stop_line_distances
+            if np.isfinite(float(d)) and -1.0 <= float(d) <= max_track_distance
+        ]
+
+        speed_mps = max(0.0, float(speed_kmh) / 3.6)
+        step_dt = max(1e-3, float(dt))
+        max_missing_s = max(0.0, float(self.config.get("stop_line_tracking_max_missing_seconds", 3.5)))
+        jump_tolerance_m = max(0.0, float(self.config.get("stop_line_tracking_jump_tolerance_m", 6.0)))
+
+        previous_distance = float(self._tracked_stop_line_distance_m)
+        predicted_distance = float("inf")
+        if np.isfinite(previous_distance) and self._stop_line_missing_s <= max_missing_s:
+            predicted_distance = previous_distance - speed_mps * step_dt
+
+        if finite_distances:
+            observed_distance = min(finite_distances)
+            self._stop_line_observed_this_frame = True
+            if (
+                np.isfinite(predicted_distance)
+                and predicted_distance >= -1.0
+                and observed_distance > predicted_distance + jump_tolerance_m
+            ):
+                tracked_distance = max(0.0, predicted_distance)
+            else:
+                tracked_distance = max(0.0, observed_distance)
+            self._tracked_stop_line_distance_m = float(tracked_distance)
+            self._stop_line_missing_s = 0.0
+        elif np.isfinite(predicted_distance) and predicted_distance >= -2.0:
+            self._tracked_stop_line_distance_m = float(max(0.0, predicted_distance))
+            self._stop_line_missing_s = float(self._stop_line_missing_s + step_dt)
+        else:
+            self._tracked_stop_line_distance_m = float("inf")
+            self._stop_line_missing_s = float("inf")
+
+        effective_distances = list(finite_distances)
+        if np.isfinite(self._tracked_stop_line_distance_m):
+            effective_distances.append(float(self._tracked_stop_line_distance_m))
+        return effective_distances
 
     def _compute_red_brake(
         self,
@@ -440,53 +503,21 @@ class TrafficSupervisor:
 
         if zone == "urban":
             trigger_stopline_m = float(self.config.get("red_stopline_trigger_distance_m", 7.0))
+            release_distance_m = float(self.config.get("stop_line_crawl_release_distance_m", 0.3))
             nearest_stopline = min(stop_line_distances) if stop_line_distances else float("inf")
             if np.isfinite(nearest_stopline):
                 self._last_red_stopline_distance_m = float(nearest_stopline)
+            if (
+                np.isfinite(nearest_stopline)
+                and nearest_stopline <= release_distance_m
+                and not self._red_hard_stop_locked
+            ):
+                return 0.0, "none"
             if np.isfinite(nearest_stopline) and nearest_stopline <= trigger_stopline_m:
                 return 1.0, "stop_line"
 
-            # Pre-brake zone (15m -> 7m by default):
-            # slow the vehicle down toward ~20km/h before entering hard-stop gate.
-            approach_start_m = float(self.config.get("red_stopline_approach_start_distance_m", 15.0))
-            approach_target_kmh = float(self.config.get("red_stopline_approach_target_speed_kmh", 20.0))
-            approach_min_brake = float(self.config.get("red_stopline_approach_min_brake", 0.08))
-            approach_floor_brake_near = float(self.config.get("red_stopline_approach_floor_brake_near", 0.35))
-            approach_max_brake = float(self.config.get("red_stopline_approach_max_brake", 0.95))
-            vehicle_max_decel = float(self.config.get("red_stopline_vehicle_max_decel_mps2", 8.0))
-            vehicle_max_decel = max(0.1, vehicle_max_decel)
-
-            if np.isfinite(nearest_stopline) and nearest_stopline <= approach_start_m:
-                # Distance remaining until hard-stop gate at 7m.
-                remaining_to_gate_m = max(0.1, nearest_stopline - trigger_stopline_m)
-
-                speed_mps = max(0.0, float(speed_kmh) / 3.6)
-                target_mps = max(0.0, float(approach_target_kmh) / 3.6)
-                if speed_mps <= target_mps:
-                    brake_from_kinematics = 0.0
-                else:
-                    req_decel = ((speed_mps * speed_mps) - (target_mps * target_mps)) / (2.0 * remaining_to_gate_m)
-                    req_decel = max(0.0, req_decel)
-                    brake_from_kinematics = req_decel / vehicle_max_decel
-
-                # Distance floor prevents "too-late" weak brake near 7m.
-                approach_range_m = max(0.5, approach_start_m - trigger_stopline_m)
-                approach_progress = (approach_start_m - nearest_stopline) / approach_range_m
-                approach_progress = self._clamp(float(approach_progress), 0.0, 1.0)
-                brake_floor = approach_min_brake + (approach_floor_brake_near - approach_min_brake) * approach_progress
-
-                approach_brake = max(float(brake_from_kinematics), float(brake_floor))
-                approach_brake = float(self._clamp(approach_brake, 0.0, approach_max_brake))
-                self._last_red_approach_brake = approach_brake
-                return approach_brake, "red_light"
-
-            # Fallback when stop-line detector misses but light is close in urban ROI.
-            fallback_red_m = min(
-                float(self.config.get("red_light_distance_threshold", 30.0)),
-                12.0,
-            )
-            if np.isfinite(red_distance) and red_distance <= fallback_red_m:
-                return 0.85, "red_light"
+            # Urban red does not create an approach brake by itself. The vehicle
+            # crawls from stop_line recognition, then hard-stops at the 7m gate.
             return 0.0, "none"
 
         if zone == "rural_right":
@@ -507,19 +538,14 @@ class TrafficSupervisor:
         self._last_stop_line_distance_m = float("inf")
         self._last_stop_line_mode = "none"
 
-        # If there is a valid traffic-light decision, stop_line crawl is disabled.
-        if has_red_signal:
-            self._last_stop_line_mode = "disabled_by_red"
-            return 0.0
-        if has_green_signal:
-            self._last_stop_line_mode = "disabled_by_green"
-            return 0.0
+        _ = (has_red_signal, has_green_signal)
         if not stop_line_distances:
             return 0.0
 
-        nearest = min(float(d) for d in stop_line_distances if np.isfinite(float(d)))
-        if not np.isfinite(nearest):
+        finite_distances = [float(d) for d in stop_line_distances if np.isfinite(float(d))]
+        if not finite_distances:
             return 0.0
+        nearest = min(finite_distances)
         self._last_stop_line_distance_m = float(nearest)
 
         start_distance_m = float(self.config.get("stop_line_crawl_start_distance_m", 30.0))
@@ -527,9 +553,15 @@ class TrafficSupervisor:
         max_brake = float(self.config.get("stop_line_crawl_max_brake", 0.2))
         target_speed_kmh = float(self.config.get("stop_line_crawl_target_speed_kmh", 20.0))
         preview_brake = float(self.config.get("stop_line_crawl_preview_brake", 0.03))
+        release_distance_m = float(self.config.get("stop_line_crawl_release_distance_m", 0.3))
 
         start_distance_m = max(1.0, start_distance_m)
         end_distance_m = max(0.5, min(end_distance_m, start_distance_m - 0.1))
+        release_distance_m = max(0.0, release_distance_m)
+
+        if nearest <= release_distance_m:
+            self._last_stop_line_mode = "passed"
+            return 0.0
 
         # No need to brake if vehicle is already at or below crawl speed target.
         if speed_kmh <= target_speed_kmh:
@@ -555,6 +587,8 @@ class TrafficSupervisor:
             overspeed_factor = max(0.25, overspeed_factor)
 
         brake = max_brake * dist_factor * overspeed_factor
+        if brake > 0.0:
+            brake = max(brake, float(self._clamp(preview_brake, 0.0, max_brake)))
         brake = float(self._clamp(brake, 0.0, max_brake))
 
         self._last_stop_line_crawl_brake = brake
@@ -745,6 +779,12 @@ class TrafficSupervisor:
             if class_name in {"stop_line", "stopline", "stop_line_marking"}:
                 stop_line_distances.append(float(det["distance_m"]))
 
+        stop_line_distances = self._update_stop_line_tracking(
+            stop_line_distances=stop_line_distances,
+            speed_kmh=speed_kmh,
+            dt=dt,
+        )
+
         selected_red, active_zone = self._select_red_signal(red_by_zone, green_by_zone)
         self._update_zone_lock(active_zone)
 
@@ -791,16 +831,25 @@ class TrafficSupervisor:
         should_refresh_latch = bool(
             red_brake >= 0.99 and red_target == "stop_line"
         )
+        if self._green_release_active:
+            self._red_hard_stop_locked = False
+            self._red_hard_stop_latch_s = 0.0
+
         if should_refresh_latch:
+            self._red_hard_stop_locked = True
             self._red_hard_stop_latch_s = max(self._red_hard_stop_latch_s, hold_seconds)
 
-        if self._red_hard_stop_latch_s > 0.0:
+        if self._red_hard_stop_locked:
+            final_brake = max(final_brake, hold_min_brake)
+            selected_target = "stop_line"
+            self._red_hard_stop_latch_s = max(self._red_hard_stop_latch_s, hold_seconds)
+        elif self._red_hard_stop_latch_s > 0.0:
             final_brake = max(final_brake, hold_min_brake)
             if selected_target in ("none", "stop_line_crawl"):
                 selected_target = "stop_line"
             self._red_hard_stop_latch_s = max(0.0, self._red_hard_stop_latch_s - max(1e-3, float(dt)))
 
-        self._red_hard_stop_active = self._red_hard_stop_latch_s > 1e-6
+        self._red_hard_stop_active = bool(self._red_hard_stop_locked or self._red_hard_stop_latch_s > 1e-6)
 
         # Timeout escape to avoid permanent deadlock.
         max_stopped_time = float(self.config.get("max_stopped_time", 30.0))
@@ -808,6 +857,9 @@ class TrafficSupervisor:
             final_brake = 0.0
             selected_target = "none"
             self._last_obstacle_reason = "timeout_release"
+            self._red_hard_stop_locked = False
+            self._red_hard_stop_latch_s = 0.0
+            self._red_hard_stop_active = False
 
         final_brake = float(self._clamp(final_brake, 0.0, 1.0))
         self._last_selected_target_type = selected_target
@@ -845,17 +897,26 @@ class TrafficSupervisor:
             "obstacle_linear_brake": float(self._last_obstacle_linear_brake),
             "green_release_active": bool(self._green_release_active),
             "green_release_zone": self._green_release_zone,
+            "red_suppressed_by_green_immunity": bool(self._red_suppressed_by_green_immunity),
             "red_stopline_distance_m": (
                 None if not np.isfinite(self._last_red_stopline_distance_m) else float(self._last_red_stopline_distance_m)
             ),
             "red_stopline_approach_brake": float(self._last_red_approach_brake),
             "red_hard_stop_active": bool(self._red_hard_stop_active),
+            "red_hard_stop_locked": bool(self._red_hard_stop_locked),
             "red_hard_stop_latch_s": float(self._red_hard_stop_latch_s),
             "stop_line_crawl_brake": float(self._last_stop_line_crawl_brake),
             "stop_line_distance_m": (
                 None if not np.isfinite(self._last_stop_line_distance_m) else float(self._last_stop_line_distance_m)
             ),
             "stop_line_crawl_mode": str(self._last_stop_line_mode),
+            "stop_line_tracked_distance_m": (
+                None if not np.isfinite(self._tracked_stop_line_distance_m) else float(self._tracked_stop_line_distance_m)
+            ),
+            "stop_line_missing_s": (
+                None if not np.isfinite(self._stop_line_missing_s) else float(self._stop_line_missing_s)
+            ),
+            "stop_line_observed_this_frame": bool(self._stop_line_observed_this_frame),
             "force_signal_brake_active": bool(self._last_force_signal_brake_active),
             "force_signal_brake_target": self._last_force_signal_brake_target,
             "prev_brake_force": float(self._last_final_brake),

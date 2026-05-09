@@ -173,6 +173,56 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def _control_without_autopilot_brake(control: Any) -> Any:
+    """Preserve autopilot steering/throttle but remove any stop/brake command."""
+    if control is None or carla is None:
+        return control
+
+    sanitized = carla.VehicleControl()
+    sanitized.throttle = float(clamp(float(getattr(control, "throttle", 0.0)), 0.0, 1.0))
+    sanitized.steer = float(clamp(float(getattr(control, "steer", 0.0)), -1.0, 1.0))
+    sanitized.brake = 0.0
+    sanitized.hand_brake = False
+    sanitized.reverse = bool(getattr(control, "reverse", False))
+    sanitized.manual_gear_shift = bool(getattr(control, "manual_gear_shift", False))
+    sanitized.gear = int(getattr(control, "gear", 0))
+    return sanitized
+
+
+def _configure_navigation_agent_ignore_stop_rules(nav_agent: Any) -> tuple[bool, bool]:
+    """Disable planner-managed stop rules so autopilot cannot decide braking."""
+    if nav_agent is None:
+        return False, False
+
+    def set_ignore(method_name: str, attr_name: str) -> bool:
+        configured = False
+        ignore_fn = getattr(nav_agent, method_name, None)
+        if callable(ignore_fn):
+            try:
+                ignore_fn(True)
+                configured = True
+            except TypeError:
+                try:
+                    ignore_fn()
+                    configured = True
+                except Exception:
+                    configured = False
+            except Exception:
+                configured = False
+
+        if not configured and hasattr(nav_agent, attr_name):
+            try:
+                setattr(nav_agent, attr_name, True)
+                configured = True
+            except Exception:
+                configured = False
+        return configured
+
+    lights_configured = set_ignore("ignore_traffic_lights", "_ignore_traffic_lights")
+    signs_configured = set_ignore("ignore_stop_signs", "_ignore_stop_signs")
+    return lights_configured, signs_configured
+
+
 def decode_carla_depth_to_meters(image) -> Any:
     """Decode CARLA depth camera BGRA buffer into meters."""
     raw = np.frombuffer(image.raw_data, dtype=np.uint8)
@@ -1076,54 +1126,40 @@ class AutopilotAgent(BaseAgent):
             logging.info("TM native autopilot enabled without speed-limit tuning (unknown speed limit).")
 
     def _configure_nav_agent_traffic_lights(self) -> None:
-        if not self.config.collect_data:
-            return
         if self._nav_agent is None:
             return
 
-        configured = False
-        ignore_fn = getattr(self._nav_agent, "ignore_traffic_lights", None)
-        if callable(ignore_fn):
-            try:
-                ignore_fn(True)
-                configured = True
-            except TypeError:
-                try:
-                    ignore_fn()
-                    configured = True
-                except Exception:
-                    configured = False
-            except Exception:
-                configured = False
-
-        if not configured and hasattr(self._nav_agent, "_ignore_traffic_lights"):
-            try:
-                setattr(self._nav_agent, "_ignore_traffic_lights", True)
-                configured = True
-            except Exception:
-                configured = False
-
-        if configured:
-            logging.info("Autopilot planner configured to ignore traffic lights during data collection.")
+        lights_configured, signs_configured = _configure_navigation_agent_ignore_stop_rules(self._nav_agent)
+        if lights_configured or signs_configured:
+            logging.info(
+                "Autopilot planner stop rules disabled (traffic_lights=%s, stop_signs=%s); brake commands are suppressed.",
+                lights_configured,
+                signs_configured,
+            )
         else:
-            logging.warning("Could not disable planner traffic-light handling for autopilot data collection.")
+            logging.warning("Could not disable planner stop rules for autopilot; brake commands will still be suppressed.")
 
     def _configure_tm_traffic_lights(self, vehicle) -> None:
-        if not self.config.collect_data:
-            return
         if self.session is None:
             return
 
         tm = getattr(self.session, "traffic_manager", None)
         if tm is None:
-            logging.warning("TrafficManager unavailable; cannot disable red-light stops for autopilot.")
+            logging.warning("TrafficManager unavailable; cannot disable TM stop rules for autopilot.")
             return
 
         try:
             tm.ignore_lights_percentage(vehicle, 100.0)
-            logging.info("Autopilot TM configured to ignore all traffic lights (100%%) during data collection.")
+            logging.info("Autopilot TM configured to ignore all traffic lights (100%%).")
         except Exception as exc:
             logging.warning("Failed to disable TM traffic-light stops for autopilot: %s", exc)
+        ignore_signs_fn = getattr(tm, "ignore_signs_percentage", None)
+        if callable(ignore_signs_fn):
+            try:
+                ignore_signs_fn(vehicle, 100.0)
+                logging.info("Autopilot TM configured to ignore all stop signs (100%%).")
+            except Exception as exc:
+                logging.warning("Failed to disable TM stop-sign stops for autopilot: %s", exc)
 
     def _set_new_destination(self, vehicle) -> None:
         nav_agent = self._nav_agent if self._nav_agent is not None else self._command_nav_agent
@@ -1491,6 +1527,7 @@ class AutopilotAgent(BaseAgent):
                 frame_id_for_control = int(world.get_snapshot().frame)
             recovery_delta = self._recovery_offset(frame_id_for_control)
             nav_control.steer = float(clamp(nav_control.steer + recovery_delta, -1.0, 1.0))
+            nav_control = _control_without_autopilot_brake(nav_control)
             vehicle.apply_control(nav_control)
         elif vehicle is not None and self._tm_fallback_mode:
             frame_id_for_control = step_idx
@@ -1506,9 +1543,13 @@ class AutopilotAgent(BaseAgent):
                     self._command_nav_agent.run_step()
                 except Exception:
                     pass
+            control = vehicle.get_control()
+            tm_brake = float(getattr(control, "brake", 0.0))
+            tm_hand_brake = bool(getattr(control, "hand_brake", False))
             if abs(recovery_delta) > 1e-6:
-                control = vehicle.get_control()
                 control.steer = float(clamp(control.steer + recovery_delta, -1.0, 1.0))
+            if abs(recovery_delta) > 1e-6 or tm_brake > 1e-6 or tm_hand_brake:
+                control = _control_without_autopilot_brake(control)
                 vehicle.apply_control(control)
 
         if self._collector is not None and vehicle is not None:
@@ -1776,6 +1817,16 @@ class LaneFollowAgent(BaseAgent):
             "confidence_threshold": 0.5,
             "temporal_filter_frames": 3,
             "red_light_distance_threshold": 30.0,
+            "red_stopline_trigger_distance_m": 7.0,
+            "red_hard_stop_min_brake": 1.0,
+            "red_hard_stop_hold_seconds": 1.5,
+            "green_immunity_frames": 10,
+            "stop_line_crawl_start_distance_m": 18.0,
+            "stop_line_crawl_end_distance_m": 7.0,
+            "stop_line_crawl_max_brake": 0.2,
+            "stop_line_crawl_target_speed_kmh": 12.0,
+            "stop_line_crawl_preview_brake": 0.03,
+            "stop_line_tracking_max_missing_seconds": 3.5,
             "obstacle_distance_threshold": 5.0,
             "max_stopped_time": 30.0,
         }
@@ -4764,48 +4815,53 @@ class YoloDetectAgent(BaseAgent):
         self._configure_tm_traffic_lights(vehicle)
         self._tm_autopilot_enabled = True
 
-    def _configure_nav_agent_traffic_lights(self) -> None:
-        if not self.config.yolo_disable_autopilot_red_light:
+    def _disable_tm_autopilot(self, vehicle) -> None:
+        try:
+            vehicle.set_autopilot(False, self.config.tm_port)
+        except TypeError:
+            vehicle.set_autopilot(False)
+        self._tm_autopilot_enabled = False
+
+    def _set_tm_manual_brake_mode(self, vehicle: Any, enabled: bool, step_idx: int) -> None:
+        if vehicle is None or not self._tm_fallback_mode:
             return
+        if enabled:
+            if self._tm_autopilot_enabled:
+                self._disable_tm_autopilot(vehicle)
+                logging.info(
+                    "YOLO TM autopilot temporarily disabled at tick %d so supervisor brake owns vehicle control.",
+                    step_idx,
+                )
+            return
+
+        if not self._tm_autopilot_enabled:
+            self._enable_tm_autopilot(vehicle)
+            logging.info(
+                "YOLO TM autopilot re-enabled at tick %d after supervisor brake released.",
+                step_idx,
+            )
+
+    def _configure_nav_agent_traffic_lights(self) -> None:
         if self._nav_agent is None:
             return
 
-        configured = False
-        ignore_fn = getattr(self._nav_agent, "ignore_traffic_lights", None)
-        if callable(ignore_fn):
-            try:
-                ignore_fn(True)
-                configured = True
-            except TypeError:
-                try:
-                    ignore_fn()
-                    configured = True
-                except Exception:
-                    configured = False
-            except Exception:
-                configured = False
-
-        if not configured and hasattr(self._nav_agent, "_ignore_traffic_lights"):
-            try:
-                setattr(self._nav_agent, "_ignore_traffic_lights", True)
-                configured = True
-            except Exception:
-                configured = False
-
-        if configured:
-            logging.info("YOLO planner autopilot configured to ignore traffic lights (supervisor decides stop/go).")
+        lights_configured, signs_configured = _configure_navigation_agent_ignore_stop_rules(self._nav_agent)
+        if lights_configured or signs_configured:
+            logging.info(
+                "YOLO planner autopilot stop rules disabled (traffic_lights=%s, stop_signs=%s); only YOLO/supervisor may brake.",
+                lights_configured,
+                signs_configured,
+            )
         else:
-            logging.warning("Could not disable traffic-light handling on planner autopilot; supervisor may compete with planner stops.")
+            logging.warning("Could not disable planner stop rules for YOLO autopilot; brake commands will still be suppressed.")
 
     def _configure_tm_traffic_lights(self, vehicle) -> None:
-        if not self.config.yolo_disable_autopilot_red_light:
-            return
         if self.session is None:
             return
 
         tm = getattr(self.session, "traffic_manager", None)
         if tm is None:
-            logging.warning("TrafficManager unavailable; cannot apply ignore_lights_percentage for YOLO fallback autopilot.")
+            logging.warning("TrafficManager unavailable; cannot disable TM stop rules for YOLO autopilot.")
             return
 
         try:
@@ -4813,6 +4869,13 @@ class YoloDetectAgent(BaseAgent):
             logging.info("YOLO TM fallback configured to ignore all traffic lights (100%%).")
         except Exception as exc:
             logging.warning("Failed to configure TM ignore_lights_percentage for YOLO fallback: %s", exc)
+        ignore_signs_fn = getattr(tm, "ignore_signs_percentage", None)
+        if callable(ignore_signs_fn):
+            try:
+                ignore_signs_fn(vehicle, 100.0)
+                logging.info("YOLO TM fallback configured to ignore all stop signs (100%%).")
+            except Exception as exc:
+                logging.warning("Failed to configure TM ignore_signs_percentage for YOLO fallback: %s", exc)
 
     def _set_new_destination(self, vehicle) -> None:
         if not self._spawn_points or self._nav_agent is None:
@@ -4974,6 +5037,16 @@ class YoloDetectAgent(BaseAgent):
             "confidence_threshold": 0.5,
             "temporal_filter_frames": 3,
             "red_light_distance_threshold": 30.0,
+            "red_stopline_trigger_distance_m": 7.0,
+            "red_hard_stop_min_brake": 1.0,
+            "red_hard_stop_hold_seconds": 1.5,
+            "green_immunity_frames": 10,
+            "stop_line_crawl_start_distance_m": 18.0,
+            "stop_line_crawl_end_distance_m": 7.0,
+            "stop_line_crawl_max_brake": 0.2,
+            "stop_line_crawl_target_speed_kmh": 12.0,
+            "stop_line_crawl_preview_brake": 0.03,
+            "stop_line_tracking_max_missing_seconds": 3.5,
             "obstacle_distance_threshold": 5.0,
             "max_stopped_time": 30.0,
         }
@@ -5233,7 +5306,8 @@ class YoloDetectAgent(BaseAgent):
                 pass
 
             nav_control = self._nav_agent.run_step()
-            final_control = nav_control
+            autopilot_brake = float(getattr(nav_control, "brake", 0.0))
+            final_control = _control_without_autopilot_brake(nav_control)
             hold_hand_brake = bool(
                 red_hard_stop_active
                 and supervisor_brake >= 0.99
@@ -5242,15 +5316,14 @@ class YoloDetectAgent(BaseAgent):
                 and float(speed_kmh) <= 2.0
             )
 
-            # IMPORTANT: supervisor brake must override planner throttle/brake.
+            # Autopilot contributes steering/throttle only; braking belongs to YOLO/supervisor.
             if is_emergency or supervisor_brake > 0.0:
                 emergency_floor = 0.6 if is_emergency else 0.0
-                final_control = carla.VehicleControl()
-                final_control.steer = float(nav_control.steer)
+                final_control = _control_without_autopilot_brake(nav_control)
                 final_control.throttle = 0.0
                 final_control.brake = float(
                     clamp(
-                        max(float(nav_control.brake), float(supervisor_brake), float(emergency_floor)),
+                        max(float(supervisor_brake), float(emergency_floor)),
                         0.0,
                         1.0,
                     )
@@ -5259,12 +5332,19 @@ class YoloDetectAgent(BaseAgent):
                     final_control.brake = 1.0
                 final_control.hand_brake = bool(hold_hand_brake)
                 logging.debug(
-                    "[TICK %d] Supervisor override planner control: emergency=%s supervisor_brake=%.2f planner_brake=%.2f final_brake=%.2f",
+                    "[TICK %d] Supervisor override planner control: emergency=%s supervisor_brake=%.2f planner_brake_suppressed=%.2f final_brake=%.2f",
                     step_idx,
                     bool(is_emergency),
                     float(supervisor_brake),
-                    float(nav_control.brake),
+                    autopilot_brake,
                     float(final_control.brake),
+                )
+            elif autopilot_brake > 1e-6 or bool(getattr(nav_control, "hand_brake", False)):
+                logging.debug(
+                    "[TICK %d] Suppressed planner autopilot brake=%.2f hand_brake=%s.",
+                    step_idx,
+                    autopilot_brake,
+                    bool(getattr(nav_control, "hand_brake", False)),
                 )
 
             vehicle.apply_control(final_control)
@@ -5272,6 +5352,11 @@ class YoloDetectAgent(BaseAgent):
             display_throttle = float(final_control.throttle)
             display_brake = float(final_control.brake)
         elif vehicle is not None and self._tm_fallback_mode:
+            current_control = vehicle.get_control()
+            autopilot_brake = float(getattr(current_control, "brake", 0.0))
+            final_control = _control_without_autopilot_brake(current_control)
+            supervisor_manual_override = bool(is_emergency or supervisor_brake > 0.0)
+            self._set_tm_manual_brake_mode(vehicle, supervisor_manual_override, step_idx)
             hold_hand_brake = bool(
                 red_hard_stop_active
                 and supervisor_brake >= 0.99
@@ -5279,15 +5364,12 @@ class YoloDetectAgent(BaseAgent):
                 and speed_kmh is not None
                 and float(speed_kmh) <= 2.0
             )
-            if is_emergency or supervisor_brake > 0.0:
+            if supervisor_manual_override:
                 emergency_floor = 0.6 if is_emergency else 0.0
-                current_control = vehicle.get_control()
-                final_control = carla.VehicleControl()
-                final_control.steer = float(current_control.steer)
                 final_control.throttle = 0.0
                 final_control.brake = float(
                     clamp(
-                        max(float(current_control.brake), float(supervisor_brake), float(emergency_floor)),
+                        max(float(supervisor_brake), float(emergency_floor)),
                         0.0,
                         1.0,
                     )
@@ -5295,18 +5377,26 @@ class YoloDetectAgent(BaseAgent):
                 if hold_hand_brake:
                     final_control.brake = 1.0
                 final_control.hand_brake = bool(hold_hand_brake)
-                vehicle.apply_control(final_control)
-                display_steer = float(final_control.steer)
-                display_throttle = float(final_control.throttle)
-                display_brake = float(final_control.brake)
                 logging.debug(
-                    "[TICK %d] Supervisor override TM fallback: emergency=%s supervisor_brake=%.2f tm_brake=%.2f final_brake=%.2f",
+                    "[TICK %d] Supervisor override TM fallback: emergency=%s supervisor_brake=%.2f tm_brake_suppressed=%.2f final_brake=%.2f",
                     step_idx,
                     bool(is_emergency),
                     float(supervisor_brake),
-                    float(current_control.brake),
+                    autopilot_brake,
                     float(final_control.brake),
                 )
+            elif autopilot_brake > 1e-6 or bool(getattr(current_control, "hand_brake", False)):
+                logging.debug(
+                    "[TICK %d] Suppressed TM autopilot brake=%.2f hand_brake=%s.",
+                    step_idx,
+                    autopilot_brake,
+                    bool(getattr(current_control, "hand_brake", False)),
+                )
+
+            vehicle.apply_control(final_control)
+            display_steer = float(final_control.steer)
+            display_throttle = float(final_control.throttle)
+            display_brake = float(final_control.brake)
 
         # ─────────────────────────────────────────────────────────
         # Step 6: Prepare Annotation Frame
@@ -5787,14 +5877,14 @@ def parse_args() -> argparse.Namespace:
         dest="yolo_disable_autopilot_red_light",
         action="store_true",
         default=None,
-        help="In yolo_detect mode, force planner/TM autopilot to ignore traffic lights so supervisor decides braking.",
+        help="Deprecated compatibility flag; yolo_detect now always suppresses autopilot stop/brake handling.",
     )
     parser.add_argument(
         "--no-yolo-disable-autopilot-red-light",
         dest="yolo_disable_autopilot_red_light",
         action="store_false",
         default=None,
-        help="In yolo_detect mode, keep autopilot traffic-light handling enabled.",
+        help="Deprecated compatibility flag; autopilot stop/brake handling stays suppressed.",
     )
     parser.add_argument(
         "--no-random-weather",

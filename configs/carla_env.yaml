@@ -7,7 +7,7 @@
   fixed_delta: 0.03
   no_rendering: false
 
-  map: "Town03"
+  map: "Town10HD"
 
 
 
@@ -67,7 +67,7 @@ yolo:
   debug_overlay: true
 
 traffic_spawn:
-  vehicle_count: 60
+  vehicle_count: 0
   bike_count: 5
   motorbike_count: 5
   pedestrian_count: 5
