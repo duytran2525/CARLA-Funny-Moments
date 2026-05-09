@@ -41,6 +41,10 @@ class TrafficSupervisor:
         self.config.setdefault("green_release_margin", 0.05)
         self.config.setdefault("green_immunity_frames", 10)
         self.config.setdefault("zone_release_missing_frames", 3)
+        self.config.setdefault("stop_line_crawl_start_distance_m", 18.0)
+        self.config.setdefault("stop_line_crawl_end_distance_m", 2.5)
+        self.config.setdefault("stop_line_crawl_max_brake", 0.2)
+        self.config.setdefault("stop_line_crawl_target_speed_kmh", 20.0)
 
         # Obstacle brake profile.
         self.config.setdefault("obstacle_linear_full_brake_distance_m", 6.0)
@@ -100,6 +104,9 @@ class TrafficSupervisor:
         self._last_force_signal_brake_target: Optional[str] = None
         self._green_release_active = False
         self._green_release_zone: Optional[str] = None
+        self._last_stop_line_crawl_brake = 0.0
+        self._last_stop_line_distance_m = float("inf")
+        self._last_stop_line_mode = "none"
 
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
@@ -412,9 +419,6 @@ class TrafficSupervisor:
         if red_det is None:
             return 0.0, "none"
 
-        if self.green_immunity_counter > 0:
-            return 0.0, "none"
-
         zone = str(red_det.get("zone", ""))
         red_distance = float(red_det.get("distance_m", float("inf")))
 
@@ -439,6 +443,67 @@ class TrafficSupervisor:
                 return 1.0, "red_light"
 
         return 0.0, "none"
+
+    def _compute_stop_line_crawl_brake(
+        self,
+        stop_line_distances: List[float],
+        speed_kmh: float,
+        has_red_signal: bool,
+        has_green_signal: bool,
+    ) -> float:
+        self._last_stop_line_crawl_brake = 0.0
+        self._last_stop_line_distance_m = float("inf")
+        self._last_stop_line_mode = "none"
+
+        # If there is a valid traffic-light decision, stop_line crawl is disabled.
+        if has_red_signal:
+            self._last_stop_line_mode = "disabled_by_red"
+            return 0.0
+        if has_green_signal:
+            self._last_stop_line_mode = "disabled_by_green"
+            return 0.0
+        if not stop_line_distances:
+            return 0.0
+
+        nearest = min(float(d) for d in stop_line_distances if np.isfinite(float(d)))
+        if not np.isfinite(nearest):
+            return 0.0
+        self._last_stop_line_distance_m = float(nearest)
+
+        start_distance_m = float(self.config.get("stop_line_crawl_start_distance_m", 18.0))
+        end_distance_m = float(self.config.get("stop_line_crawl_end_distance_m", 2.5))
+        max_brake = float(self.config.get("stop_line_crawl_max_brake", 0.2))
+        target_speed_kmh = float(self.config.get("stop_line_crawl_target_speed_kmh", 20.0))
+
+        start_distance_m = max(1.0, start_distance_m)
+        end_distance_m = max(0.5, min(end_distance_m, start_distance_m - 0.1))
+
+        if nearest > start_distance_m:
+            self._last_stop_line_mode = "far"
+            return 0.0
+
+        # No need to brake if vehicle is already at or below crawl speed target.
+        if speed_kmh <= target_speed_kmh:
+            self._last_stop_line_mode = "below_target_speed"
+            return 0.0
+
+        if nearest <= end_distance_m:
+            dist_factor = 1.0
+        else:
+            dist_factor = (start_distance_m - nearest) / max(1e-6, start_distance_m - end_distance_m)
+        dist_factor = self._clamp(float(dist_factor), 0.0, 1.0)
+
+        overspeed_ratio = (float(speed_kmh) - target_speed_kmh) / max(1.0, target_speed_kmh)
+        overspeed_factor = self._clamp(float(overspeed_ratio), 0.0, 1.0)
+        if overspeed_factor > 0.0:
+            overspeed_factor = max(0.25, overspeed_factor)
+
+        brake = max_brake * dist_factor * overspeed_factor
+        brake = float(self._clamp(brake, 0.0, max_brake))
+
+        self._last_stop_line_crawl_brake = brake
+        self._last_stop_line_mode = "active" if brake > 0.0 else "inactive"
+        return brake
 
     def _compute_obstacle_brake(
         self,
@@ -632,6 +697,13 @@ class TrafficSupervisor:
             self._last_force_signal_brake_active = True
             self._last_force_signal_brake_target = red_target
 
+        stop_line_crawl_brake = self._compute_stop_line_crawl_brake(
+            stop_line_distances=stop_line_distances,
+            speed_kmh=speed_kmh,
+            has_red_signal=(selected_red is not None),
+            has_green_signal=bool(self._green_release_active),
+        )
+
         obstacle_brake = self._compute_obstacle_brake(
             detections=parsed,
             danger_polygon=danger_polygon,
@@ -648,6 +720,9 @@ class TrafficSupervisor:
         elif red_brake > 0.0:
             final_brake = red_brake
             selected_target = red_target
+        elif stop_line_crawl_brake > 0.0:
+            final_brake = stop_line_crawl_brake
+            selected_target = "stop_line_crawl"
 
         # Timeout escape to avoid permanent deadlock.
         max_stopped_time = float(self.config.get("max_stopped_time", 30.0))
@@ -692,6 +767,11 @@ class TrafficSupervisor:
             "obstacle_linear_brake": float(self._last_obstacle_linear_brake),
             "green_release_active": bool(self._green_release_active),
             "green_release_zone": self._green_release_zone,
+            "stop_line_crawl_brake": float(self._last_stop_line_crawl_brake),
+            "stop_line_distance_m": (
+                None if not np.isfinite(self._last_stop_line_distance_m) else float(self._last_stop_line_distance_m)
+            ),
+            "stop_line_crawl_mode": str(self._last_stop_line_mode),
             "force_signal_brake_active": bool(self._last_force_signal_brake_active),
             "force_signal_brake_target": self._last_force_signal_brake_target,
             "prev_brake_force": float(self._last_final_brake),
