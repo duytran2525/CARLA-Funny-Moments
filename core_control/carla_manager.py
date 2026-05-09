@@ -70,6 +70,7 @@ class CarlaManager:
         npc_motorbike_count: int = 10,
         npc_pedestrian_count: int = 50,
         npc_enable_autopilot: bool = True,
+        seed: Optional[int] = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -87,6 +88,7 @@ class CarlaManager:
         self.npc_motorbike_count = max(0, npc_motorbike_count)
         self.npc_pedestrian_count = max(0, npc_pedestrian_count)
         self.npc_enable_autopilot = npc_enable_autopilot
+        self.seed = seed
 
         self.client: Optional[CarlaClient] = None
         self.world: Optional[CarlaWorld] = None
@@ -165,6 +167,7 @@ class CarlaManager:
         self.client.set_timeout(self.timeout)
         self.world = world
         self.tm = self.client.get_trafficmanager(self.tm_port)
+        self._apply_random_seeds()
         self._original_settings = self.world.get_settings()
         self._apply_world_settings()
         self._destroy_existing_actors()
@@ -174,6 +177,25 @@ class CarlaManager:
         self._spawn_pedestrians()
         self._log_static_traffic_actors()
         self.apply_spawn_locked_spectator(force=True)
+
+    def _apply_random_seeds(self) -> None:
+        if self.seed is None:
+            return
+        seed = int(self.seed)
+        if self.tm is not None:
+            try:
+                self.tm.set_random_device_seed(seed)
+                logging.info("Applied Traffic Manager random seed: %d", seed)
+            except Exception as exc:
+                logging.warning("Failed to set Traffic Manager random seed=%d: %s", seed, exc)
+        if self.world is not None:
+            set_pedestrians_seed = getattr(self.world, "set_pedestrians_seed", None)
+            if callable(set_pedestrians_seed):
+                try:
+                    set_pedestrians_seed(seed)
+                    logging.info("Applied pedestrian random seed: %d", seed)
+                except Exception as exc:
+                    logging.warning("Failed to set pedestrian random seed=%d: %s", seed, exc)
 
     def _apply_world_settings(self) -> None:
         assert self.world is not None

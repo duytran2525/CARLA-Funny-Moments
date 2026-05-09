@@ -13,5 +13,6 @@ torchvision
 
 # Optional local verification
 pytest
+trackeval
 
 # CARLA is usually installed separately because versioning is tied to the simulator build.

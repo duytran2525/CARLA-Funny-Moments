@@ -4,6 +4,7 @@ import argparse
 import csv
 import inspect
 import importlib
+import json
 import logging
 import math
 import os
@@ -729,6 +730,7 @@ class RunConfig:
     yolo_visualize: bool
     yolo_draw_overlay: bool
     yolo_inference_imgsz: int
+    yolo_tracker_config: str
     cil_command_prep_time_s: float
     cil_command_trigger_min_m: float
     cil_command_trigger_max_m: float
@@ -872,6 +874,7 @@ class CarlaSession(BaseSession):
             npc_motorbike_count=self.config.npc_motorbike_count,
             npc_pedestrian_count=self.config.npc_pedestrian_count,
             npc_enable_autopilot=self.config.npc_enable_autopilot,
+            seed=self.config.seed,
         )
         self._manager.start()
         logging.info("CARLA session is ready.")
@@ -4663,10 +4666,14 @@ class YoloDetectAgent(BaseAgent):
         self._tracking_predictions_path: Optional[Path] = None
         self._tracking_ground_truth_path: Optional[Path] = None
         self._tracking_seqinfo_path: Optional[Path] = None
+        self._tracking_metadata_path: Optional[Path] = None
+        self._tracking_model_path: Optional[Path] = None
         self._tracking_seq_name: str = ""
         self._tracking_gt_logs: list[str] = []
         self._tracking_gt_frame_id = 0
         self._tracking_image_size: tuple[int, int] = (0, 0)
+        self._tracking_initial_spawn_index: Optional[int] = None
+        self._tracking_initial_transform: Optional[Dict[str, Any]] = None
 
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
@@ -4691,7 +4698,11 @@ class YoloDetectAgent(BaseAgent):
         self._tracking_predictions_path = None
         self._tracking_ground_truth_path = None
         self._tracking_seqinfo_path = None
+        self._tracking_metadata_path = None
+        self._tracking_model_path = None
         self._tracking_seq_name = ""
+        self._tracking_initial_spawn_index = None
+        self._tracking_initial_transform = None
         vehicle = session.ego_vehicle
         world = session.world
         if vehicle is None or world is None:
@@ -4723,6 +4734,7 @@ class YoloDetectAgent(BaseAgent):
             camera_mount_y_m=0.0,
             camera_mount_z_m=2.2,
             camera_pitch_deg=-8.0,
+            tracker_config=self.config.yolo_tracker_config,
             enable_tracking_metrics_logging=True,
         )
         self._init_tracking_metrics_workspace(model_path)
@@ -4736,11 +4748,12 @@ class YoloDetectAgent(BaseAgent):
                 (time.perf_counter() - warmup_t0) * 1000.0,
             )
         logging.info(
-            "YOLO runtime config: every_n_ticks=%d visualize=%s draw_overlay=%s imgsz=%s",
+            "YOLO runtime config: every_n_ticks=%d visualize=%s draw_overlay=%s imgsz=%s tracker=%s",
             int(self.config.yolo_inference_every_n_ticks),
             bool(self.config.yolo_visualize),
             bool(self.config.yolo_draw_overlay),
             detector_imgsz if detector_imgsz is not None else "engine-default",
+            self.config.yolo_tracker_config,
         )
         if TrafficSupervisor is None:
             logging.warning("TrafficSupervisor unavailable. yolo_detect will run without supervisor brake fusion.")
@@ -4754,20 +4767,22 @@ class YoloDetectAgent(BaseAgent):
                 logging.warning("Failed to initialize TrafficSupervisor: %s", exc)
         self._camera = self._spawn_camera(world, vehicle)
         self._camera.listen(self._on_camera_frame)
-        if self._use_depth_camera:
+        needs_depth_camera = bool(self._use_depth_camera or self._tracking_metrics_dir is not None)
+        if needs_depth_camera:
             try:
                 self._depth_camera = self._spawn_depth_camera(world, vehicle)
                 self._depth_camera.listen(self._on_depth_frame)
             except Exception as exc:
                 self._depth_camera = None
                 logging.warning(
-                    "Depth camera unavailable for yolo_detect, fallback to bbox distance. Reason: %s",
+                    "Depth camera unavailable for yolo_detect/tracking metrics, fallback to projection-only GT. Reason: %s",
                     exc,
                 )
         else:
             self._depth_camera = None
             logging.info("YOLO detector does not consume depth_map_m; skipping depth camera for higher FPS.")
         self._init_navigation_agent(world, vehicle)
+        self._capture_tracking_run_context(vehicle)
         self._enabled = True
         if self._nav_agent is not None:
             logging.info(
@@ -5150,16 +5165,117 @@ class YoloDetectAgent(BaseAgent):
     def _init_tracking_metrics_workspace(self, model_path: Path) -> None:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         model_stem = Path(model_path).stem
-        self._tracking_seq_name = f"carla_{self.name}_{timestamp}"
+        tracker_stem = Path(str(self.config.yolo_tracker_config)).stem or "tracker"
+        self._tracking_seq_name = f"carla_{self.name}_{tracker_stem}_{timestamp}"
         metrics_root = (Path(__file__).resolve().parent / "outputs" / "tracking_metrics" / self._tracking_seq_name).resolve()
         metrics_root.mkdir(parents=True, exist_ok=True)
         self._tracking_metrics_dir = metrics_root
-        self._tracking_predictions_path = metrics_root / f"{model_stem}_tracker_predictions.txt"
+        self._tracking_predictions_path = metrics_root / f"{model_stem}_{tracker_stem}_tracker_predictions.txt"
         self._tracking_ground_truth_path = metrics_root / "ground_truth.txt"
         self._tracking_seqinfo_path = metrics_root / "seqinfo.ini"
+        self._tracking_metadata_path = metrics_root / "run_metadata.json"
+        self._tracking_model_path = Path(model_path).resolve()
         self._tracking_gt_logs = []
         self._tracking_gt_frame_id = 0
         logging.info("Tracking metrics workspace: %s", metrics_root)
+
+    @staticmethod
+    def _transform_to_metadata(transform: Any) -> Optional[Dict[str, Dict[str, float]]]:
+        if transform is None:
+            return None
+        try:
+            location = transform.location
+            rotation = transform.rotation
+            return {
+                "location": {
+                    "x": round(float(location.x), 4),
+                    "y": round(float(location.y), 4),
+                    "z": round(float(location.z), 4),
+                },
+                "rotation": {
+                    "pitch": round(float(rotation.pitch), 4),
+                    "yaw": round(float(rotation.yaw), 4),
+                    "roll": round(float(rotation.roll), 4),
+                },
+            }
+        except Exception:
+            return None
+
+    def _capture_tracking_run_context(self, vehicle: Any) -> None:
+        if vehicle is None:
+            return
+        try:
+            transform = vehicle.get_transform()
+        except Exception:
+            transform = None
+        self._tracking_initial_transform = self._transform_to_metadata(transform)
+        if transform is not None:
+            self._tracking_initial_spawn_index = self._nearest_spawn_index(transform.location)
+
+    def _build_tracking_run_metadata(self) -> Dict[str, Any]:
+        resolved_model = self._tracking_model_path
+        if resolved_model is None:
+            try:
+                resolved_model = resolve_yolo_model_path(self.config.yolo_model_path)
+            except Exception:
+                resolved_model = None
+
+        metadata: Dict[str, Any] = {
+            "metadata_version": 1,
+            "created_at_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "seq_name": self._tracking_seq_name,
+            "agent": self.name,
+            "env_config_path": str(self.config.env_config_path),
+            "map_name": str(self.config.map_name),
+            "sync": bool(self.config.sync),
+            "fixed_delta": float(self.config.fixed_delta),
+            "no_rendering": bool(self.config.no_rendering),
+            "seed": self.config.seed,
+            "ticks": int(self.config.ticks),
+            "tick_interval": float(self.config.tick_interval),
+            "weather_preset": str(self.config.weather_preset),
+            "vehicle_filter": str(self.config.vehicle_filter),
+            "configured_spawn_point": int(self.config.spawn_point),
+            "actual_initial_spawn_point": self._tracking_initial_spawn_index,
+            "initial_transform": self._tracking_initial_transform,
+            "configured_destination_point": int(self.config.destination_point),
+            "actual_route_destination_point": self._route_destination_index,
+            "target_speed_kmh": float(self.config.target_speed_kmh),
+            "tm_port": int(self.config.tm_port),
+            "npc_vehicle_count": int(self.config.npc_vehicle_count),
+            "npc_bike_count": int(self.config.npc_bike_count),
+            "npc_motorbike_count": int(self.config.npc_motorbike_count),
+            "npc_pedestrian_count": int(self.config.npc_pedestrian_count),
+            "npc_enable_autopilot": bool(self.config.npc_enable_autopilot),
+            "camera_width": int(self.config.camera_width),
+            "camera_height": int(self.config.camera_height),
+            "camera_fov": float(self.config.camera_fov),
+            "camera_mount": {
+                "x_m": 1.5,
+                "y_m": 0.0,
+                "z_m": 2.2,
+                "pitch_deg": -8.0,
+            },
+            "yolo_backend": str(self.config.yolo_backend),
+            "yolo_nav_agent_type": str(self.config.yolo_nav_agent_type),
+            "yolo_tracker_config": str(self.config.yolo_tracker_config),
+            "yolo_model_path": str(self.config.yolo_model_path),
+            "resolved_yolo_model_path": str(resolved_model) if resolved_model is not None else "",
+            "yolo_inference_imgsz": int(self.config.yolo_inference_imgsz),
+            "yolo_inference_every_n_ticks": int(self.config.yolo_inference_every_n_ticks),
+            "detector_uses_depth_input": bool(self._use_depth_camera),
+            "gt_occlusion_filter": {
+                "enabled": bool(self._depth_camera is not None),
+                "method": "projected_3d_bbox_visible_area_plus_depth_map",
+                "min_visible_area_ratio": 0.20,
+                "min_depth_visible_ratio": 0.20,
+            },
+            "tracking_metrics_dir": str(self._tracking_metrics_dir) if self._tracking_metrics_dir is not None else "",
+            "predictions_path": str(self._tracking_predictions_path) if self._tracking_predictions_path is not None else "",
+            "ground_truth_path": str(self._tracking_ground_truth_path) if self._tracking_ground_truth_path is not None else "",
+            "seqinfo_path": str(self._tracking_seqinfo_path) if self._tracking_seqinfo_path is not None else "",
+        }
+        return metadata
 
     def _camera_intrinsics_matrix(self, image_width: int, image_height: int) -> Any:
         if np is None:
@@ -5232,7 +5348,66 @@ class YoloDetectAgent(BaseAgent):
             return "vehicle"
         return None
 
-    def _log_ground_truth_frame(self, frame_shape: tuple[int, int, int], ego_vehicle: Any) -> None:
+    @staticmethod
+    def _projected_depth_visibility_ratio(
+        projected_points: list[tuple[float, float, float]],
+        depth_map_m: Any,
+        image_w: int,
+        image_h: int,
+    ) -> Optional[float]:
+        if np is None or depth_map_m is None or not projected_points:
+            return None
+        try:
+            depth_array = np.asarray(depth_map_m)
+        except Exception:
+            return None
+        if depth_array.ndim < 2:
+            return None
+
+        depth_h = int(depth_array.shape[0])
+        depth_w = int(depth_array.shape[1])
+        if depth_h <= 0 or depth_w <= 0 or image_w <= 0 or image_h <= 0:
+            return None
+
+        visible = 0
+        checked = 0
+        for u, v, expected_depth in projected_points:
+            if not (
+                math.isfinite(float(u))
+                and math.isfinite(float(v))
+                and math.isfinite(float(expected_depth))
+                and expected_depth > 0.0
+            ):
+                continue
+            if u < 0.0 or v < 0.0 or u >= float(image_w) or v >= float(image_h):
+                continue
+
+            px = int(round(float(u) * float(depth_w - 1) / max(1.0, float(image_w - 1))))
+            py = int(round(float(v) * float(depth_h - 1) / max(1.0, float(image_h - 1))))
+            px = max(0, min(depth_w - 1, px))
+            py = max(0, min(depth_h - 1, py))
+            try:
+                measured_depth = float(depth_array[py, px])
+            except Exception:
+                continue
+            if not math.isfinite(measured_depth) or measured_depth <= 0.0:
+                continue
+
+            checked += 1
+            tolerance_m = max(1.5, 0.10 * float(expected_depth))
+            if float(expected_depth) <= measured_depth + tolerance_m:
+                visible += 1
+
+        if checked <= 0:
+            return None
+        return float(visible) / float(checked)
+
+    def _log_ground_truth_frame(
+        self,
+        frame_shape: tuple[int, int, int],
+        ego_vehicle: Any,
+        depth_map_m: Any = None,
+    ) -> None:
         if (
             np is None
             or self.session is None
@@ -5291,7 +5466,7 @@ class YoloDetectAgent(BaseAgent):
             if not bbox_vertices:
                 continue
 
-            pixels: list[tuple[float, float]] = []
+            projected_points: list[tuple[float, float, float]] = []
             for vertex in bbox_vertices:
                 projected = self._project_world_location_to_image(
                     world_location=vertex,
@@ -5300,21 +5475,49 @@ class YoloDetectAgent(BaseAgent):
                 )
                 if projected is None:
                     continue
-                u, v, _ = projected
-                pixels.append((u, v))
+                projected_points.append(projected)
 
-            if len(pixels) < 2:
+            try:
+                center_projected = self._project_world_location_to_image(
+                    world_location=actor.get_location(),
+                    world_to_camera=world_to_camera,
+                    intrinsics=intrinsics,
+                )
+                if center_projected is not None:
+                    projected_points.append(center_projected)
+            except Exception:
+                pass
+
+            if len(projected_points) < 2:
                 continue
 
-            xs = [p[0] for p in pixels]
-            ys = [p[1] for p in pixels]
-            x1 = max(0.0, min(xs))
-            y1 = max(0.0, min(ys))
-            x2 = min(float(image_w - 1), max(xs))
-            y2 = min(float(image_h - 1), max(ys))
+            xs = [p[0] for p in projected_points]
+            ys = [p[1] for p in projected_points]
+            raw_x1 = min(xs)
+            raw_y1 = min(ys)
+            raw_x2 = max(xs)
+            raw_y2 = max(ys)
+            raw_area = max(0.0, raw_x2 - raw_x1) * max(0.0, raw_y2 - raw_y1)
+            x1 = max(0.0, raw_x1)
+            y1 = max(0.0, raw_y1)
+            x2 = min(float(image_w - 1), raw_x2)
+            y2 = min(float(image_h - 1), raw_y2)
             width = max(0.0, x2 - x1)
             height = max(0.0, y2 - y1)
             if width < 1.0 or height < 1.0:
+                continue
+            if raw_area > 1.0:
+                visible_area_ratio = (width * height) / raw_area
+                if visible_area_ratio < 0.20:
+                    continue
+
+            depth_visibility = self._projected_depth_visibility_ratio(
+                projected_points=projected_points,
+                depth_map_m=depth_map_m,
+                image_w=image_w,
+                image_h=image_h,
+            )
+            if depth_visibility is not None and depth_visibility < 0.20:
                 continue
 
             # MOTChallenge GT format:
@@ -5360,12 +5563,23 @@ class YoloDetectAgent(BaseAgent):
             except Exception as exc:
                 logging.warning("Failed to save seqinfo.ini for tracking metrics: %s", exc)
 
+        if self._tracking_metadata_path is not None:
+            try:
+                self._tracking_metadata_path.parent.mkdir(parents=True, exist_ok=True)
+                metadata = self._build_tracking_run_metadata()
+                with self._tracking_metadata_path.open("w", encoding="utf-8") as file_obj:
+                    json.dump(metadata, file_obj, indent=2, sort_keys=True)
+                    file_obj.write("\n")
+            except Exception as exc:
+                logging.warning("Failed to save tracking run metadata: %s", exc)
+
         if self._tracking_metrics_dir is not None:
             logging.info(
-                "[Metrics] Tracking logs exported: predictions=%s | ground_truth=%s | seqinfo=%s",
+                "[Metrics] Tracking logs exported: predictions=%s | ground_truth=%s | seqinfo=%s | metadata=%s",
                 self._tracking_predictions_path,
                 self._tracking_ground_truth_path,
                 self._tracking_seqinfo_path,
+                self._tracking_metadata_path,
             )
 
     def run_step(self, step_idx: int) -> None:
@@ -5450,7 +5664,7 @@ class YoloDetectAgent(BaseAgent):
                 vehicle_steer=current_steer,
                 speed_kmh=speed_kmh,
             )
-            self._log_ground_truth_frame(frame_bgr.shape, vehicle)
+            self._log_ground_truth_frame(frame_bgr.shape, vehicle, depth_map_m=depth_map_m)
             self._last_detection_runtime_ms = (time.perf_counter() - detector_t0) * 1000.0
             debug_info = {}
             if hasattr(self._detector, "get_last_debug_info"):
@@ -6024,6 +6238,11 @@ def parse_args() -> argparse.Namespace:
         help="Run YOLO detection every N ticks and reuse cached detections in between.",
     )
     parser.add_argument(
+        "--yolo-tracker",
+        default=None,
+        help="Ultralytics tracker config for yolo_detect, e.g. botsort.yaml or bytetrack.yaml.",
+    )
+    parser.add_argument(
         "--yolo-visualize",
         dest="yolo_visualize",
         action="store_true",
@@ -6397,6 +6616,15 @@ def build_config(args: argparse.Namespace) -> RunConfig:
             )
         ),
     )
+    yolo_tracker_config = str(
+        pick(args.yolo_tracker, "yolo", "tracker", "botsort.yaml")
+    ).strip()
+    if not yolo_tracker_config:
+        yolo_tracker_config = "botsort.yaml"
+    if yolo_tracker_config.lower() in {"botsort", "bot-sort", "bot_sort"}:
+        yolo_tracker_config = "botsort.yaml"
+    elif yolo_tracker_config.lower() in {"bytetrack", "byte-track", "byte_track"}:
+        yolo_tracker_config = "bytetrack.yaml"
 
     weather_preset = str(_cfg_get(env_cfg, "weather", "preset", "ClearNoon"))
     yaml_random_weather = _to_bool(_cfg_get(env_cfg, "weather", "random", False), False)
@@ -6504,6 +6732,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         yolo_visualize=bool(yolo_visualize),
         yolo_draw_overlay=bool(yolo_draw_overlay),
         yolo_inference_imgsz=int(yolo_inference_imgsz),
+        yolo_tracker_config=yolo_tracker_config,
         cil_command_prep_time_s=cil_command_prep_time_s,
         cil_command_trigger_min_m=cil_command_trigger_min_m,
         cil_command_trigger_max_m=cil_command_trigger_max_m,

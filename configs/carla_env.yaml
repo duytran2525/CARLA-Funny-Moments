@@ -7,14 +7,14 @@
   fixed_delta: 0.03
   no_rendering: false
 
-  map: "Town10HD"
+  map: "Town03"
 
 
 
 vehicle:
   filter: "vehicle.tesla.model3"
-  spawn_point: -1
-  destination_point: -1
+  spawn_point: 1 
+  destination_point: 15
   role_name: "hero"
 
 spectator:
@@ -55,6 +55,9 @@ yolo:
   # Chỉ dùng khi backend="planner"
   nav_agent_type: "basic"
   disable_autopilot_red_light: true
+  # Tracker dùng bởi Ultralytics model.track().
+  # Chạy 2 lần với "botsort.yaml" và "bytetrack.yaml" để so sánh tracking metrics.
+  tracker: "botsort.yaml"
   inference_every_n_ticks: 2
   inference_imgsz: 0
   # Bật cửa sổ debug YOLO kiểu cũ.
@@ -67,7 +70,7 @@ yolo:
   debug_overlay: true
 
 traffic_spawn:
-  vehicle_count: 0
+  vehicle_count: 20
   bike_count: 5
   motorbike_count: 5
   pedestrian_count: 5
