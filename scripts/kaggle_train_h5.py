@@ -488,7 +488,7 @@ def main():
         train_ratio=train_ratio,
         seed=seed,
         geometric_offset=geo_offset,
-        include_side_cameras=True,
+        include_side_cameras=False,  # OFF: avoids 3x memory, 60K samples enough
     )
     val_dataset = WaypointCarlaDatasetH5(
         h5_path=H5_PATH,
@@ -502,10 +502,18 @@ def main():
         include_side_cameras=False,
     )
 
+    # Free H5 key lookup after building samples (saves ~70MB RAM)
+    train_dataset._h5_keys = {}
+    val_dataset._h5_keys = {}
+    gc.collect()
+
     print(f"\nTrain: {len(train_dataset)} samples")
     print(f"Val  : {len(val_dataset)} samples")
 
     # ── DataLoader ──
+    # CRITICAL: num_workers=0 to avoid h5py + multiprocessing memory leak.
+    # h5py internally caches HDF5 metadata per forked process, growing unbounded
+    # until Kaggle OOM-kills the kernel (~batch 900 with 2 workers).
     def collate_fn(batch):
         imgs, wps, cmds, recs = zip(*batch)
         return (
@@ -515,15 +523,7 @@ def main():
             torch.tensor(recs, dtype=torch.float32),
         )
 
-    batch_size = int(config.get("batch_size", 32))
-    num_workers = 2  # h5py + multiprocessing is fragile; 2 is safest
-
-    # Reset h5py handle in each worker after fork to prevent inherited dead FDs
-    def worker_init_fn(worker_id):
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is not None:
-            dataset = worker_info.dataset
-            dataset._h5_handle = None  # Force lazy re-open in this worker
+    batch_size = int(config.get("batch_size", 48))  # larger batch OK with 0 workers
 
     rec_flags = train_dataset.get_recovery_flags()
     rec_weight = float(config.get("recovery_weight", 2.0))
@@ -532,18 +532,14 @@ def main():
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, sampler=sampler,
-        num_workers=num_workers, pin_memory=True, collate_fn=collate_fn,
-        persistent_workers=True, prefetch_factor=2,
-        worker_init_fn=worker_init_fn,
+        num_workers=0, pin_memory=True, collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True, collate_fn=collate_fn,
-        persistent_workers=True, prefetch_factor=2,
-        worker_init_fn=worker_init_fn,
+        num_workers=0, pin_memory=True, collate_fn=collate_fn,
     )
 
-    print(f"DataLoader: batch={batch_size}, workers={num_workers}")
+    print(f"DataLoader: batch={batch_size}, workers=0 (h5py safe mode)")
     print(f"  train_steps={len(train_loader)}  val_steps={len(val_loader)}")
 
     # ── Model ──
