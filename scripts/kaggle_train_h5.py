@@ -533,7 +533,7 @@ def main():
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, sampler=sampler,
         num_workers=num_workers, pin_memory=True, collate_fn=collate_fn,
-        persistent_workers=True, prefetch_factor=4,
+        persistent_workers=True, prefetch_factor=2,
         worker_init_fn=worker_init_fn,
     )
     val_loader = DataLoader(
@@ -630,8 +630,18 @@ def main():
             running_loss += float(loss.item())
 
             if i % 100 == 0:
+                # Periodic memory cleanup to prevent OOM
                 gc.collect()
-                print(f"  [Train] Epoch {epoch + 1} - Batch {i}/{len(train_loader)}", flush=True)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    mem_gb = torch.cuda.memory_allocated(primary_device) / 1024**3
+                    print(
+                        f"  [Train] Epoch {epoch + 1} - Batch {i}/{len(train_loader)} "
+                        f"| loss={loss.item():.4f} | GPU={mem_gb:.1f}GB",
+                        flush=True,
+                    )
+                else:
+                    print(f"  [Train] Epoch {epoch + 1} - Batch {i}/{len(train_loader)}", flush=True)
 
         n_valid = max(1, len(train_loader) - nan_batches)
         train_loss = running_loss / n_valid
