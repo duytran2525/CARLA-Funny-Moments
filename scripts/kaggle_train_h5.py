@@ -593,12 +593,37 @@ def main():
     patience = int(config.get("early_stopping_patience", 8))
     best_val = float("inf")
     no_improve = 0
+    start_epoch = 0
+
+    # ── RESUME CHECKPOINT ──
+    resume_path = config.get("resume_checkpoint")
+    if resume_path and os.path.isfile(resume_path):
+        print(f"\n🔄 ĐANG KHÔI PHỤC TỪ CHECKPOINT: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=primary_device)
+        
+        # Load model
+        if "model_state_dict" in checkpoint:
+            model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            model.load_state_dict(checkpoint) # fallback for old format
+            
+        # Load optimizer & scheduler
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            
+        # Load metrics
+        start_epoch = checkpoint.get("epoch", 0)
+        best_val = checkpoint.get("val_loss", float("inf"))
+        
+        print(f"✅ Đã khôi phục thành công! Tiếp tục từ Epoch {start_epoch + 1} (Best Val={best_val:.4f})")
 
     print(f"\n{'=' * 60}")
     print(f"TRAINING | lr={base_lr} | grad_clip={grad_clip_norm} | sigma=[{sigma_min},{sigma_max}]")
     print(f"{'=' * 60}\n")
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         # Linear LR warmup
         if epoch < warmup_epochs:
             warmup_lr = base_lr * (epoch + 1) / max(1, warmup_epochs)
@@ -743,8 +768,14 @@ def main():
             no_improve = 0
             state = model.module.state_dict() if use_multi_gpu else model.state_dict()
             torch.save(
-                {"model_state_dict": state, "epoch": epoch + 1,
-                 "val_loss": val_loss, "val_mae": val_mae},
+                {
+                    "model_state_dict": state, 
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "epoch": epoch + 1,
+                    "val_loss": val_loss, 
+                    "val_mae": val_mae
+                },
                 model_save,
             )
             print(f"  Saved best (val={val_loss:.4f}, MAE={val_mae:.4f}) -> {model_save}")

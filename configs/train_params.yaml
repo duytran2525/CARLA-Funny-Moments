@@ -43,6 +43,7 @@ early_stopping_patience: 8      # 5 → 8 (more patience with cosine schedule)
 # Reproducibility & I/O
 seed: 42
 model_save_path: models/waypoint_predictor.pth
+# resume_checkpoint: "/kaggle/input/model-checkpoint/waypoint_predictor_h5.pth" # Bỏ comment dòng này và trỏ tới file .pth cũ để train tiếp
 num_workers: 4
 prefetch_factor: 4
 log_every_batches: 200
