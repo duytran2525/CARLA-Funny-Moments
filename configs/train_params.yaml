@@ -1,9 +1,9 @@
 # ============================================================================
 # CIL Model Training Parameters (Optimized for Kaggle GPU T4 x2)
 # ============================================================================
-# Updated: 2026-05-10 (v5 - disable GNLL, pure Huber loss)
-# Data Size: 49.9k training + 16.7k validation
-# Environment: Kaggle GPU T4 x2 (32GB total, MultiGPU training)
+# Updated: 2026-05-10 (v6 - side cameras + CosineAnnealing + 40 epochs)
+# Data Size: ~180k training (3x with side cameras) + ~20k validation
+# Environment: Kaggle GPU T4 x2 (32GB total, Single GPU training)
 # ============================================================================
 
 # Kaggle dataset paths
@@ -11,12 +11,12 @@ data_root: /kaggle/input/datasets/yudtrann/data-carlav3/data_carlav2
 csv_path: /kaggle/input/datasets/yudtrann/data-carlav3/data_carlav2/driving_log.csv
 work_dir: /kaggle/working
 
-epochs: 20                      # More epochs with pure Huber (converges smoothly)
+epochs: 40                      # 20 → 40 (deeper convergence with cosine schedule)
 batch_size: 48                  # safe with num_workers=0
-learning_rate: 0.0003           # 5e-4 → 3e-4 (more stable)
+learning_rate: 0.0003           # 3e-4 (stable)
 
 # GNLL stability
-warmup_epochs: 3                # 1 → 3 (longer warmup for stable start)
+warmup_epochs: 3                # 3 epochs linear warmup
 grad_clip_norm: 1.0
 sigma_min: 0.01
 sigma_max: 10.0
@@ -25,38 +25,40 @@ sigma_max: 10.0
 geometric_offset: 0.35
 augmentation_prob: 0.75
 train_split: 0.75
-include_side_cameras_train: false
+include_side_cameras_train: true  # false → true (3x training data for recovery learning)
 recovery_weight: 2.0
 
 # Loss weights
 loss_lambda_wp: 1.0
-loss_lambda_gnll: 0.0           # DISABLED: GNLL caused divergence at epoch 2. Pure Huber only.
+loss_lambda_gnll: 0.0           # DISABLED: GNLL caused divergence. Pure Huber only.
 
 # Learning Rate Scheduler
-lr_patience: 3                  # 5 → 3 (react faster to plateau)
-lr_factor: 0.5                  # 0.7 → 0.5 (cut harder when plateau)
+lr_scheduler: cosine            # ReduceLROnPlateau → CosineAnnealingLR (smoother decay)
+lr_patience: 3                  # kept for fallback
+lr_factor: 0.5                  # kept for fallback
 
 # Early Stopping
-early_stopping_patience: 5      # 8 → 5 (stop faster if not improving)
+early_stopping_patience: 8      # 5 → 8 (more patience with cosine schedule)
 
 # Reproducibility & I/O
 seed: 42
 model_save_path: models/waypoint_predictor.pth
 num_workers: 4
 prefetch_factor: 4
-log_every_batches: 200          # 250 → 200 (more frequent logging for GNLL monitoring)
+log_every_batches: 200
 val_log_every_batches: 0
 
 # Multi-GPU
 use_multi_gpu: true
 
 # ============================================================================
-# CHANGELOG v2:
-# - Gradient clipping + NaN batch skip to prevent GNLL explosion
-# - Warmup 1 epoch for initial GNLL stability
-# - Sigma clamping [0.01, 10.0] (model already has softplus, this adds bounds)
-# - lr 1e-3 → 5e-4, lambda_gnll 0.1 → 0.05, batch 64 → 48
-# - Val MAE logging added
-# - Checkpoint saves metadata dict (backward compatible via unwrap_state_dict)
-# Expected: Val MAE 0.018-0.022, training time ~30-35 min on T4 x2
+# CHANGELOG v6:
+# - Side cameras enabled: 3x training data (center + left + right)
+#   Each side camera applies ±geometric_offset to waypoints, teaching
+#   the model lane recovery behavior
+# - CosineAnnealingLR: smooth decay from lr_max to lr_min over all epochs
+#   Avoids the plateau-then-cliff behavior of ReduceLROnPlateau
+# - Epochs 20 → 40: allows deeper convergence with the smoother LR schedule
+# - Early stopping patience 5 → 8: cosine schedule needs more room
+# Expected: Val MAE < 2.0, training time ~8-10h on T4
 # ============================================================================

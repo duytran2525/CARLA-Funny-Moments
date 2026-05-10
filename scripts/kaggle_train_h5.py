@@ -484,7 +484,8 @@ def main():
     train_ratio = float(config.get("train_split", 0.75))
     geo_offset = float(config.get("geometric_offset", 0.35))
 
-    print("\n📦 Đang tạo H5 datasets...")
+    include_side = bool(config.get("include_side_cameras_train", True))
+    print(f"\n📦 Đang tạo H5 datasets... (side_cameras={include_side})")
     train_dataset = WaypointCarlaDatasetH5(
         h5_path=H5_PATH,
         csv_root=csv_root,
@@ -494,7 +495,7 @@ def main():
         train_ratio=train_ratio,
         seed=seed,
         geometric_offset=geo_offset,
-        include_side_cameras=False,  # OFF: avoids 3x memory, 60K samples enough
+        include_side_cameras=include_side,
     )
     val_dataset = WaypointCarlaDatasetH5(
         h5_path=H5_PATH,
@@ -505,7 +506,7 @@ def main():
         train_ratio=train_ratio,
         seed=seed,
         geometric_offset=geo_offset,
-        include_side_cameras=False,
+        include_side_cameras=False,  # Val always center only
     )
 
     # Free H5 key lookup after building samples (saves ~70MB RAM)
@@ -557,11 +558,22 @@ def main():
     huber = nn.SmoothL1Loss(reduction="mean")
     base_lr = float(config["learning_rate"])
     optimizer = optim.Adam(model.parameters(), lr=base_lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min",
-        factor=float(config.get("lr_factor", 0.5)),
-        patience=int(config.get("lr_patience", 3)),
-    )
+
+    lr_scheduler_type = str(config.get("lr_scheduler", "plateau")).lower()
+    if lr_scheduler_type == "cosine":
+        # CosineAnnealingLR: smooth decay over all epochs (after warmup)
+        effective_epochs = int(config["epochs"]) - int(config.get("warmup_epochs", 1))
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, effective_epochs), eta_min=1e-6,
+        )
+        print(f"  LR Scheduler: CosineAnnealing (T_max={effective_epochs}, eta_min=1e-6)")
+    else:
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min",
+            factor=float(config.get("lr_factor", 0.5)),
+            patience=int(config.get("lr_patience", 3)),
+        )
+        print(f"  LR Scheduler: ReduceLROnPlateau (factor={config.get('lr_factor', 0.5)})")
     use_amp = torch.cuda.is_available()
     scaler = torch.amp.GradScaler("cuda" if use_amp else "cpu", enabled=use_amp)
 
@@ -718,7 +730,13 @@ def main():
 
         # Only step scheduler after warmup
         if epoch >= warmup_epochs:
-            scheduler.step(val_loss)
+            if lr_scheduler_type == "cosine":
+                scheduler.step()
+            else:
+                scheduler.step(val_loss)
+
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"  LR: {current_lr:.6f}")
 
         if val_loss < best_val:
             best_val = val_loss

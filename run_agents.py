@@ -2455,6 +2455,14 @@ class CILAgent(BaseAgent):
             max_brake=config.max_brake,
         )
 
+        # Pure pursuit steering controller
+        self._use_pure_pursuit = bool(config.cil_use_pure_pursuit)
+        if self._use_pure_pursuit and PurePursuitController is not None and np is not None:
+            dt = max(float(config.fixed_delta), 1e-3)
+            self._pure_pursuit = PurePursuitController(dt=dt)
+        else:
+            self._pure_pursuit = None
+
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
         self._route_overlay_bounds = None
@@ -4409,7 +4417,7 @@ class CILAgent(BaseAgent):
         stage_times["model"] = time.perf_counter() - model_t0
 
         control_t0 = time.perf_counter()
-        ai_is_confused = float(mean_uncertainty) > 1.5
+        ai_is_confused = float(mean_uncertainty) > 100.0
 
         if ai_is_confused:
             logging.warning(
