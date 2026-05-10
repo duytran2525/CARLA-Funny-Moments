@@ -1,7 +1,7 @@
 # ============================================================================
 # CIL Model Training Parameters (Optimized for Kaggle GPU T4 x2)
 # ============================================================================
-# Updated: 2026-05-09 (v4 - h5py safe mode: workers=0)
+# Updated: 2026-05-10 (v5 - disable GNLL, pure Huber loss)
 # Data Size: 49.9k training + 16.7k validation
 # Environment: Kaggle GPU T4 x2 (32GB total, MultiGPU training)
 # ============================================================================
@@ -11,15 +11,15 @@ data_root: /kaggle/input/datasets/yudtrann/data-carlav3/data_carlav2
 csv_path: /kaggle/input/datasets/yudtrann/data-carlav3/data_carlav2/driving_log.csv
 work_dir: /kaggle/working
 
-epochs: 15                      # 25 → 15 (side cameras off = fewer samples, converges faster)
-batch_size: 48                  # 32 → 48 (safe with num_workers=0, no fork overhead)
-learning_rate: 0.0005           # 1e-3 → 5e-4 (more stable for GNLL, warmup compensates)
+epochs: 20                      # More epochs with pure Huber (converges smoothly)
+batch_size: 48                  # safe with num_workers=0
+learning_rate: 0.0003           # 5e-4 → 3e-4 (more stable)
 
-# GNLL stability (NEW)
-warmup_epochs: 1                # Linear LR warmup for first epoch
-grad_clip_norm: 1.0             # Gradient norm clipping (prevents GNLL explosion)
-sigma_min: 0.01                 # Floor for sigma (prevents log(0))
-sigma_max: 10.0                 # Ceiling for sigma (prevents lazy large-sigma predictions)
+# GNLL stability
+warmup_epochs: 3                # 1 → 3 (longer warmup for stable start)
+grad_clip_norm: 1.0
+sigma_min: 0.01
+sigma_max: 10.0
 
 # Data
 geometric_offset: 0.35
@@ -30,14 +30,14 @@ recovery_weight: 2.0
 
 # Loss weights
 loss_lambda_wp: 1.0
-loss_lambda_gnll: 0.05          # 0.1 → 0.05 (reduce GNLL influence early in training)
+loss_lambda_gnll: 0.0           # DISABLED: GNLL caused divergence at epoch 2. Pure Huber only.
 
 # Learning Rate Scheduler
 lr_patience: 3                  # 5 → 3 (react faster to plateau)
 lr_factor: 0.5                  # 0.7 → 0.5 (cut harder when plateau)
 
 # Early Stopping
-early_stopping_patience: 8      # 12 → 8 (sufficient with warmup + faster LR decay)
+early_stopping_patience: 5      # 8 → 5 (stop faster if not improving)
 
 # Reproducibility & I/O
 seed: 42

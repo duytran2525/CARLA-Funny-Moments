@@ -298,11 +298,17 @@ class WaypointCarlaDatasetH5(Dataset):
     def get_recovery_flags(self) -> list[int]:
         return list(self.recovery_flags)
 
-    # ── Lazy H5 handle (one per DataLoader worker) ──
+    # ── H5 handle with periodic reopen to flush internal cache ──
     def _get_h5(self) -> h5py.File:
-        """Return a cached h5py.File handle. Opened once per worker process."""
+        """Return h5py.File handle. Reopens every 3000 calls to prevent
+        h5py's internal object/metadata cache from growing unbounded."""
+        self._h5_reads = getattr(self, '_h5_reads', 0) + 1
+        if self._h5_handle is not None and self._h5_reads % 3000 == 0:
+            self._h5_handle.close()
+            self._h5_handle = None
+            gc.collect()
         if self._h5_handle is None:
-            self._h5_handle = h5py.File(self.h5_path, "r", swmr=True)
+            self._h5_handle = h5py.File(self.h5_path, "r")
         return self._h5_handle
 
     # ── Image loading ──
@@ -542,11 +548,10 @@ def main():
     print(f"DataLoader: batch={batch_size}, workers=0 (h5py safe mode)")
     print(f"  train_steps={len(train_loader)}  val_steps={len(val_loader)}")
 
-    # ── Model ──
+    # ── Model (single GPU to reduce memory overhead) ──
     model = WaypointPredictor().to(primary_device)
-    if use_multi_gpu:
-        model = nn.DataParallel(model, device_ids=list(range(num_gpus)))
-        print(f"DataParallel: {num_gpus} GPUs")
+    use_multi_gpu = False  # DataParallel causes extra memory on GPU:0
+    print(f"Single GPU mode: {primary_device}")
 
     # ── Optimizer / Scheduler ──
     huber = nn.SmoothL1Loss(reduction="mean")
@@ -612,6 +617,7 @@ def main():
             if not torch.isfinite(loss):
                 nan_batches += 1
                 optimizer.zero_grad(set_to_none=True)
+                del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_gnll, loss, imgs, cmds, wps
                 continue
 
             scaler.scale(loss).backward()
@@ -625,24 +631,44 @@ def main():
             scaler.update()
             running_loss += float(loss.item())
 
-            if i % 100 == 0:
-                # Periodic memory cleanup to prevent OOM
+            # Explicit cleanup of intermediate tensors
+            del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_gnll, loss, imgs, cmds, wps
+
+            if i % 50 == 0:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                    mem_gb = torch.cuda.memory_allocated(primary_device) / 1024**3
-                    print(
-                        f"  [Train] Epoch {epoch + 1} - Batch {i}/{len(train_loader)} "
-                        f"| loss={loss.item():.4f} | GPU={mem_gb:.1f}GB",
-                        flush=True,
-                    )
-                else:
-                    print(f"  [Train] Epoch {epoch + 1} - Batch {i}/{len(train_loader)}", flush=True)
+                # CPU RAM check via /proc (Linux/Kaggle)
+                cpu_mb = 0
+                try:
+                    with open('/proc/self/status') as sf:
+                        for line in sf:
+                            if line.startswith('VmRSS:'):
+                                cpu_mb = int(line.split()[1]) // 1024
+                                break
+                except Exception:
+                    pass
+                gpu_mb = 0
+                if torch.cuda.is_available():
+                    gpu_mb = int(torch.cuda.memory_allocated(primary_device) / 1024**2)
+                print(
+                    f"  [Train] Ep {epoch+1} Batch {i}/{len(train_loader)} "
+                    f"| loss={running_loss/max(1,i):.4f} | RAM={cpu_mb}MB GPU={gpu_mb}MB",
+                    flush=True,
+                )
 
         n_valid = max(1, len(train_loader) - nan_batches)
         train_loss = running_loss / n_valid
         if nan_batches > 0:
             print(f"  Skipped {nan_batches} NaN/Inf batches")
+
+        # Force close H5 handles between train/val to flush h5py cache
+        if train_dataset._h5_handle is not None:
+            train_dataset._h5_handle.close()
+            train_dataset._h5_handle = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # ── VAL ──
         model.eval()
@@ -666,8 +692,15 @@ def main():
                 val_loss += float(loss.item()) * bs
                 val_mae += float((pred_wp - tgt_wp).abs().mean().item()) * bs
                 val_samples += bs
+                del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_g, loss, imgs, cmds, wps
                 if i % 50 == 0:
                     gc.collect()
+
+        # Flush val H5 handle too
+        if val_dataset._h5_handle is not None:
+            val_dataset._h5_handle.close()
+            val_dataset._h5_handle = None
+        gc.collect()
 
         val_loss = val_loss / max(1, val_samples)
         val_mae = val_mae / max(1, val_samples)
