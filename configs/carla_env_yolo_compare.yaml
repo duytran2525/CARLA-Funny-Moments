@@ -1,4 +1,4 @@
-﻿carla:
+carla:
   host: "127.0.0.1"
   port: 2000
   tm_port: 8000
@@ -7,7 +7,7 @@
   fixed_delta: 0.03
   no_rendering: false
 
-  map: "Town06"
+  map: "Town03"
 
 
 
@@ -51,14 +51,14 @@ yolo:
   # backend:
   # - "tm": native CARLA Traffic Manager autopilot
   # - "planner": BasicAgent/BehaviorAgent route planner
-  backend: "tm"
+  backend: "planner"
   # Chỉ dùng khi backend="planner"
   nav_agent_type: "basic"
   disable_autopilot_red_light: true
   # Tracker dùng bởi Ultralytics model.track().
   # Chạy 2 lần với "botsort.yaml" và "bytetrack.yaml" để so sánh tracking metrics.
   tracker: "botsort.yaml"
-  inference_every_n_ticks: 2
+  inference_every_n_ticks: 1
   inference_imgsz: 0
   # Bật cửa sổ debug YOLO kiểu cũ.
   # true  = mở màn hình cv2 của yolo_detect để quan sát trực tiếp.

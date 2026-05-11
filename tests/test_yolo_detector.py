@@ -25,6 +25,33 @@ class YoloDetectorCompatTests(unittest.TestCase):
         )
         self.assertEqual(YoloDetector._extract_static_export_hw(exc), (640, 640))
 
+    def test_metrics_eval_classes_match_requested_order(self):
+        expected = (
+            "vehicle",
+            "two_wheeler",
+            "traffic_light_red",
+            "traffic_sign",
+            "pedestrian",
+            "traffic_light_green",
+            "stop_line",
+        )
+        self.assertEqual(tuple(YoloDetector.DEFAULT_DISPLAY_CLASSES), expected)
+        self.assertEqual(tuple(YoloDetector.METRICS_EVAL_CLASSES), expected)
+
+    def test_two_wheeler_aliases_match_metrics_class(self):
+        detector = YoloDetector.__new__(YoloDetector)
+        detector.class_names = {
+            0: "bike",
+            1: "motobike",
+            2: "motorcycle",
+            3: "bicycle",
+            4: "two_wheeler",
+        }
+        detector.class_aliases = dict(YoloDetector.CLASS_ALIASES)
+
+        for cls_id in range(5):
+            self.assertEqual(detector._resolve_class_name(cls_id), "two_wheeler")
+
     def test_predict_recovers_from_static_engine_size_mismatch(self):
         detector = YoloDetector.__new__(YoloDetector)
         detector.conf_threshold = 0.25

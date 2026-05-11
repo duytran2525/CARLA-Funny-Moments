@@ -58,6 +58,13 @@ def _write_metrics_dir(root: Path, tracker: str, pred_lines: list[str], metadata
         "yolo_inference_imgsz": 448,
         "yolo_inference_every_n_ticks": 1,
         "yolo_tracker_config": f"{tracker}.yaml",
+        "detector_uses_depth_input": False,
+        "gt_occlusion_filter": {
+            "enabled": True,
+            "method": "projected_3d_bbox_visible_area_plus_depth_map",
+            "min_visible_area_ratio": 0.20,
+            "min_depth_visible_ratio": 0.20,
+        },
     }
     if metadata_overrides:
         metadata.update(metadata_overrides)
@@ -120,6 +127,64 @@ class CompareTrackingMetricsTests(unittest.TestCase):
 
             map_row = next(row for row in rows if row["key"] == "map_name")
             self.assertEqual(map_row["status"], "mismatch")
+
+    def test_tm_backend_missing_actual_destination_is_not_applicable(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            left_dir = _write_metrics_dir(
+                root,
+                "botsort",
+                ["1,7,10,10,20,20,0.9,-1,-1,-1"],
+                metadata_overrides={
+                    "yolo_backend": "tm",
+                    "actual_route_destination_point": None,
+                },
+            )
+            right_dir = _write_metrics_dir(
+                root,
+                "bytetrack",
+                ["1,7,10,10,20,20,0.9,-1,-1,-1"],
+                metadata_overrides={
+                    "yolo_backend": "tm",
+                    "actual_route_destination_point": None,
+                },
+            )
+
+            left = load_tracking_run(left_dir, name="BoTSORT")
+            right = load_tracking_run(right_dir, name="ByteTrack")
+            rows = compare_fairness_rows(left, right)
+
+            destination_row = next(row for row in rows if row["key"] == "actual_route_destination_point")
+            self.assertEqual(destination_row["BoTSORT"], "not_applicable_tm_backend")
+            self.assertEqual(destination_row["ByteTrack"], "not_applicable_tm_backend")
+            self.assertEqual(destination_row["status"], "match")
+
+    def test_fairness_detects_different_ground_truth_files(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            left_dir = _write_metrics_dir(
+                root,
+                "botsort",
+                ["1,7,10,10,20,20,0.9,-1,-1,-1"],
+            )
+            right_dir = _write_metrics_dir(
+                root,
+                "bytetrack",
+                ["1,7,10,10,20,20,0.9,-1,-1,-1"],
+            )
+            (right_dir / "ground_truth.txt").write_text(
+                "1,101,10,10,20,20,1,-1,-1,-1\n",
+                encoding="utf-8",
+            )
+
+            left = load_tracking_run(left_dir, name="BoTSORT")
+            right = load_tracking_run(right_dir, name="ByteTrack")
+            rows = compare_fairness_rows(left, right)
+
+            sha_row = next(row for row in rows if row["key"] == "metrics_raw.ground_truth_sha256")
+            rows_row = next(row for row in rows if row["key"] == "metrics_raw.ground_truth_rows")
+            self.assertEqual(sha_row["status"], "mismatch")
+            self.assertEqual(rows_row["status"], "mismatch")
 
 
 if __name__ == "__main__":

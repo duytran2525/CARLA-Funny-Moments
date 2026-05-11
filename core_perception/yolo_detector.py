@@ -23,14 +23,29 @@ class YoloDetector:
     """
 
     DEFAULT_DISPLAY_CLASSES: Sequence[str] = (
-        "pedestrian",
         "vehicle",
         "two_wheeler",
-        "traffic_sign",
         "traffic_light_red",
+        "traffic_sign",
+        "pedestrian",
         "traffic_light_green",
         "stop_line",
     )
+    METRICS_EVAL_CLASSES: Sequence[str] = DEFAULT_DISPLAY_CLASSES
+    CLASS_ALIASES = {
+        "bike": "two_wheeler",
+        "bicycle": "two_wheeler",
+        "motobike": "two_wheeler",
+        "motorbike": "two_wheeler",
+        "motorcycle": "two_wheeler",
+        "trafficlight_red": "traffic_light_red",
+        "red_traffic_light": "traffic_light_red",
+        "trafficlight_green": "traffic_light_green",
+        "green_traffic_light": "traffic_light_green",
+        "stopline": "stop_line",
+        "stop-line": "stop_line",
+        "stop_line_marking": "stop_line",
+    }
 
     def __init__(
         self,
@@ -101,19 +116,11 @@ class YoloDetector:
             self._normalize_class_name(name)
             for name in (display_classes or self.DEFAULT_DISPLAY_CLASSES)
         )
-        self.class_aliases = {
-            "trafficlight_red": "traffic_light_red",
-            "red_traffic_light": "traffic_light_red",
-            "trafficlight_green": "traffic_light_green",
-            "green_traffic_light": "traffic_light_green",
-            "stopline": "stop_line",
-            "stop-line": "stop_line",
-            "stop_line_marking": "stop_line",
-        }
+        self.class_aliases = dict(self.CLASS_ALIASES)
         self.tracker_config = str(tracker_config or "botsort.yaml")
         self._track_persist = True
         self._enable_tracking_metrics_logging = bool(enable_tracking_metrics_logging)
-        self._metrics_eval_classes = {"vehicle", "pedestrian", "two_wheeler"}
+        self._metrics_eval_classes = set(self.METRICS_EVAL_CLASSES)
         self.current_frame_id = 0
         self.tracking_logs: List[str] = []
 
@@ -370,8 +377,8 @@ class YoloDetector:
             if self._enable_tracking_metrics_logging and class_name in self._metrics_eval_classes:
                 # MOTChallenge tracking-results format plus a repo-local class column:
                 # <frame>,<id>,<bb_left>,<bb_top>,<bb_width>,<bb_height>,<conf>,<x>,<y>,<z>,<class>
-                # The first 10 columns stay MOT-compatible; the class column prevents
-                # built-in metrics from matching e.g. a vehicle prediction to a pedestrian GT.
+                # The first 10 columns stay MOT-compatible; the class column lets
+                # repo-local metrics avoid matching e.g. a vehicle prediction to pedestrian GT.
                 w = int(x2 - x1)
                 h = int(y2 - y1)
                 log_line = (

@@ -1,11 +1,15 @@
+import csv
 import tempfile
 import unittest
 from pathlib import Path
 
 from scripts.evaluate_tracking_metrics import (
+    EVALUATION_CLASS_ORDER,
+    copy_run_context_files,
     compute_simple_tracking_metrics,
     prepare_trackeval_bundle,
     write_simple_metrics_outputs,
+    _classes_in_mot_files,
     _find_single_prediction_file,
     _read_seq_name_from_seqinfo,
 )
@@ -75,6 +79,53 @@ class EvaluateTrackingMetricsTests(unittest.TestCase):
             self.assertIn("class_vehicle_false_positives", csv_path.read_text(encoding="utf-8"))
             self.assertIn("class=pedestrian", txt_path.read_text(encoding="utf-8"))
 
+    def test_per_class_outputs_include_all_eval_classes_in_requested_order(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            pred = root / "pred.txt"
+            gt = root / "gt.txt"
+            out_dir = root / "out"
+
+            gt.write_text("1,101,10,10,20,20,1,-1,-1,-1,vehicle\n", encoding="utf-8")
+            pred.write_text("1,7,10,10,20,20,0.9,-1,-1,-1,vehicle\n", encoding="utf-8")
+
+            metrics = compute_simple_tracking_metrics(pred, gt, iou_threshold=0.5)
+            _csv_path, txt_path = write_simple_metrics_outputs(metrics, out_dir)
+
+            per_class_csv = out_dir / "tracking_metrics_per_class.csv"
+            with per_class_csv.open("r", newline="", encoding="utf-8") as csv_file:
+                rows = list(csv.DictReader(csv_file))
+
+            self.assertEqual([row["class"] for row in rows[: len(EVALUATION_CLASS_ORDER)]], EVALUATION_CLASS_ORDER)
+            self.assertEqual(rows[1]["class"], "two_wheeler")
+            self.assertEqual(rows[1]["gt_detections"], "0")
+            summary_text = txt_path.read_text(encoding="utf-8")
+            positions = [summary_text.index(f"class={class_name}") for class_name in EVALUATION_CLASS_ORDER]
+            self.assertEqual(positions, sorted(positions))
+
+    def test_classes_in_mot_files_uses_requested_order_and_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            pred = root / "pred.txt"
+            gt = root / "gt.txt"
+            pred.write_text(
+                "\n".join(
+                    [
+                        "1,7,10,10,20,20,0.9,-1,-1,-1,stopline",
+                        "1,8,10,10,20,20,0.9,-1,-1,-1,bike",
+                        "1,9,10,10,20,20,0.9,-1,-1,-1,traffic-light-red",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            gt.write_text("1,101,10,10,20,20,1,-1,-1,-1,pedestrian\n", encoding="utf-8")
+
+            self.assertEqual(
+                _classes_in_mot_files(pred, gt),
+                ["two_wheeler", "traffic_light_red", "pedestrian", "stop_line"],
+            )
+
     def test_prepare_trackeval_bundle(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -138,10 +189,50 @@ class EvaluateTrackingMetricsTests(unittest.TestCase):
             )
 
             trackeval_pred = data_root / "trackers" / "mot_challenge" / "BENCH" / "TRK_vehicle" / "data" / "vehicle_seq.txt"
-            self.assertEqual(trackeval_pred.read_text(encoding="utf-8").count("\n"), 1)
-            self.assertNotIn("pedestrian", trackeval_pred.read_text(encoding="utf-8"))
+            trackeval_pred_text = trackeval_pred.read_text(encoding="utf-8")
+            self.assertEqual(trackeval_pred_text.count("\n"), 1)
+            self.assertNotIn("pedestrian", trackeval_pred_text)
+            pred_fields = trackeval_pred_text.strip().split(",")
+            self.assertEqual(len(pred_fields), 10)
+            self.assertEqual(pred_fields[7], "1")
             rewritten_seqinfo = data_root / "gt" / "mot_challenge" / "BENCH" / "vehicle_seq" / "seqinfo.ini"
             self.assertIn("name=vehicle_seq", rewritten_seqinfo.read_text(encoding="utf-8"))
+
+    def test_prepare_trackeval_per_class_separates_class_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            pred = root / "pred.txt"
+            gt = root / "gt.txt"
+            pred.write_text("1,7,10,10,20,20,0.9,-1,-1,-1,vehicle\n", encoding="utf-8")
+            gt.write_text("1,101,10,10,20,20,1,-1,-1,-1,pedestrian\n", encoding="utf-8")
+
+            vehicle_root = prepare_trackeval_bundle(
+                predictions_txt=pred,
+                ground_truth_txt=gt,
+                output_dir=root / "eval_vehicle",
+                seq_name="vehicle_seq",
+                tracker_name="TRK_vehicle",
+                benchmark_name="BENCH",
+                class_filter="vehicle",
+            )
+            vehicle_gt = vehicle_root / "gt" / "mot_challenge" / "BENCH" / "vehicle_seq" / "gt" / "gt.txt"
+            vehicle_pred = vehicle_root / "trackers" / "mot_challenge" / "BENCH" / "TRK_vehicle" / "data" / "vehicle_seq.txt"
+            self.assertEqual(vehicle_gt.read_text(encoding="utf-8"), "")
+            self.assertEqual(vehicle_pred.read_text(encoding="utf-8").count("\n"), 1)
+
+            pedestrian_root = prepare_trackeval_bundle(
+                predictions_txt=pred,
+                ground_truth_txt=gt,
+                output_dir=root / "eval_pedestrian",
+                seq_name="pedestrian_seq",
+                tracker_name="TRK_pedestrian",
+                benchmark_name="BENCH",
+                class_filter="pedestrian",
+            )
+            pedestrian_gt = pedestrian_root / "gt" / "mot_challenge" / "BENCH" / "pedestrian_seq" / "gt" / "gt.txt"
+            pedestrian_pred = pedestrian_root / "trackers" / "mot_challenge" / "BENCH" / "TRK_pedestrian" / "data" / "pedestrian_seq.txt"
+            self.assertEqual(pedestrian_gt.read_text(encoding="utf-8").count("\n"), 1)
+            self.assertEqual(pedestrian_pred.read_text(encoding="utf-8"), "")
 
     def test_metrics_dir_helpers(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -153,6 +244,24 @@ class EvaluateTrackingMetricsTests(unittest.TestCase):
 
             self.assertEqual(_find_single_prediction_file(root), pred)
             self.assertEqual(_read_seq_name_from_seqinfo(seqinfo), "carla_run")
+
+    def test_copy_run_context_files_from_pred_gt_parent(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            run_dir = root / "run"
+            out_dir = root / "out"
+            run_dir.mkdir()
+            pred = run_dir / "model_tracker_predictions.txt"
+            gt = run_dir / "ground_truth.txt"
+            metadata = run_dir / "run_metadata.json"
+            pred.write_text("1,7,10,10,20,20,0.9,-1,-1,-1,vehicle\n", encoding="utf-8")
+            gt.write_text("1,101,10,10,20,20,1,-1,-1,-1,vehicle\n", encoding="utf-8")
+            metadata.write_text('{"agent":"yolo_detect"}\n', encoding="utf-8")
+
+            copy_run_context_files(out_dir, pred_path=pred, gt_path=gt)
+
+            self.assertEqual((out_dir / "run_metadata.json").read_text(encoding="utf-8"), metadata.read_text(encoding="utf-8"))
+            self.assertEqual((out_dir / "ground_truth.txt").read_text(encoding="utf-8"), gt.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

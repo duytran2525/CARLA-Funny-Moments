@@ -4,10 +4,10 @@ val: images/val
 test: images/val
 
 names:
-  0: pedestrian
-  1: vehicle
-  2: two_wheeler
+  0: vehicle
+  1: two_wheeler
+  2: traffic_light_red
   3: traffic_sign
-  4: traffic_light_red
+  4: pedestrian
   5: traffic_light_green
   6: stop_line

@@ -731,6 +731,7 @@ class RunConfig:
     yolo_draw_overlay: bool
     yolo_inference_imgsz: int
     yolo_tracker_config: str
+    yolo_secondary_tracker_config: str
     cil_command_prep_time_s: float
     cil_command_trigger_min_m: float
     cil_command_trigger_max_m: float
@@ -3949,45 +3950,9 @@ class CILAgent(BaseAgent):
     ) -> float:
         # ──────────────────────────────────────────────────────────────
         # [TEST] Bypass all smoothing – use 100% raw CNN model steering.
-        # Comment block below and uncomment original logic to restore.
         # ──────────────────────────────────────────────────────────────
         self._last_steer = clamp(float(steering_raw), -1.0, 1.0)
         return float(self._last_steer)
-
-        # ──────────────────────────────────────────────────────────────
-        # [ORIGINAL] EMA smoothing + slew-rate limit (DISABLED FOR TEST)
-        # ──────────────────────────────────────────────────────────────
-        # phase = str(command_phase).lower()
-        # alpha = clamp(self.config.steer_smoothing, 0.0, 0.98)
-        #
-        # # Keep stronger smoothing on lane-follow, slightly relax it around turns
-        # # so the model can still commit to the intersection trajectory.
-        # if int(command) in (1, 2, 3) and phase in {"armed", "in_junction"}:
-        #     alpha = min(alpha, 0.76)
-        #
-        # smoothed = alpha * float(self._last_steer) + (1.0 - alpha) * float(steering_raw)
-        #
-        # # Per-tick steering slew-rate limit. High speed gets tighter limits to
-        # # suppress left-right hunting; turn phases get a bit more headroom.
-        # speed_ratio = clamp(
-        #     float(speed_kmh) / max(10.0, float(self.config.target_speed_kmh)),
-        #     0.0,
-        #     1.4,
-        # )
-        # max_delta = 0.11 - 0.05 * min(speed_ratio, 1.0)
-        # if phase == "armed":
-        #     max_delta += 0.015
-        # elif phase == "in_junction":
-        #     max_delta += 0.030
-        # max_delta = clamp(max_delta, 0.05, 0.14)
-        #
-        # smoothed = clamp(
-        #     smoothed,
-        #     float(self._last_steer) - max_delta,
-        #     float(self._last_steer) + max_delta,
-        # )
-        # self._last_steer = clamp(smoothed, -1.0, 1.0)
-        # return float(self._last_steer)
 
     def _route_locations_to_ego_waypoints(
         self,
@@ -4417,7 +4382,8 @@ class CILAgent(BaseAgent):
         stage_times["model"] = time.perf_counter() - model_t0
 
         control_t0 = time.perf_counter()
-        ai_is_confused = float(mean_uncertainty) > 100.0
+        # NOTE: Huber-only model has no valid uncertainty head → disable VETO
+        ai_is_confused = float(mean_uncertainty) > 1e9
 
         if ai_is_confused:
             logging.warning(
@@ -4459,6 +4425,26 @@ class CILAgent(BaseAgent):
         vehicle_location = vehicle.get_location()
         rotation = vehicle.get_transform().rotation
         self._update_route_history(vehicle_location)
+
+        # ── Debug: draw predicted waypoints in CARLA world ──
+        if step_idx % 3 == 0 and np is not None:
+            _yaw_r = math.radians(float(rotation.yaw))
+            _cos_y, _sin_y = math.cos(_yaw_r), math.sin(_yaw_r)
+            _z_draw = float(vehicle_location.z) + 0.5
+            _high_unc = float(mean_uncertainty) > 50.0
+            _wp_color = carla.Color(255, 0, 0) if _high_unc else carla.Color(0, 255, 0)
+            _line_color = carla.Color(255, 200, 0)
+            _prev_w = None
+            for _wi in range(pred_waypoints.shape[0]):
+                _ex = float(pred_waypoints[_wi, 0])
+                _ey = float(pred_waypoints[_wi, 1])
+                _wx = float(vehicle_location.x) + _cos_y * _ex - _sin_y * _ey
+                _wy = float(vehicle_location.y) + _sin_y * _ex + _cos_y * _ey
+                _wloc = carla.Location(x=_wx, y=_wy, z=_z_draw)
+                self.session.world.debug.draw_point(_wloc, size=0.15, color=_wp_color, life_time=0.15)
+                if _prev_w is not None:
+                    self.session.world.debug.draw_line(_prev_w, _wloc, thickness=0.06, color=_line_color, life_time=0.15)
+                _prev_w = _wloc
 
         destination_distance_m = self._distance_to_destination(vehicle_location)
         if destination_distance_m is not None and destination_distance_m <= self._arrival_distance_m:
@@ -4646,6 +4632,7 @@ class YoloDetectAgent(BaseAgent):
         self._frame_lock = threading.Lock()
         self._waiting_frame_logged = False
         self._detector = None
+        self._secondary_detector = None
         self._window_name = "CARLA YOLO Detections"
         self._tm_autopilot_enabled = False
         self._nav_agent = None
@@ -4672,6 +4659,7 @@ class YoloDetectAgent(BaseAgent):
         self._last_detection_runtime_ms: Optional[float] = None
         self._tracking_metrics_dir: Optional[Path] = None
         self._tracking_predictions_path: Optional[Path] = None
+        self._secondary_tracking_predictions_path: Optional[Path] = None
         self._tracking_ground_truth_path: Optional[Path] = None
         self._tracking_seqinfo_path: Optional[Path] = None
         self._tracking_metadata_path: Optional[Path] = None
@@ -4704,6 +4692,7 @@ class YoloDetectAgent(BaseAgent):
         self._tracking_image_size = (0, 0)
         self._tracking_metrics_dir = None
         self._tracking_predictions_path = None
+        self._secondary_tracking_predictions_path = None
         self._tracking_ground_truth_path = None
         self._tracking_seqinfo_path = None
         self._tracking_metadata_path = None
@@ -4711,6 +4700,7 @@ class YoloDetectAgent(BaseAgent):
         self._tracking_seq_name = ""
         self._tracking_initial_spawn_index = None
         self._tracking_initial_transform = None
+        self._secondary_detector = None
         vehicle = session.ego_vehicle
         world = session.world
         if vehicle is None or world is None:
@@ -4745,6 +4735,23 @@ class YoloDetectAgent(BaseAgent):
             tracker_config=self.config.yolo_tracker_config,
             enable_tracking_metrics_logging=True,
         )
+        secondary_tracker = str(self.config.yolo_secondary_tracker_config or "").strip()
+        if secondary_tracker and secondary_tracker != str(self.config.yolo_tracker_config):
+            self._secondary_detector = YoloDetector(
+                str(model_path),
+                inference_imgsz=detector_imgsz,
+                camera_fov_deg=self.config.camera_fov,
+                obstacle_base_distance_m=8.0,
+                camera_mount_x_m=1.5,
+                camera_mount_y_m=0.0,
+                camera_mount_z_m=2.2,
+                camera_pitch_deg=-8.0,
+                tracker_config=secondary_tracker,
+                enable_tracking_metrics_logging=True,
+            )
+            logging.info("Secondary YOLO tracker enabled for same-sequence metrics: %s", secondary_tracker)
+        else:
+            self._secondary_detector = None
         self._init_tracking_metrics_workspace(model_path)
         self._use_depth_camera = bool(getattr(self._detector, "uses_depth_input", False))
         warmup_fn = getattr(self._detector, "warmup", None)
@@ -4755,6 +4762,15 @@ class YoloDetectAgent(BaseAgent):
                 "YOLO detector warmup completed in %.1f ms.",
                 (time.perf_counter() - warmup_t0) * 1000.0,
             )
+        if self._secondary_detector is not None:
+            secondary_warmup_fn = getattr(self._secondary_detector, "warmup", None)
+            if callable(secondary_warmup_fn):
+                warmup_t0 = time.perf_counter()
+                secondary_warmup_fn(self.config.camera_width, self.config.camera_height)
+                logging.info(
+                    "Secondary YOLO detector warmup completed in %.1f ms.",
+                    (time.perf_counter() - warmup_t0) * 1000.0,
+                )
         logging.info(
             "YOLO runtime config: every_n_ticks=%d visualize=%s draw_overlay=%s imgsz=%s tracker=%s",
             int(self.config.yolo_inference_every_n_ticks),
@@ -5179,6 +5195,14 @@ class YoloDetectAgent(BaseAgent):
         metrics_root.mkdir(parents=True, exist_ok=True)
         self._tracking_metrics_dir = metrics_root
         self._tracking_predictions_path = metrics_root / f"{model_stem}_{tracker_stem}_tracker_predictions.txt"
+        secondary_tracker = str(self.config.yolo_secondary_tracker_config or "").strip()
+        if secondary_tracker:
+            secondary_tracker_stem = Path(secondary_tracker).stem or "secondary_tracker"
+            self._secondary_tracking_predictions_path = (
+                metrics_root / f"{model_stem}_{secondary_tracker_stem}_tracker_predictions.txt"
+            )
+        else:
+            self._secondary_tracking_predictions_path = None
         self._tracking_ground_truth_path = metrics_root / "ground_truth.txt"
         self._tracking_seqinfo_path = metrics_root / "seqinfo.ini"
         self._tracking_metadata_path = metrics_root / "run_metadata.json"
@@ -5227,6 +5251,9 @@ class YoloDetectAgent(BaseAgent):
                 resolved_model = resolve_yolo_model_path(self.config.yolo_model_path)
             except Exception:
                 resolved_model = None
+        actual_route_destination = self._route_destination_index
+        if actual_route_destination is None and str(self.config.yolo_backend).strip().lower() == "tm":
+            actual_route_destination = "not_applicable_tm_backend"
 
         metadata: Dict[str, Any] = {
             "metadata_version": 1,
@@ -5247,7 +5274,7 @@ class YoloDetectAgent(BaseAgent):
             "actual_initial_spawn_point": self._tracking_initial_spawn_index,
             "initial_transform": self._tracking_initial_transform,
             "configured_destination_point": int(self.config.destination_point),
-            "actual_route_destination_point": self._route_destination_index,
+            "actual_route_destination_point": actual_route_destination,
             "target_speed_kmh": float(self.config.target_speed_kmh),
             "tm_port": int(self.config.tm_port),
             "npc_vehicle_count": int(self.config.npc_vehicle_count),
@@ -5267,6 +5294,7 @@ class YoloDetectAgent(BaseAgent):
             "yolo_backend": str(self.config.yolo_backend),
             "yolo_nav_agent_type": str(self.config.yolo_nav_agent_type),
             "yolo_tracker_config": str(self.config.yolo_tracker_config),
+            "yolo_secondary_tracker_config": str(self.config.yolo_secondary_tracker_config or ""),
             "yolo_model_path": str(self.config.yolo_model_path),
             "resolved_yolo_model_path": str(resolved_model) if resolved_model is not None else "",
             "yolo_inference_imgsz": int(self.config.yolo_inference_imgsz),
@@ -5280,6 +5308,11 @@ class YoloDetectAgent(BaseAgent):
             },
             "tracking_metrics_dir": str(self._tracking_metrics_dir) if self._tracking_metrics_dir is not None else "",
             "predictions_path": str(self._tracking_predictions_path) if self._tracking_predictions_path is not None else "",
+            "secondary_predictions_path": (
+                str(self._secondary_tracking_predictions_path)
+                if self._secondary_tracking_predictions_path is not None
+                else ""
+            ),
             "ground_truth_path": str(self._tracking_ground_truth_path) if self._tracking_ground_truth_path is not None else "",
             "seqinfo_path": str(self._tracking_seqinfo_path) if self._tracking_seqinfo_path is not None else "",
         }
@@ -5543,6 +5576,11 @@ class YoloDetectAgent(BaseAgent):
                 self._detector.save_tracking_metrics_log(str(self._tracking_predictions_path))
             except Exception as exc:
                 logging.warning("Failed to save tracker predictions log: %s", exc)
+        if self._secondary_detector is not None and self._secondary_tracking_predictions_path is not None:
+            try:
+                self._secondary_detector.save_tracking_metrics_log(str(self._secondary_tracking_predictions_path))
+            except Exception as exc:
+                logging.warning("Failed to save secondary tracker predictions log: %s", exc)
 
         if self._tracking_ground_truth_path is not None:
             try:
@@ -5672,6 +5710,17 @@ class YoloDetectAgent(BaseAgent):
                 vehicle_steer=current_steer,
                 speed_kmh=speed_kmh,
             )
+            if self._secondary_detector is not None:
+                try:
+                    self._secondary_detector.detect_and_evaluate(
+                        frame_bgr,
+                        distance_threshold=None,
+                        depth_map_m=depth_map_m,
+                        vehicle_steer=current_steer,
+                        speed_kmh=speed_kmh,
+                    )
+                except Exception as exc:
+                    logging.warning("Secondary YOLO tracker failed on tick %d: %s", step_idx, exc)
             self._log_ground_truth_frame(frame_bgr.shape, vehicle, depth_map_m=depth_map_m)
             self._last_detection_runtime_ms = (time.perf_counter() - detector_t0) * 1000.0
             debug_info = {}
@@ -6251,6 +6300,14 @@ def parse_args() -> argparse.Namespace:
         help="Ultralytics tracker config for yolo_detect, e.g. botsort.yaml or bytetrack.yaml.",
     )
     parser.add_argument(
+        "--yolo-secondary-tracker",
+        default=None,
+        help=(
+            "Optional second Ultralytics tracker config to run on the same frames for fair same-sequence "
+            "metrics, e.g. bytetrack.yaml while --yolo-tracker is botsort.yaml."
+        ),
+    )
+    parser.add_argument(
         "--yolo-visualize",
         dest="yolo_visualize",
         action="store_true",
@@ -6624,15 +6681,27 @@ def build_config(args: argparse.Namespace) -> RunConfig:
             )
         ),
     )
-    yolo_tracker_config = str(
-        pick(args.yolo_tracker, "yolo", "tracker", "botsort.yaml")
-    ).strip()
+    def normalize_yolo_tracker_config(value: Any, default: str = "") -> str:
+        tracker_config = str(value if value is not None else default).strip()
+        if not tracker_config:
+            return ""
+        if tracker_config.lower() in {"botsort", "bot-sort", "bot_sort"}:
+            return "botsort.yaml"
+        if tracker_config.lower() in {"bytetrack", "byte-track", "byte_track"}:
+            return "bytetrack.yaml"
+        return tracker_config
+
+    yolo_tracker_config = normalize_yolo_tracker_config(
+        pick(args.yolo_tracker, "yolo", "tracker", "botsort.yaml"),
+        default="botsort.yaml",
+    )
     if not yolo_tracker_config:
         yolo_tracker_config = "botsort.yaml"
-    if yolo_tracker_config.lower() in {"botsort", "bot-sort", "bot_sort"}:
-        yolo_tracker_config = "botsort.yaml"
-    elif yolo_tracker_config.lower() in {"bytetrack", "byte-track", "byte_track"}:
-        yolo_tracker_config = "bytetrack.yaml"
+    yolo_secondary_tracker_config = normalize_yolo_tracker_config(
+        pick(args.yolo_secondary_tracker, "yolo", "secondary_tracker", ""),
+    )
+    if yolo_secondary_tracker_config == yolo_tracker_config:
+        yolo_secondary_tracker_config = ""
 
     weather_preset = str(_cfg_get(env_cfg, "weather", "preset", "ClearNoon"))
     yaml_random_weather = _to_bool(_cfg_get(env_cfg, "weather", "random", False), False)
@@ -6741,6 +6810,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         yolo_draw_overlay=bool(yolo_draw_overlay),
         yolo_inference_imgsz=int(yolo_inference_imgsz),
         yolo_tracker_config=yolo_tracker_config,
+        yolo_secondary_tracker_config=yolo_secondary_tracker_config,
         cil_command_prep_time_s=cil_command_prep_time_s,
         cil_command_trigger_min_m=cil_command_trigger_min_m,
         cil_command_trigger_max_m=cil_command_trigger_max_m,

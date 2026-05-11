@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -11,11 +12,13 @@ try:
     from scripts.evaluate_tracking_metrics import (
         _find_single_prediction_file,
         compute_simple_tracking_metrics,
+        metric_key_sort_key,
     )
 except ModuleNotFoundError:  # pragma: no cover - used when executed from scripts/
     from evaluate_tracking_metrics import (  # type: ignore
         _find_single_prediction_file,
         compute_simple_tracking_metrics,
+        metric_key_sort_key,
     )
 
 
@@ -101,6 +104,14 @@ FAIRNESS_KEYS = [
     "resolved_yolo_model_path",
     "yolo_inference_imgsz",
     "yolo_inference_every_n_ticks",
+    "detector_uses_depth_input",
+    "gt_occlusion_filter.enabled",
+    "gt_occlusion_filter.method",
+    "gt_occlusion_filter.min_visible_area_ratio",
+    "gt_occlusion_filter.min_depth_visible_ratio",
+    "metrics_raw.ground_truth_sha256",
+    "metrics_raw.ground_truth_rows",
+    "metrics_raw.ground_truth_max_frame",
 ]
 
 EXPECTED_DIFFERENCE_KEYS = [
@@ -141,7 +152,7 @@ def _read_summary_csv(path: Path) -> Dict[str, Any]:
 
 def _write_summary_csv(metrics: Dict[str, Any], path: Path) -> None:
     fieldnames = [key for key in METRIC_ORDER if key in metrics]
-    for key in metrics:
+    for key in sorted(metrics, key=metric_key_sort_key):
         if key not in fieldnames:
             fieldnames.append(key)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -175,6 +186,65 @@ def _read_metadata_near(path: Path) -> Dict[str, Any]:
             if isinstance(loaded, dict):
                 return loaded
     return {}
+
+
+def _ground_truth_path_for_stats(source: Path, metadata: Dict[str, Any]) -> Optional[Path]:
+    candidates = []
+    if source.is_file():
+        candidates.append(source.parent / "ground_truth.txt")
+    else:
+        candidates.append(source / "ground_truth.txt")
+
+    metadata_path = metadata.get("ground_truth_path")
+    if metadata_path:
+        try:
+            candidates.append(Path(str(metadata_path)))
+        except Exception:
+            pass
+
+    for candidate in candidates:
+        try:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _ground_truth_file_stats(path: Path) -> Dict[str, Any]:
+    sha = hashlib.sha256()
+    rows = 0
+    max_frame = 0
+    with path.open("rb") as file_obj:
+        for raw in file_obj:
+            sha.update(raw)
+            line = raw.decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            rows += 1
+            first = line.split(",", 1)[0].strip()
+            try:
+                frame_id = int(float(first))
+            except Exception:
+                continue
+            max_frame = max(max_frame, frame_id)
+    return {
+        "ground_truth_sha256": sha.hexdigest(),
+        "ground_truth_rows": rows,
+        "ground_truth_max_frame": max_frame,
+    }
+
+
+def _metadata_with_raw_stats(metadata: Dict[str, Any], source: Path) -> Dict[str, Any]:
+    enriched = dict(metadata)
+    gt_path = _ground_truth_path_for_stats(source, enriched)
+    if gt_path is None:
+        return enriched
+    try:
+        enriched["metrics_raw"] = _ground_truth_file_stats(gt_path)
+    except Exception:
+        pass
+    return enriched
 
 
 def _coerce_float(value: Any) -> Optional[float]:
@@ -213,7 +283,7 @@ def load_tracking_run(source: Path, name: str, iou_threshold: float = 0.5) -> Di
     source = source.resolve()
     if source.is_file():
         metrics = _read_summary_csv(source)
-        metadata = _read_metadata_near(source)
+        metadata = _metadata_with_raw_stats(_read_metadata_near(source), source)
         return {
             "name": name,
             "source": str(source),
@@ -229,7 +299,7 @@ def load_tracking_run(source: Path, name: str, iou_threshold: float = 0.5) -> Di
     summary_csv = source / "tracking_metrics_summary.csv"
     if summary_csv.exists():
         metrics = _read_summary_csv(summary_csv)
-        metadata = _read_metadata_near(source)
+        metadata = _metadata_with_raw_stats(_read_metadata_near(source), source)
         return {
             "name": name,
             "source": str(source),
@@ -251,7 +321,7 @@ def load_tracking_run(source: Path, name: str, iou_threshold: float = 0.5) -> Di
         iou_threshold=float(iou_threshold),
     )
     _write_summary_csv(metrics, source / "tracking_metrics_summary.csv")
-    metadata = _read_metadata_near(source)
+    metadata = _metadata_with_raw_stats(_read_metadata_near(source), source)
     return {
         "name": name,
         "source": str(source),
@@ -264,7 +334,7 @@ def compare_metric_rows(left_run: Dict[str, Any], right_run: Dict[str, Any]) -> 
     left_metrics = dict(left_run["metrics"])
     right_metrics = dict(right_run["metrics"])
     ordered_keys = [key for key in METRIC_ORDER if key in left_metrics or key in right_metrics]
-    for key in sorted(set(left_metrics) | set(right_metrics)):
+    for key in sorted(set(left_metrics) | set(right_metrics), key=metric_key_sort_key):
         if key not in ordered_keys:
             ordered_keys.append(key)
 
@@ -323,6 +393,11 @@ def compare_metric_rows(left_run: Dict[str, Any], right_run: Dict[str, Any]) -> 
 
 
 def _metadata_value(flat_metadata: Dict[str, Any], key: str) -> Any:
+    if key == "actual_route_destination_point":
+        value = flat_metadata.get(key, "")
+        backend = str(flat_metadata.get("yolo_backend", "")).strip().lower()
+        if _normalize_for_compare(value) == "" and backend == "tm":
+            return "not_applicable_tm_backend"
     return flat_metadata.get(key, "")
 
 

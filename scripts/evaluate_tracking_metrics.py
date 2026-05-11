@@ -4,11 +4,36 @@ import argparse
 import csv
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 MotRows = Dict[int, List[dict]]
 UNKNOWN_CLASS = "__unknown__"
+EVALUATION_CLASS_ORDER = [
+    "vehicle",
+    "two_wheeler",
+    "traffic_light_red",
+    "traffic_sign",
+    "pedestrian",
+    "traffic_light_green",
+    "stop_line",
+]
+_EVALUATION_CLASS_INDEX = {
+    class_name: index for index, class_name in enumerate(EVALUATION_CLASS_ORDER)
+}
+_CLASS_ALIASES = {
+    "bike": "two_wheeler",
+    "bicycle": "two_wheeler",
+    "motobike": "two_wheeler",
+    "motorbike": "two_wheeler",
+    "motorcycle": "two_wheeler",
+    "trafficlight_red": "traffic_light_red",
+    "red_traffic_light": "traffic_light_red",
+    "trafficlight_green": "traffic_light_green",
+    "green_traffic_light": "traffic_light_green",
+    "stopline": "stop_line",
+    "stop_line_marking": "stop_line",
+}
 BASE_METRIC_FIELDS = [
     "method",
     "class_match_mode",
@@ -41,8 +66,69 @@ PER_CLASS_METRIC_SUFFIXES = [
 ]
 
 
+def _normalize_metric_class_name(class_name: str) -> str:
+    text = str(class_name).strip().lower()
+    if not text or text == UNKNOWN_CLASS:
+        return UNKNOWN_CLASS
+    normalized = text.replace(" ", "_").replace("-", "_")
+    return _CLASS_ALIASES.get(normalized, normalized)
+
+
 def _safe_metric_class_name(class_name: str) -> str:
     return "".join(ch if ch.isalnum() else "_" for ch in class_name).strip("_") or "unknown"
+
+
+def _metric_class_sort_key(class_name: str) -> Tuple[int, str]:
+    normalized = _normalize_metric_class_name(class_name)
+    class_index = _EVALUATION_CLASS_INDEX.get(normalized)
+    if class_index is not None:
+        return class_index, ""
+    return len(EVALUATION_CLASS_ORDER), _safe_metric_class_name(normalized)
+
+
+def _ordered_metric_classes(class_names: Iterable[str]) -> List[str]:
+    seen = set()
+    ordered = []
+    for class_name in class_names:
+        normalized = _normalize_metric_class_name(class_name)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return sorted(ordered, key=_metric_class_sort_key)
+
+
+def _empty_class_stats() -> dict:
+    return {
+        "gt_detections": 0,
+        "pred_detections": 0,
+        "true_positives": 0,
+        "false_positives": 0,
+        "false_negatives": 0,
+        "id_switches": 0,
+        "iou_sum": 0.0,
+    }
+
+
+def _split_class_metric_key(key: str) -> Optional[Tuple[str, str]]:
+    if not key.startswith("class_"):
+        return None
+    for suffix in PER_CLASS_METRIC_SUFFIXES:
+        marker = f"_{suffix}"
+        if key.endswith(marker):
+            return key[len("class_") : -len(marker)], suffix
+    return None
+
+
+def metric_key_sort_key(key: str) -> Tuple[int, int, str, int, str]:
+    class_metric = _split_class_metric_key(key)
+    if class_metric is None:
+        return 2, len(EVALUATION_CLASS_ORDER), "", len(PER_CLASS_METRIC_SUFFIXES), str(key)
+
+    class_name, suffix = class_metric
+    class_index, fallback_class_name = _metric_class_sort_key(class_name)
+    suffix_index = PER_CLASS_METRIC_SUFFIXES.index(suffix)
+    return 1, class_index, fallback_class_name, suffix_index, str(key)
 
 
 def _max_frame_id_from_mot_txt(path: Path) -> int:
@@ -90,6 +176,29 @@ def _find_single_prediction_file(metrics_dir: Path) -> Optional[Path]:
     if not candidates:
         return None
     return candidates[0]
+
+
+def copy_run_context_files(out_dir: Path, pred_path: Path, gt_path: Path, metrics_dir: Optional[Path] = None) -> None:
+    """Copy raw GT and nearby metadata so later compare runs can verify fairness."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    metadata_candidates = []
+    if metrics_dir is not None:
+        metadata_candidates.append(metrics_dir / "run_metadata.json")
+    metadata_candidates.extend([pred_path.parent / "run_metadata.json", gt_path.parent / "run_metadata.json"])
+
+    for metadata_candidate in metadata_candidates:
+        if metadata_candidate.exists():
+            metadata_target = out_dir / "run_metadata.json"
+            if metadata_candidate.resolve() != metadata_target.resolve():
+                shutil.copy2(metadata_candidate, metadata_target)
+            print(f"[OK] Copied run metadata: {metadata_target}")
+            break
+
+    if gt_path.exists():
+        gt_target = out_dir / "ground_truth.txt"
+        if gt_path.resolve() != gt_target.resolve():
+            shutil.copy2(gt_path, gt_target)
+        print(f"[OK] Copied raw ground truth: {gt_target}")
 
 
 def _write_default_seqinfo(path: Path, seq_name: str, seq_length: int) -> None:
@@ -159,7 +268,11 @@ def _read_mot_txt(path: Path, ignore_negative_ids: bool = True) -> MotRows:
                     "id": track_id,
                     "bbox": (x, y, w, h),
                     "conf": conf,
-                    "class": parts[10].strip().lower() if len(parts) > 10 and parts[10].strip() else UNKNOWN_CLASS,
+                    "class": (
+                        _normalize_metric_class_name(parts[10])
+                        if len(parts) > 10 and parts[10].strip()
+                        else UNKNOWN_CLASS
+                    ),
                 }
             )
     return rows_by_frame
@@ -170,8 +283,10 @@ def _copy_mot_txt_for_trackeval(
     target: Path,
     ignore_negative_ids: bool = False,
     class_filter: Optional[str] = None,
+    force_mot_class_id: Optional[int] = None,
 ) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
+    class_filter_norm = _normalize_metric_class_name(class_filter) if class_filter is not None else None
     with source.open("r", encoding="utf-8") as source_obj, target.open("w", encoding="utf-8") as target_obj:
         for raw in source_obj:
             line = raw.strip()
@@ -189,13 +304,22 @@ def _copy_mot_txt_for_trackeval(
                     continue
                 if track_id < 0:
                     continue
-            if class_filter is not None:
-                row_class = parts[10].strip().lower() if len(parts) > 10 and parts[10].strip() else UNKNOWN_CLASS
-                if row_class != class_filter:
+            if class_filter_norm is not None:
+                row_class = (
+                    _normalize_metric_class_name(parts[10])
+                    if len(parts) > 10 and parts[10].strip()
+                    else UNKNOWN_CLASS
+                )
+                if row_class != class_filter_norm:
                     continue
             # TrackEval expects standard MOTChallenge columns. New logs may append
             # repo-local metadata such as class after column 10, so strip extras here.
-            target_obj.write(",".join(parts[:10]) + "\n")
+            mot_parts = list(parts[:10])
+            while len(mot_parts) < 10:
+                mot_parts.append("-1")
+            if force_mot_class_id is not None:
+                mot_parts[7] = str(int(force_mot_class_id))
+            target_obj.write(",".join(mot_parts[:10]) + "\n")
 
 
 def _classes_in_mot_files(*paths: Path) -> List[str]:
@@ -207,7 +331,7 @@ def _classes_in_mot_files(*paths: Path) -> List[str]:
                 class_name = str(row.get("class", UNKNOWN_CLASS))
                 if class_name != UNKNOWN_CLASS:
                     classes.add(class_name)
-    return sorted(classes)
+    return _ordered_metric_classes(classes)
 
 
 def _bbox_iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
@@ -253,21 +377,12 @@ def compute_simple_tracking_metrics(
     id_switches = 0
     iou_sum = 0.0
     last_match_by_gt_key: Dict[Tuple[str, int], int] = {}
-    class_stats: Dict[str, dict] = {}
+    class_stats: Dict[str, dict] = {
+        class_name: _empty_class_stats() for class_name in EVALUATION_CLASS_ORDER
+    }
 
     def stats_for(class_name: str) -> dict:
-        return class_stats.setdefault(
-            class_name,
-            {
-                "gt_detections": 0,
-                "pred_detections": 0,
-                "true_positives": 0,
-                "false_positives": 0,
-                "false_negatives": 0,
-                "id_switches": 0,
-                "iou_sum": 0.0,
-            },
-        )
+        return class_stats.setdefault(_normalize_metric_class_name(class_name), _empty_class_stats())
 
     threshold = float(iou_threshold)
     for frame_id in frames:
@@ -348,7 +463,7 @@ def compute_simple_tracking_metrics(
         "mota": mota,
         "motp": motp,
     }
-    for class_name in sorted(class_stats):
+    for class_name in _ordered_metric_classes(class_stats):
         safe_class = _safe_metric_class_name(class_name)
         stat = class_stats[class_name]
         class_tp = int(stat["true_positives"])
@@ -388,21 +503,17 @@ def compute_simple_tracking_metrics(
 
 
 def _per_class_metric_rows(metrics: dict) -> List[dict]:
-    class_names = set()
+    class_names = set(EVALUATION_CLASS_ORDER)
     for key in metrics:
-        if not key.startswith("class_"):
-            continue
-        for suffix in PER_CLASS_METRIC_SUFFIXES:
-            marker = f"_{suffix}"
-            if key.endswith(marker):
-                class_names.add(key[len("class_") : -len(marker)])
-                break
+        class_metric = _split_class_metric_key(key)
+        if class_metric is not None:
+            class_names.add(class_metric[0])
 
     rows = []
-    for safe_class in sorted(class_names):
+    for safe_class in _ordered_metric_classes(class_names):
         row = {"class": safe_class}
         for suffix in PER_CLASS_METRIC_SUFFIXES:
-            row[suffix] = metrics.get(f"class_{safe_class}_{suffix}", "")
+            row[suffix] = metrics.get(f"class_{safe_class}_{suffix}", 0)
         rows.append(row)
     return rows
 
@@ -450,7 +561,7 @@ def write_simple_metrics_outputs(metrics: dict, output_dir: Path) -> Tuple[Path,
     txt_path = output_dir / "tracking_metrics_summary.txt"
 
     fieldnames = list(BASE_METRIC_FIELDS)
-    for key in metrics:
+    for key in sorted(metrics, key=metric_key_sort_key):
         if key not in fieldnames:
             fieldnames.append(key)
     with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
@@ -529,8 +640,24 @@ def prepare_trackeval_bundle(
 
     gt_target = gt_seq_gt_dir / "gt.txt"
     pred_target = tracker_data_dir / f"{seq_name}.txt"
-    _copy_mot_txt_for_trackeval(ground_truth_txt, gt_target, class_filter=class_filter)
-    _copy_mot_txt_for_trackeval(predictions_txt, pred_target, ignore_negative_ids=True, class_filter=class_filter)
+    # TrackEval's MOTChallenge adapter only exposes the pedestrian class. For a
+    # repo-local per-class bundle, rows are already filtered by our class column,
+    # so mark the remaining rows as MOT pedestrian class id 1 to make TrackEval
+    # evaluate that filtered class instead of silently treating it as classless.
+    force_mot_class_id = 1 if class_filter is not None else None
+    _copy_mot_txt_for_trackeval(
+        ground_truth_txt,
+        gt_target,
+        class_filter=class_filter,
+        force_mot_class_id=force_mot_class_id,
+    )
+    _copy_mot_txt_for_trackeval(
+        predictions_txt,
+        pred_target,
+        ignore_negative_ids=True,
+        class_filter=class_filter,
+        force_mot_class_id=force_mot_class_id,
+    )
 
     seqinfo_target = gt_seq_dir / "seqinfo.ini"
     if seqinfo_ini is not None and seqinfo_ini.exists():
@@ -552,6 +679,7 @@ def run_trackeval(
     seq_name: str,
     tracker_name: str,
     benchmark_name: str,
+    do_preproc: bool = False,
 ) -> None:
     try:
         import trackeval  # type: ignore
@@ -573,12 +701,13 @@ def run_trackeval(
     dataset_config["BENCHMARK"] = str(benchmark_name)
     dataset_config["SPLIT_TO_EVAL"] = "all"
     dataset_config["TRACKERS_TO_EVAL"] = [str(tracker_name)]
+    dataset_config["CLASSES_TO_EVAL"] = ["pedestrian"]
     dataset_config["SEQMAP_FOLDER"] = str(data_root / "gt" / "mot_challenge" / "seqmaps")
     dataset_config["SEQMAP_FILE"] = str(
         data_root / "gt" / "mot_challenge" / "seqmaps" / f"{benchmark_name}-all.txt"
     )
     dataset_config["SKIP_SPLIT_FOL"] = True
-    dataset_config["DO_PREPROC"] = False
+    dataset_config["DO_PREPROC"] = bool(do_preproc)
 
     evaluator = trackeval.Evaluator(eval_config)
     dataset_list = [trackeval.datasets.MotChallenge2DBox(dataset_config)]
@@ -616,6 +745,14 @@ def main() -> int:
         action="store_true",
         help="Only prepare folder structure and built-in summary; do not execute TrackEval.",
     )
+    parser.add_argument(
+        "--run-overall-trackeval",
+        action="store_true",
+        help=(
+            "Also run the unfiltered TrackEval bundle. This is class-agnostic for CARLA repo logs; "
+            "prefer the per-class TrackEval bundles for BoT-SORT/ByteTrack comparison."
+        ),
+    )
     args = parser.parse_args()
 
     metrics_dir: Optional[Path] = None
@@ -648,12 +785,7 @@ def main() -> int:
 
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    if metrics_dir is not None:
-        metadata_candidate = metrics_dir / "run_metadata.json"
-        if metadata_candidate.exists():
-            metadata_target = out_dir / "run_metadata.json"
-            shutil.copy2(metadata_candidate, metadata_target)
-            print(f"[OK] Copied run metadata: {metadata_target}")
+    copy_run_context_files(out_dir, pred_path=pred_path, gt_path=gt_path, metrics_dir=metrics_dir)
 
     seqinfo_path: Optional[Path] = None
     if args.seqinfo:
@@ -683,8 +815,13 @@ def main() -> int:
     )
     print(f"[OK] Prepared TrackEval bundle at: {data_root}")
 
-    class_names = _classes_in_mot_files(pred_path, gt_path)
-    per_class_trackeval_roots: List[Tuple[str, Path, str]] = []
+    observed_class_names = _classes_in_mot_files(pred_path, gt_path)
+    class_names = (
+        _ordered_metric_classes([*EVALUATION_CLASS_ORDER, *observed_class_names])
+        if observed_class_names
+        else []
+    )
+    per_class_trackeval_roots: List[Tuple[str, Path, str, str]] = []
     for class_name in class_names:
         safe_class = _safe_metric_class_name(class_name)
         class_seq_name = f"{seq_name}_{safe_class}"
@@ -699,11 +836,11 @@ def main() -> int:
             seqinfo_ini=seqinfo_path,
             class_filter=class_name,
         )
-        per_class_trackeval_roots.append((safe_class, class_root, class_seq_name))
+        per_class_trackeval_roots.append((safe_class, class_root, class_seq_name, class_name))
     if per_class_trackeval_roots:
         print(
             "[OK] Prepared per-class TrackEval bundles for: "
-            + ", ".join(safe_class for safe_class, _, _ in per_class_trackeval_roots)
+            + ", ".join(safe_class for safe_class, _, _, _ in per_class_trackeval_roots)
         )
 
     metrics = compute_simple_tracking_metrics(
@@ -718,18 +855,34 @@ def main() -> int:
     if args.prepare_only:
         return 0
 
-    run_trackeval(
-        data_root=data_root,
-        seq_name=seq_name,
-        tracker_name=str(args.tracker_name),
-        benchmark_name=str(args.benchmark),
-    )
-    for safe_class, class_root, class_seq_name in per_class_trackeval_roots:
+    if observed_class_names and not args.run_overall_trackeval:
+        print(
+            "[INFO] Skipped unfiltered overall TrackEval because MOTChallenge TrackEval is class-agnostic "
+            "for these repo logs. Use tracking_metrics_summary.csv for strict overall metrics and "
+            "trackeval_per_class/* for HOTA/CLEAR/IDF1 per class."
+        )
+    else:
+        run_trackeval(
+            data_root=data_root,
+            seq_name=seq_name,
+            tracker_name=str(args.tracker_name),
+            benchmark_name=str(args.benchmark),
+            do_preproc=False,
+        )
+    for safe_class, class_root, class_seq_name, _class_name in per_class_trackeval_roots:
+        class_gt = int(float(metrics.get(f"class_{safe_class}_gt_detections", 0) or 0))
+        if class_gt <= 0:
+            print(
+                f"[INFO] Skipped TrackEval for class without GT detections: {safe_class}. "
+                "Use tracking_metrics_per_class.csv for zero-GT/FP-only class rows."
+            )
+            continue
         run_trackeval(
             data_root=class_root,
             seq_name=class_seq_name,
             tracker_name=f"{args.tracker_name}_{safe_class}",
             benchmark_name=str(args.benchmark),
+            do_preproc=True,
         )
     print("[OK] TrackEval finished. Check summary files under tracker output folders.")
     return 0
