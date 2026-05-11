@@ -37,6 +37,7 @@ NUMERIC_METRICS = {
 
 METRIC_ORDER = [
     "method",
+    "class_match_mode",
     "iou_threshold",
     "frames",
     "gt_detections",
@@ -282,6 +283,10 @@ def compare_metric_rows(left_run: Dict[str, Any], right_run: Dict[str, Any]) -> 
         if metric in HIGHER_IS_BETTER:
             preference = "higher"
         elif metric in LOWER_IS_BETTER:
+            preference = "lower"
+        elif metric.endswith(("_true_positives", "_precision", "_recall", "_f1", "_mota", "_motp")):
+            preference = "higher"
+        elif metric.endswith(("_false_positives", "_false_negatives", "_id_switches")):
             preference = "lower"
 
         if left_num is not None and right_num is not None:

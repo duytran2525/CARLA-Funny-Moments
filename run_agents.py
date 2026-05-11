@@ -5528,12 +5528,12 @@ class YoloDetectAgent(BaseAgent):
             if depth_visibility is not None and depth_visibility < 0.20:
                 continue
 
-            # MOTChallenge GT format:
-            # <frame>,<id>,<bb_left>,<bb_top>,<bb_width>,<bb_height>,<conf>,<x>,<y>,<z>
+            # MOTChallenge GT format plus a repo-local class column:
+            # <frame>,<id>,<bb_left>,<bb_top>,<bb_width>,<bb_height>,<conf>,<x>,<y>,<z>,<class>
             # conf=1 marks valid GT object.
             gt_line = (
                 f"{frame_id},{actor_id},"
-                f"{x1:.2f},{y1:.2f},{width:.2f},{height:.2f},1,-1,-1,-1"
+                f"{x1:.2f},{y1:.2f},{width:.2f},{height:.2f},1,-1,-1,-1,{class_name}"
             )
             self._tracking_gt_logs.append(gt_line)
 

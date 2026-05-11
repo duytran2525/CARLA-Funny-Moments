@@ -8,6 +8,41 @@ from typing import Dict, List, Optional, Tuple
 
 
 MotRows = Dict[int, List[dict]]
+UNKNOWN_CLASS = "__unknown__"
+BASE_METRIC_FIELDS = [
+    "method",
+    "class_match_mode",
+    "iou_threshold",
+    "frames",
+    "gt_detections",
+    "pred_detections",
+    "true_positives",
+    "false_positives",
+    "false_negatives",
+    "id_switches",
+    "precision",
+    "recall",
+    "f1",
+    "mota",
+    "motp",
+]
+PER_CLASS_METRIC_SUFFIXES = [
+    "gt_detections",
+    "pred_detections",
+    "true_positives",
+    "false_positives",
+    "false_negatives",
+    "id_switches",
+    "precision",
+    "recall",
+    "f1",
+    "mota",
+    "motp",
+]
+
+
+def _safe_metric_class_name(class_name: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in class_name).strip("_") or "unknown"
 
 
 def _max_frame_id_from_mot_txt(path: Path) -> int:
@@ -77,6 +112,21 @@ def _write_default_seqinfo(path: Path, seq_name: str, seq_length: int) -> None:
     )
 
 
+def _copy_seqinfo_with_name(source: Path, target: Path, seq_name: str) -> None:
+    lines = source.read_text(encoding="utf-8").splitlines()
+    wrote_name = False
+    output_lines = []
+    for line in lines:
+        if line.strip().lower().startswith("name="):
+            output_lines.append(f"name={seq_name}")
+            wrote_name = True
+        else:
+            output_lines.append(line)
+    if not wrote_name:
+        output_lines.insert(1 if output_lines and output_lines[0].strip().lower() == "[sequence]" else 0, f"name={seq_name}")
+    target.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
+
+
 def _read_mot_txt(path: Path, ignore_negative_ids: bool = True) -> MotRows:
     rows_by_frame: MotRows = {}
     if not path.exists():
@@ -109,12 +159,18 @@ def _read_mot_txt(path: Path, ignore_negative_ids: bool = True) -> MotRows:
                     "id": track_id,
                     "bbox": (x, y, w, h),
                     "conf": conf,
+                    "class": parts[10].strip().lower() if len(parts) > 10 and parts[10].strip() else UNKNOWN_CLASS,
                 }
             )
     return rows_by_frame
 
 
-def _copy_mot_txt_for_trackeval(source: Path, target: Path, ignore_negative_ids: bool = False) -> None:
+def _copy_mot_txt_for_trackeval(
+    source: Path,
+    target: Path,
+    ignore_negative_ids: bool = False,
+    class_filter: Optional[str] = None,
+) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     with source.open("r", encoding="utf-8") as source_obj, target.open("w", encoding="utf-8") as target_obj:
         for raw in source_obj:
@@ -122,6 +178,8 @@ def _copy_mot_txt_for_trackeval(source: Path, target: Path, ignore_negative_ids:
             if not line:
                 continue
             parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 6:
+                continue
             if ignore_negative_ids:
                 if len(parts) < 2:
                     continue
@@ -131,7 +189,25 @@ def _copy_mot_txt_for_trackeval(source: Path, target: Path, ignore_negative_ids:
                     continue
                 if track_id < 0:
                     continue
-            target_obj.write(line + "\n")
+            if class_filter is not None:
+                row_class = parts[10].strip().lower() if len(parts) > 10 and parts[10].strip() else UNKNOWN_CLASS
+                if row_class != class_filter:
+                    continue
+            # TrackEval expects standard MOTChallenge columns. New logs may append
+            # repo-local metadata such as class after column 10, so strip extras here.
+            target_obj.write(",".join(parts[:10]) + "\n")
+
+
+def _classes_in_mot_files(*paths: Path) -> List[str]:
+    classes = set()
+    for path in paths:
+        rows_by_frame = _read_mot_txt(path, ignore_negative_ids=False)
+        for rows in rows_by_frame.values():
+            for row in rows:
+                class_name = str(row.get("class", UNKNOWN_CLASS))
+                if class_name != UNKNOWN_CLASS:
+                    classes.add(class_name)
+    return sorted(classes)
 
 
 def _bbox_iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
@@ -176,7 +252,22 @@ def compute_simple_tracking_metrics(
     fn = 0
     id_switches = 0
     iou_sum = 0.0
-    last_match_by_gt_id: Dict[int, int] = {}
+    last_match_by_gt_key: Dict[Tuple[str, int], int] = {}
+    class_stats: Dict[str, dict] = {}
+
+    def stats_for(class_name: str) -> dict:
+        return class_stats.setdefault(
+            class_name,
+            {
+                "gt_detections": 0,
+                "pred_detections": 0,
+                "true_positives": 0,
+                "false_positives": 0,
+                "false_negatives": 0,
+                "id_switches": 0,
+                "iou_sum": 0.0,
+            },
+        )
 
     threshold = float(iou_threshold)
     for frame_id in frames:
@@ -184,10 +275,16 @@ def compute_simple_tracking_metrics(
         frame_pred = predictions.get(frame_id, [])
         total_gt += len(frame_gt)
         total_pred += len(frame_pred)
+        for gt in frame_gt:
+            stats_for(str(gt["class"]))["gt_detections"] += 1
+        for pred in frame_pred:
+            stats_for(str(pred["class"]))["pred_detections"] += 1
 
         candidate_pairs = []
         for gt_idx, gt in enumerate(frame_gt):
             for pred_idx, pred in enumerate(frame_pred):
+                if str(gt["class"]) != str(pred["class"]):
+                    continue
                 iou = _bbox_iou(gt["bbox"], pred["bbox"])
                 if iou >= threshold:
                     candidate_pairs.append((iou, gt_idx, pred_idx))
@@ -203,15 +300,26 @@ def compute_simple_tracking_metrics(
             tp += 1
             iou_sum += float(iou)
 
+            class_name = str(frame_gt[gt_idx]["class"])
+            class_stat = stats_for(class_name)
+            class_stat["true_positives"] += 1
+            class_stat["iou_sum"] += float(iou)
             gt_id = int(frame_gt[gt_idx]["id"])
             pred_id = int(frame_pred[pred_idx]["id"])
-            previous_pred_id = last_match_by_gt_id.get(gt_id)
+            previous_pred_id = last_match_by_gt_key.get((class_name, gt_id))
             if previous_pred_id is not None and previous_pred_id != pred_id:
                 id_switches += 1
-            last_match_by_gt_id[gt_id] = pred_id
+                class_stat["id_switches"] += 1
+            last_match_by_gt_key[(class_name, gt_id)] = pred_id
 
         fp += len(frame_pred) - len(matched_pred)
         fn += len(frame_gt) - len(matched_gt)
+        for pred_idx, pred in enumerate(frame_pred):
+            if pred_idx not in matched_pred:
+                stats_for(str(pred["class"]))["false_positives"] += 1
+        for gt_idx, gt in enumerate(frame_gt):
+            if gt_idx not in matched_gt:
+                stats_for(str(gt["class"]))["false_negatives"] += 1
 
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / total_gt if total_gt > 0 else 0.0
@@ -219,8 +327,13 @@ def compute_simple_tracking_metrics(
     motp = iou_sum / tp if tp > 0 else 0.0
     f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
-    return {
+    metrics = {
         "method": "simple_iou_greedy",
+        "class_match_mode": "strict" if any(
+            str(row.get("class", UNKNOWN_CLASS)) != UNKNOWN_CLASS
+            for rows in list(predictions.values()) + list(ground_truth.values())
+            for row in rows
+        ) else "legacy_unknown_class",
         "iou_threshold": threshold,
         "frames": len(frames),
         "gt_detections": total_gt,
@@ -235,6 +348,100 @@ def compute_simple_tracking_metrics(
         "mota": mota,
         "motp": motp,
     }
+    for class_name in sorted(class_stats):
+        safe_class = _safe_metric_class_name(class_name)
+        stat = class_stats[class_name]
+        class_tp = int(stat["true_positives"])
+        class_fp = int(stat["false_positives"])
+        class_fn = int(stat["false_negatives"])
+        class_gt = int(stat["gt_detections"])
+        class_precision = class_tp / (class_tp + class_fp) if (class_tp + class_fp) > 0 else 0.0
+        class_recall = class_tp / class_gt if class_gt > 0 else 0.0
+        class_f1 = (
+            2.0 * class_precision * class_recall / (class_precision + class_recall)
+            if (class_precision + class_recall) > 0
+            else 0.0
+        )
+        class_mota = (
+            1.0 - ((class_fn + class_fp + int(stat["id_switches"])) / class_gt)
+            if class_gt > 0
+            else 0.0
+        )
+        class_motp = float(stat["iou_sum"]) / class_tp if class_tp > 0 else 0.0
+        prefix = f"class_{safe_class}_"
+        metrics.update(
+            {
+                f"{prefix}gt_detections": class_gt,
+                f"{prefix}pred_detections": int(stat["pred_detections"]),
+                f"{prefix}true_positives": class_tp,
+                f"{prefix}false_positives": class_fp,
+                f"{prefix}false_negatives": class_fn,
+                f"{prefix}id_switches": int(stat["id_switches"]),
+                f"{prefix}precision": class_precision,
+                f"{prefix}recall": class_recall,
+                f"{prefix}f1": class_f1,
+                f"{prefix}mota": class_mota,
+                f"{prefix}motp": class_motp,
+            }
+        )
+    return metrics
+
+
+def _per_class_metric_rows(metrics: dict) -> List[dict]:
+    class_names = set()
+    for key in metrics:
+        if not key.startswith("class_"):
+            continue
+        for suffix in PER_CLASS_METRIC_SUFFIXES:
+            marker = f"_{suffix}"
+            if key.endswith(marker):
+                class_names.add(key[len("class_") : -len(marker)])
+                break
+
+    rows = []
+    for safe_class in sorted(class_names):
+        row = {"class": safe_class}
+        for suffix in PER_CLASS_METRIC_SUFFIXES:
+            row[suffix] = metrics.get(f"class_{safe_class}_{suffix}", "")
+        rows.append(row)
+    return rows
+
+
+def _write_per_class_metrics_outputs(metrics: dict, output_dir: Path) -> Tuple[Path, Path]:
+    csv_path = output_dir / "tracking_metrics_per_class.csv"
+    txt_path = output_dir / "tracking_metrics_per_class.txt"
+    rows = _per_class_metric_rows(metrics)
+    fieldnames = ["class"] + PER_CLASS_METRIC_SUFFIXES
+
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    lines = ["Tracking Metrics Per Class"]
+    if not rows:
+        lines.append("No class labels were found. Re-run the tracker after the class-aware logging change for per-class metrics.")
+    for row in rows:
+        lines.extend(
+            [
+                "",
+                f"class: {row['class']}",
+                f"gt_detections: {row['gt_detections']}",
+                f"pred_detections: {row['pred_detections']}",
+                f"true_positives: {row['true_positives']}",
+                f"false_positives: {row['false_positives']}",
+                f"false_negatives: {row['false_negatives']}",
+                f"id_switches: {row['id_switches']}",
+                f"precision: {float(row['precision']):.6f}",
+                f"recall: {float(row['recall']):.6f}",
+                f"f1: {float(row['f1']):.6f}",
+                f"mota: {float(row['mota']):.6f}",
+                f"motp: {float(row['motp']):.6f}",
+            ]
+        )
+    txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return csv_path, txt_path
 
 
 def write_simple_metrics_outputs(metrics: dict, output_dir: Path) -> Tuple[Path, Path]:
@@ -242,22 +449,10 @@ def write_simple_metrics_outputs(metrics: dict, output_dir: Path) -> Tuple[Path,
     csv_path = output_dir / "tracking_metrics_summary.csv"
     txt_path = output_dir / "tracking_metrics_summary.txt"
 
-    fieldnames = [
-        "method",
-        "iou_threshold",
-        "frames",
-        "gt_detections",
-        "pred_detections",
-        "true_positives",
-        "false_positives",
-        "false_negatives",
-        "id_switches",
-        "precision",
-        "recall",
-        "f1",
-        "mota",
-        "motp",
-    ]
+    fieldnames = list(BASE_METRIC_FIELDS)
+    for key in metrics:
+        if key not in fieldnames:
+            fieldnames.append(key)
     with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
@@ -266,6 +461,7 @@ def write_simple_metrics_outputs(metrics: dict, output_dir: Path) -> Tuple[Path,
     lines = [
         "Tracking Metrics Summary",
         f"method: {metrics['method']}",
+        f"class_match_mode: {metrics.get('class_match_mode', '')}",
         f"iou_threshold: {metrics['iou_threshold']:.3f}",
         f"frames: {metrics['frames']}",
         f"gt_detections: {metrics['gt_detections']}",
@@ -280,7 +476,31 @@ def write_simple_metrics_outputs(metrics: dict, output_dir: Path) -> Tuple[Path,
         f"mota: {metrics['mota']:.6f}",
         f"motp: {metrics['motp']:.6f}",
     ]
+    per_class_rows = _per_class_metric_rows(metrics)
+    if per_class_rows:
+        lines.extend(["", "Per Class"])
+        for row in per_class_rows:
+            lines.append(
+                "class={class_name} | gt={gt_detections} | pred={pred_detections} | "
+                "tp={true_positives} | fp={false_positives} | fn={false_negatives} | "
+                "idsw={id_switches} | precision={precision:.6f} | recall={recall:.6f} | "
+                "f1={f1:.6f} | mota={mota:.6f} | motp={motp:.6f}".format(
+                    class_name=row["class"],
+                    gt_detections=row["gt_detections"],
+                    pred_detections=row["pred_detections"],
+                    true_positives=row["true_positives"],
+                    false_positives=row["false_positives"],
+                    false_negatives=row["false_negatives"],
+                    id_switches=row["id_switches"],
+                    precision=float(row["precision"]),
+                    recall=float(row["recall"]),
+                    f1=float(row["f1"]),
+                    mota=float(row["mota"]),
+                    motp=float(row["motp"]),
+                )
+            )
     txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_per_class_metrics_outputs(metrics, output_dir)
     return csv_path, txt_path
 
 
@@ -292,6 +512,7 @@ def prepare_trackeval_bundle(
     tracker_name: str,
     benchmark_name: str,
     seqinfo_ini: Optional[Path] = None,
+    class_filter: Optional[str] = None,
 ) -> Path:
     data_root = output_dir / "trackeval_data"
     gt_root = data_root / "gt" / "mot_challenge"
@@ -308,12 +529,12 @@ def prepare_trackeval_bundle(
 
     gt_target = gt_seq_gt_dir / "gt.txt"
     pred_target = tracker_data_dir / f"{seq_name}.txt"
-    _copy_mot_txt_for_trackeval(ground_truth_txt, gt_target)
-    _copy_mot_txt_for_trackeval(predictions_txt, pred_target, ignore_negative_ids=True)
+    _copy_mot_txt_for_trackeval(ground_truth_txt, gt_target, class_filter=class_filter)
+    _copy_mot_txt_for_trackeval(predictions_txt, pred_target, ignore_negative_ids=True, class_filter=class_filter)
 
     seqinfo_target = gt_seq_dir / "seqinfo.ini"
     if seqinfo_ini is not None and seqinfo_ini.exists():
-        shutil.copy2(seqinfo_ini, seqinfo_target)
+        _copy_seqinfo_with_name(seqinfo_ini, seqinfo_target, seq_name=seq_name)
     else:
         seq_len = max(
             _max_frame_id_from_mot_txt(ground_truth_txt),
@@ -462,6 +683,29 @@ def main() -> int:
     )
     print(f"[OK] Prepared TrackEval bundle at: {data_root}")
 
+    class_names = _classes_in_mot_files(pred_path, gt_path)
+    per_class_trackeval_roots: List[Tuple[str, Path, str]] = []
+    for class_name in class_names:
+        safe_class = _safe_metric_class_name(class_name)
+        class_seq_name = f"{seq_name}_{safe_class}"
+        class_tracker_name = f"{args.tracker_name}_{safe_class}"
+        class_root = prepare_trackeval_bundle(
+            predictions_txt=pred_path,
+            ground_truth_txt=gt_path,
+            output_dir=out_dir / "trackeval_per_class" / safe_class,
+            seq_name=class_seq_name,
+            tracker_name=class_tracker_name,
+            benchmark_name=str(args.benchmark),
+            seqinfo_ini=seqinfo_path,
+            class_filter=class_name,
+        )
+        per_class_trackeval_roots.append((safe_class, class_root, class_seq_name))
+    if per_class_trackeval_roots:
+        print(
+            "[OK] Prepared per-class TrackEval bundles for: "
+            + ", ".join(safe_class for safe_class, _, _ in per_class_trackeval_roots)
+        )
+
     metrics = compute_simple_tracking_metrics(
         predictions_txt=pred_path,
         ground_truth_txt=gt_path,
@@ -476,10 +720,17 @@ def main() -> int:
 
     run_trackeval(
         data_root=data_root,
-        seq_name=str(args.seq_name),
+        seq_name=seq_name,
         tracker_name=str(args.tracker_name),
         benchmark_name=str(args.benchmark),
     )
+    for safe_class, class_root, class_seq_name in per_class_trackeval_roots:
+        run_trackeval(
+            data_root=class_root,
+            seq_name=class_seq_name,
+            tracker_name=f"{args.tracker_name}_{safe_class}",
+            benchmark_name=str(args.benchmark),
+        )
     print("[OK] TrackEval finished. Check summary files under tracker output folders.")
     return 0
 

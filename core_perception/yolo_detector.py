@@ -368,13 +368,15 @@ class YoloDetector:
             )
 
             if self._enable_tracking_metrics_logging and class_name in self._metrics_eval_classes:
-                # MOTChallenge tracking-results format:
-                # <frame>,<id>,<bb_left>,<bb_top>,<bb_width>,<bb_height>,<conf>,<x>,<y>,<z>
+                # MOTChallenge tracking-results format plus a repo-local class column:
+                # <frame>,<id>,<bb_left>,<bb_top>,<bb_width>,<bb_height>,<conf>,<x>,<y>,<z>,<class>
+                # The first 10 columns stay MOT-compatible; the class column prevents
+                # built-in metrics from matching e.g. a vehicle prediction to a pedestrian GT.
                 w = int(x2 - x1)
                 h = int(y2 - y1)
                 log_line = (
                     f"{int(self.current_frame_id)},{int(track_id_val)},{int(x1)},{int(y1)},"
-                    f"{int(w)},{int(h)},{float(conf):.4f},-1,-1,-1"
+                    f"{int(w)},{int(h)},{float(conf):.4f},-1,-1,-1,{class_name}"
                 )
                 self.tracking_logs.append(log_line)
         return tracked_objects
