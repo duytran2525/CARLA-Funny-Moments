@@ -36,6 +36,7 @@ NUMERIC_METRICS = {
     "f1",
     "mota",
     "motp",
+    "hota",
 }
 
 METRIC_ORDER = [
@@ -54,6 +55,7 @@ METRIC_ORDER = [
     "f1",
     "mota",
     "motp",
+    "hota",
 ]
 
 HIGHER_IS_BETTER = {
@@ -63,6 +65,7 @@ HIGHER_IS_BETTER = {
     "f1",
     "mota",
     "motp",
+    "hota",
 }
 
 LOWER_IS_BETTER = {

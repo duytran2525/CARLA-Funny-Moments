@@ -35,6 +35,7 @@ class YoloDetector:
     CLASS_ALIASES = {
         "bike": "two_wheeler",
         "bicycle": "two_wheeler",
+        "cyclist": "two_wheeler",
         "motobike": "two_wheeler",
         "motorbike": "two_wheeler",
         "motorcycle": "two_wheeler",

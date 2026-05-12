@@ -1794,6 +1794,7 @@ class LaneFollowAgent(BaseAgent):
 
         self._yolo_detector = YoloDetector(
             str(model_path),
+            display_classes=["pedestrian", "vehicle", "two_wheeler"],
             camera_fov_deg=self.config.camera_fov,
             obstacle_base_distance_m=8.0,
             camera_mount_x_m=1.5,
@@ -3592,7 +3593,7 @@ class CILAgent(BaseAgent):
         checkpoint = torch.load(model_path, map_location=self._device)
         state_dict = unwrap_state_dict(checkpoint)
         model_kind = classify_checkpoint_state_dict(state_dict)
-        if model_kind not in ("waypoint", "waypoint_legacy"):
+        if model_kind != "waypoint":
             raise RuntimeError(
                 f"Incompatible CIL checkpoint '{model_path.name}' detected as '{model_kind}'. "
                 "Train or provide a waypoint predictor checkpoint such as models/waypoint_predictor.pth."
@@ -3892,24 +3893,21 @@ class CILAgent(BaseAgent):
 
         command_idx = max(0, min(3, int(command)))
         command_tensor = torch.tensor([command_idx], dtype=torch.long)
-        speed_norm = clamp(speed_kmh / 120.0, 0.0, 1.0)
-        speed_tensor = torch.tensor([speed_norm], dtype=torch.float32)
 
         image_tensor = image_tensor.to(self._device, non_blocking=True)
         command_tensor = command_tensor.to(self._device, non_blocking=True)
-        speed_tensor = speed_tensor.to(self._device, non_blocking=True)
 
         with torch.inference_mode():
-            predictions = self._model(image_tensor, command_tensor, speed_tensor)
+            predictions = self._model(image_tensor, command_tensor)
 
         if torch.is_tensor(predictions):
             pred_tensor = predictions.detach().squeeze(0).cpu().float().numpy()
-            if pred_tensor.shape[0] >= 15:
+            if pred_tensor.shape[0] == 15:
                 wp_array = pred_tensor[:10].reshape(5, 2)
-                mean_uncertainty = float(np.mean(pred_tensor[10:15]))
+                mean_uncertainty = float(np.mean(pred_tensor[10:]))
             else:
                 logging.error(
-                    "Shape Model Output bị sai: %s (Kỳ vọng: >=15). Dùng Zeros.",
+                    "Shape Model Output bị sai: %s (Kỳ vọng: 15). Dùng Zeros.",
                     pred_tensor.shape,
                 )
                 wp_array = np.zeros((5, 2), dtype=np.float32)
@@ -4726,8 +4724,12 @@ class YoloDetectAgent(BaseAgent):
         elif model_path.suffix.lower() != ".engine":
             detector_imgsz = 448
 
+        # Restrict to CARLA-compatible classes that ground truth API can generate
+        carla_compatible_classes = ["pedestrian", "vehicle", "two_wheeler"]
+
         self._detector = YoloDetector(
             str(model_path),
+            display_classes=carla_compatible_classes,
             inference_imgsz=detector_imgsz,
             camera_fov_deg=self.config.camera_fov,
             obstacle_base_distance_m=8.0,
@@ -4742,6 +4744,7 @@ class YoloDetectAgent(BaseAgent):
         if secondary_tracker and secondary_tracker != str(self.config.yolo_tracker_config):
             self._secondary_detector = YoloDetector(
                 str(model_path),
+                display_classes=carla_compatible_classes,
                 inference_imgsz=detector_imgsz,
                 camera_fov_deg=self.config.camera_fov,
                 obstacle_base_distance_m=8.0,
@@ -4752,7 +4755,11 @@ class YoloDetectAgent(BaseAgent):
                 tracker_config=secondary_tracker,
                 enable_tracking_metrics_logging=True,
             )
-            logging.info("Secondary YOLO tracker enabled for same-sequence metrics: %s", secondary_tracker)
+            logging.info(
+                "Secondary YOLO tracker enabled for same-sequence metrics (%s), restricted to CARLA-compatible classes: %s",
+                secondary_tracker,
+                ", ".join(carla_compatible_classes),
+            )
         else:
             self._secondary_detector = None
         self._init_tracking_metrics_workspace(model_path)
@@ -4775,12 +4782,14 @@ class YoloDetectAgent(BaseAgent):
                     (time.perf_counter() - warmup_t0) * 1000.0,
                 )
         logging.info(
-            "YOLO runtime config: every_n_ticks=%d visualize=%s draw_overlay=%s imgsz=%s tracker=%s",
+            "YOLO runtime config: every_n_ticks=%d visualize=%s draw_overlay=%s imgsz=%s tracker=%s "
+            "classes_for_tracking_metrics=%s",
             int(self.config.yolo_inference_every_n_ticks),
             bool(self.config.yolo_visualize),
             bool(self.config.yolo_draw_overlay),
             detector_imgsz if detector_imgsz is not None else "engine-default",
             self.config.yolo_tracker_config,
+            "[" + ", ".join(carla_compatible_classes) + "]",
         )
         if TrafficSupervisor is None:
             logging.warning("TrafficSupervisor unavailable. yolo_detect will run without supervisor brake fusion.")
@@ -5377,6 +5386,9 @@ class YoloDetectAgent(BaseAgent):
             return "pedestrian"
         if type_id.startswith("vehicle."):
             # Match detector's two_wheeler class for bikes/motorbikes.
+            # Includes both generic tokens and known CARLA vehicle brand names
+            # for bicycles (diamondback, gazelle, bh, crossbike) and
+            # motorcycles (vespa, yamaha, harley, kawasaki).
             two_wheel_tokens = (
                 "bike",
                 "bicycle",
@@ -5386,6 +5398,11 @@ class YoloDetectAgent(BaseAgent):
                 "yamaha",
                 "harley",
                 "kawasaki",
+                "diamondback",
+                "gazelle",
+                "bh",
+                "crossbike",
+                "cyclist",
             )
             if any(token in type_id for token in two_wheel_tokens):
                 return "two_wheeler"
