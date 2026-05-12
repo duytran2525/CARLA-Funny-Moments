@@ -233,6 +233,7 @@ class WaypointCarlaDatasetH5(Dataset):
 
             command = int(row.get("command", 0))
             recovery = float(row.get("recovery_flag", 0.0))
+            speed_kmh = float(row.get("speed", 0.0))
 
             for cam_dir, offset in camera_configs:
                 # Verify all 3 temporal images exist in this camera
@@ -254,6 +255,7 @@ class WaypointCarlaDatasetH5(Dataset):
                     "waypoints": wp_cam,
                     "command": command,
                     "recovery_flag": recovery,
+                    "speed_kmh": speed_kmh,
                 })
                 self.recovery_flags.append(int(recovery))
 
@@ -375,6 +377,7 @@ class WaypointCarlaDatasetH5(Dataset):
         waypoints = sample["waypoints"].copy()
         command = int(sample["command"])
         recovery = float(sample["recovery_flag"])
+        speed_norm = float(sample.get("speed_kmh", 0.0)) / 120.0  # normalize to [0, 1]
 
         # ── Augmentation decisions ──
         do_flip = self.is_training and random.random() > 0.5
@@ -439,6 +442,7 @@ class WaypointCarlaDatasetH5(Dataset):
             torch.tensor(waypoints, dtype=torch.float32),
             torch.tensor(command, dtype=torch.long),
             torch.tensor(recovery, dtype=torch.float32),
+            torch.tensor(speed_norm, dtype=torch.float32),
         )
 
 
@@ -522,12 +526,13 @@ def main():
     # h5py internally caches HDF5 metadata per forked process, growing unbounded
     # until Kaggle OOM-kills the kernel (~batch 900 with 2 workers).
     def collate_fn(batch):
-        imgs, wps, cmds, recs = zip(*batch)
+        imgs, wps, cmds, recs, speeds = zip(*batch)
         return (
             torch.stack(imgs),
             torch.stack(wps).float(),
             torch.stack(cmds).long(),
             torch.tensor(recs, dtype=torch.float32),
+            torch.tensor(speeds, dtype=torch.float32),
         )
 
     batch_size = int(config.get("batch_size", 48))  # larger batch OK with 0 workers
@@ -553,11 +558,17 @@ def main():
     model = WaypointPredictor().to(primary_device)
     use_multi_gpu = False  # DataParallel causes extra memory on GPU:0
     print(f"Single GPU mode: {primary_device}")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  Model params: {total_params:,} ({total_params/1e6:.1f}M)")
 
-    # ── Optimizer / Scheduler ──
+    # ── Optimizer with differential LR for backbone ──
     huber = nn.SmoothL1Loss(reduction="mean")
     base_lr = float(config["learning_rate"])
-    optimizer = optim.Adam(model.parameters(), lr=base_lr)
+    backbone_lr_ratio = float(config.get("backbone_lr_ratio", 0.1))
+    optimizer = optim.Adam([
+        {"params": model.get_non_backbone_params(), "lr": base_lr},
+        {"params": model.get_backbone_params(), "lr": base_lr * backbone_lr_ratio},
+    ])
 
     lr_scheduler_type = str(config.get("lr_scheduler", "plateau")).lower()
     if lr_scheduler_type == "cosine":
@@ -578,13 +589,16 @@ def main():
     scaler = torch.amp.GradScaler("cuda" if use_amp else "cpu", enabled=use_amp)
 
     lambda_wp = float(config.get("loss_lambda_wp", 1.0))
-    lambda_gnll = float(config.get("loss_lambda_gnll", 0.05))
+    lambda_gnll = float(config.get("loss_lambda_gnll", 0.02))
+    lambda_smoothness = float(config.get("loss_lambda_smoothness", 0.1))
+    lambda_speed = float(config.get("loss_lambda_speed", 0.5))
 
     # GNLL stability params
     grad_clip_norm = float(config.get("grad_clip_norm", 1.0))
     sigma_min = float(config.get("sigma_min", 0.01))
     sigma_max = float(config.get("sigma_max", 10.0))
-    warmup_epochs = int(config.get("warmup_epochs", 1))
+    warmup_epochs = int(config.get("warmup_epochs", 3))
+    backbone_freeze_epochs = int(config.get("backbone_freeze_epochs", 5))
 
     model_save = Path(WORKING_DIR) / "models" / "waypoint_predictor_h5.pth"
     model_save.parent.mkdir(exist_ok=True)
@@ -624,37 +638,60 @@ def main():
     print(f"{'=' * 60}\n")
 
     for epoch in range(start_epoch, epochs):
+        # Backbone freeze schedule: freeze for first N epochs
+        if epoch < backbone_freeze_epochs:
+            for p in model.get_backbone_params():
+                p.requires_grad = False
+            if epoch == 0:
+                print(f"  🧊 Backbone FROZEN for epochs 1-{backbone_freeze_epochs}")
+        elif epoch == backbone_freeze_epochs:
+            for p in model.get_backbone_params():
+                p.requires_grad = True
+            print(f"  🔥 Backbone UNFROZEN from epoch {epoch + 1}")
+
         # Linear LR warmup
         if epoch < warmup_epochs:
             warmup_lr = base_lr * (epoch + 1) / max(1, warmup_epochs)
             for pg in optimizer.param_groups:
-                pg["lr"] = warmup_lr
+                pg["lr"] = warmup_lr * (backbone_lr_ratio if pg is optimizer.param_groups[1] else 1.0)
 
         # ── TRAIN ──
         model.train()
         running_loss = 0.0
         nan_batches = 0
-        for i, (imgs, wps, cmds, _recs) in enumerate(train_loader):
+        for i, (imgs, wps, cmds, _recs, speeds) in enumerate(train_loader):
             imgs = imgs.to(primary_device, non_blocking=True)
             cmds = cmds.to(primary_device, non_blocking=True)
             wps = wps.to(primary_device, non_blocking=True)
-
+            speeds = speeds.to(primary_device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda" if use_amp else "cpu", enabled=use_amp):
-                out = model(imgs, cmds)
+                out = model(imgs, cmds, speeds)
                 pred_wp = out[:, :10].view(-1, 5, 2)
-                # Model already applies softplus — only clamp here
-                pred_sig = out[:, 10:].view(-1, 5, 1).expand(-1, 5, 2).clamp(sigma_min, sigma_max)
                 tgt_wp = wps.view(-1, 5, 2)
                 loss_wp = huber(pred_wp, tgt_wp)
-                loss_gnll = 0.5 * ((tgt_wp - pred_wp) ** 2 / pred_sig + torch.log(pred_sig))
-                loss = lambda_wp * loss_wp + lambda_gnll * loss_gnll.mean()
+                pred_sig = out[:, 10:15].view(-1, 5, 1).expand(-1, 5, 2).clamp(sigma_min, sigma_max)
+                pred_var = pred_sig.pow(2)
+                loss_gnll = 0.5 * ((tgt_wp - pred_wp)**2 / pred_var + torch.log(pred_var))
+
+                vel = pred_wp[:, 1:] - pred_wp[:, :-1]
+                accel = vel[:, 1:] - vel[:, :-1]
+                smoothness_loss = accel.pow(2).mean()
+
+                # Speed prediction loss (CILRS-style regularizer)
+                pred_speed = out[:, 15]
+                loss_speed = nn.functional.mse_loss(pred_speed, speeds)
+
+                loss = (lambda_wp * loss_wp
+                        + lambda_gnll * loss_gnll.mean()
+                        + lambda_smoothness * smoothness_loss
+                        + lambda_speed * loss_speed)
 
             # Skip NaN/Inf batches
             if not torch.isfinite(loss):
                 nan_batches += 1
                 optimizer.zero_grad(set_to_none=True)
-                del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_gnll, loss, imgs, cmds, wps
+                del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_gnll, loss, imgs, cmds, wps, speeds
                 continue
 
             scaler.scale(loss).backward()
@@ -669,7 +706,7 @@ def main():
             running_loss += float(loss.item())
 
             # Explicit cleanup of intermediate tensors
-            del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_gnll, loss, imgs, cmds, wps
+            del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_gnll, loss, imgs, cmds, wps, speeds
 
             if i % 50 == 0:
                 gc.collect()
@@ -713,23 +750,36 @@ def main():
         val_mae = 0.0
         val_samples = 0
         with torch.no_grad():
-            for i, (imgs, wps, cmds, _recs) in enumerate(val_loader):
+            for i, (imgs, wps, cmds, _recs, speeds) in enumerate(val_loader):
                 imgs = imgs.to(primary_device, non_blocking=True)
                 cmds = cmds.to(primary_device, non_blocking=True)
                 wps = wps.to(primary_device, non_blocking=True)
+                speeds = speeds.to(primary_device, non_blocking=True)
                 with torch.amp.autocast("cuda" if use_amp else "cpu", enabled=use_amp):
-                    out = model(imgs, cmds)
+                    out = model(imgs, cmds, speeds)
                     pred_wp = out[:, :10].view(-1, 5, 2)
-                    pred_sig = out[:, 10:].view(-1, 5, 1).expand(-1, 5, 2).clamp(sigma_min, sigma_max)
+                    pred_sig = out[:, 10:15].view(-1, 5, 1).expand(-1, 5, 2).clamp(sigma_min, sigma_max)
                     tgt_wp = wps.view(-1, 5, 2)
                     loss_wp = huber(pred_wp, tgt_wp)
-                    loss_g = 0.5 * ((tgt_wp - pred_wp) ** 2 / pred_sig + torch.log(pred_sig))
-                    loss = lambda_wp * loss_wp + lambda_gnll * loss_g.mean()
+                    pred_var = pred_sig.pow(2)
+                    loss_g = 0.5 * ((tgt_wp - pred_wp) ** 2 / pred_var + torch.log(pred_var))
+
+                    vel = pred_wp[:, 1:] - pred_wp[:, :-1]
+                    accel = vel[:, 1:] - vel[:, :-1]
+                    smoothness_loss = accel.pow(2).mean()
+
+                    pred_speed = out[:, 15]
+                    loss_speed = nn.functional.mse_loss(pred_speed, speeds)
+
+                    loss = (lambda_wp * loss_wp
+                            + lambda_gnll * loss_g.mean()
+                            + lambda_smoothness * smoothness_loss
+                            + lambda_speed * loss_speed)
                 bs = imgs.size(0)
                 val_loss += float(loss.item()) * bs
                 val_mae += float((pred_wp - tgt_wp).abs().mean().item()) * bs
                 val_samples += bs
-                del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_g, loss, imgs, cmds, wps
+                del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_g, loss, imgs, cmds, wps, speeds
                 if i % 50 == 0:
                     gc.collect()
 

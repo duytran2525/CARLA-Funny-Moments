@@ -387,6 +387,7 @@ def main():
     scaler = torch.amp.GradScaler("cuda" if use_amp else "cpu", enabled=use_amp)
     lambda_wp = float(config.get("loss_lambda_wp", 1.0))
     lambda_gnll = float(config.get("loss_lambda_gnll", 0.05))
+    lambda_smoothness = float(config.get("loss_lambda_smoothness", 0.1))
 
     # GNLL stability params
     grad_clip_norm = float(config.get("grad_clip_norm", 1.0))
@@ -395,7 +396,7 @@ def main():
     warmup_epochs = int(config.get("warmup_epochs", 1))
 
     print(f"Optimizer: Adam (lr={base_lr})")
-    print(f"Loss weights: waypoint={lambda_wp} gnll={lambda_gnll}")
+    print(f"Loss weights: waypoint={lambda_wp} gnll={lambda_gnll} smoothness={lambda_smoothness}")
     print(f"Mixed precision: {'enabled' if use_amp else 'disabled'}")
     print(f"Grad clip: {grad_clip_norm}, sigma range: [{sigma_min}, {sigma_max}]")
     print(f"Warmup epochs: {warmup_epochs}")
@@ -439,7 +440,12 @@ def main():
 
                 loss_wp = huber_loss(pred_wp, target_wp)
                 loss_gnll = 0.5 * ((target_wp - pred_wp) ** 2 / pred_sigma + torch.log(pred_sigma))
-                loss = lambda_wp * loss_wp + lambda_gnll * loss_gnll.mean()
+                
+                vel = pred_wp[:, 1:] - pred_wp[:, :-1]
+                accel = vel[:, 1:] - vel[:, :-1]
+                smoothness_loss = accel.pow(2).mean()
+
+                loss = lambda_wp * loss_wp + lambda_gnll * loss_gnll.mean() + lambda_smoothness * smoothness_loss
 
             # Skip NaN/Inf batches to protect optimizer state
             if not torch.isfinite(loss):
@@ -491,7 +497,12 @@ def main():
 
                     loss_wp = huber_loss(pred_wp, target_wp)
                     loss_gnll = 0.5 * ((target_wp - pred_wp) ** 2 / pred_sigma + torch.log(pred_sigma))
-                    loss = lambda_wp * loss_wp + lambda_gnll * loss_gnll.mean()
+                    
+                    vel = pred_wp[:, 1:] - pred_wp[:, :-1]
+                    accel = vel[:, 1:] - vel[:, :-1]
+                    smoothness_loss = accel.pow(2).mean()
+
+                    loss = lambda_wp * loss_wp + lambda_gnll * loss_gnll.mean() + lambda_smoothness * smoothness_loss
 
                 bs = images.size(0)
                 val_loss += float(loss.item()) * bs

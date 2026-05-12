@@ -45,7 +45,7 @@ class PurePursuitController:
 
         distances = np.linalg.norm(waypoints, axis=1)
 
-        for i in range(2, len(distances)):
+        for i in range(len(distances)):
             if distances[i] >= ld_target:
                 return waypoints[i][0], waypoints[i][1]
 

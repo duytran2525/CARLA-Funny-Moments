@@ -1,8 +1,8 @@
 # ============================================================================
-# CIL Model Training Parameters (Optimized for Kaggle GPU T4 x2)
+# CIL Model Training Parameters v7 — RegNetY-400MF Backbone
 # ============================================================================
-# Updated: 2026-05-10 (v6 - side cameras + CosineAnnealing + 40 epochs)
-# Data Size: ~180k training (3x with side cameras) + ~20k validation
+# Updated: 2026-05-12 (v7 - RegNet backbone + speed prediction + backbone freeze)
+# Data Size: ~240k training (8 towns × 10K × 3 cameras) + ~20k validation
 # Environment: Kaggle GPU T4 x2 (32GB total, Single GPU training)
 # ============================================================================
 
@@ -11,55 +11,67 @@ data_root: /kaggle/input/datasets/yudtrann/data-carlav3/data_carlav2
 csv_path: /kaggle/input/datasets/yudtrann/data-carlav3/data_carlav2/driving_log.csv
 work_dir: /kaggle/working
 
-epochs: 40                      # 20 → 40 (deeper convergence with cosine schedule)
-batch_size: 48                  # safe with num_workers=0
-learning_rate: 0.0003           # 3e-4 (stable)
+# ── Training Schedule ──
+epochs: 25                       # 25 epochs (pretrained converges fast, fits 2 Kaggle sessions)
+batch_size: 48                   # 48 safe on T4 16GB (~3GB peak VRAM)
+learning_rate: 0.0003            # 3e-4 (stable)
 
-# GNLL stability
-warmup_epochs: 3                # 3 epochs linear warmup
+# ── Backbone Freeze Schedule ──
+backbone_freeze_epochs: 3        # Freeze RegNet for first 3 epochs (let heads learn)
+backbone_lr_ratio: 0.1           # After unfreeze: backbone lr = base_lr × 0.1
+
+# ── Warmup ──
+warmup_epochs: 3                 # Match freeze epochs for smooth transition
 grad_clip_norm: 1.0
+
+# ── GNLL Uncertainty ──
 sigma_min: 0.01
 sigma_max: 10.0
 
-# Data
+# ── Data ──
 geometric_offset: 0.35
 augmentation_prob: 0.75
 train_split: 0.75
-include_side_cameras_train: true  # false → true (3x training data for recovery learning)
+include_side_cameras_train: true
 recovery_weight: 2.0
 
-# Loss weights
-loss_lambda_wp: 1.0
-loss_lambda_gnll: 0.0           # DISABLED: GNLL caused divergence. Pure Huber only.
+# ── Loss Weights ──
+loss_lambda_wp: 1.0              # Huber waypoint loss
+loss_lambda_gnll: 0.02           # Re-enabled gently (was 0.0 = disabled)
+loss_lambda_smoothness: 0.1     # Trajectory smoothness regularizer
+loss_lambda_speed: 0.5           # NEW: Speed prediction auxiliary loss (CILRS-style)
 
-# Learning Rate Scheduler
-lr_scheduler: cosine            # ReduceLROnPlateau → CosineAnnealingLR (smoother decay)
-lr_patience: 3                  # kept for fallback
-lr_factor: 0.5                  # kept for fallback
+# ── Learning Rate Scheduler ──
+lr_scheduler: cosine
+lr_patience: 3                   # fallback for ReduceLROnPlateau
+lr_factor: 0.5                   # fallback for ReduceLROnPlateau
 
-# Early Stopping
-early_stopping_patience: 8      # 5 → 8 (more patience with cosine schedule)
+# ── Early Stopping ──
+early_stopping_patience: 6       # 6 epochs patience (enough for 25 total epochs)
 
-# Reproducibility & I/O
+# ── Reproducibility & I/O ──
 seed: 42
 model_save_path: models/waypoint_predictor.pth
-# resume_checkpoint: "/kaggle/input/model-checkpoint/waypoint_predictor_h5.pth" # Bỏ comment dòng này và trỏ tới file .pth cũ để train tiếp
+# resume_checkpoint: "/kaggle/input/model-checkpoint/waypoint_predictor_h5.pth"
 num_workers: 4
 prefetch_factor: 4
 log_every_batches: 200
 val_log_every_batches: 0
 
-# Multi-GPU
+# ── Multi-GPU ──
 use_multi_gpu: true
 
 # ============================================================================
-# CHANGELOG v6:
-# - Side cameras enabled: 3x training data (center + left + right)
-#   Each side camera applies ±geometric_offset to waypoints, teaching
-#   the model lane recovery behavior
-# - CosineAnnealingLR: smooth decay from lr_max to lr_min over all epochs
-#   Avoids the plateau-then-cliff behavior of ReduceLROnPlateau
-# - Epochs 20 → 40: allows deeper convergence with the smoother LR schedule
-# - Early stopping patience 5 → 8: cosine schedule needs more room
-# Expected: Val MAE < 2.0, training time ~8-10h on T4
+# CHANGELOG v7:
+# - Backbone: Custom DepthwiseSeparable (250K) → RegNetY-400MF (4.3M pretrained)
+# - PhysicsAwareStem kept as temporal pre-processor → adapter → RegNet trunk
+# - Backbone freeze: first 5 epochs train only heads, then unfreeze with 0.1× LR
+# - Speed prediction branch: auxiliary loss (lambda=0.5) for inertia regularization
+# - GNLL re-enabled at low weight (0.02) for uncertainty estimation
+# - Output: 16 values (10 waypoints + 5 sigma + 1 speed_pred)
+# - WaypointScaling: x_scale 30→50, y_scale 10→15 (handles high-speed waypoints)
+# - Dropout(0.3) added to shared features and speed head
+# - Batch size 48→32 to accommodate larger backbone memory
+# - Total model params: ~4.6M (was ~254K = 18× increase)
+# Expected: Val MAE < 2.0, training time ~12-15h on T4
 # ============================================================================

@@ -297,6 +297,7 @@ class WaypointCarlaDataset(Dataset):
                         "recovery_flag": recovery_flag,
                         "row_idx": int(row_idx),
                         "camera_type": camera_type,
+                        "speed": float(row.get("speed", 0.0)),
                     }
                 )
                 self.recovery_flags.append(int(recovery_flag))
@@ -378,6 +379,8 @@ class WaypointCarlaDataset(Dataset):
         waypoints = np.asarray(sample["waypoints"], dtype=np.float32).copy()
         command = int(sample["command"])
         recovery_flag = float(sample["recovery_flag"])
+        speed = float(sample["speed"])
+        speed_tensor = torch.tensor(speed / 120.0, dtype=torch.float32)
 
         images = []
         do_flip = self.is_training and random.random() > 0.5
@@ -434,4 +437,4 @@ class WaypointCarlaDataset(Dataset):
         command_tensor = torch.tensor(command, dtype=torch.long)
         recovery_tensor = torch.tensor(recovery_flag, dtype=torch.float32)
 
-        return stacked_tensor, waypoint_tensor, command_tensor, recovery_tensor
+        return stacked_tensor, waypoint_tensor, command_tensor, recovery_tensor, speed_tensor

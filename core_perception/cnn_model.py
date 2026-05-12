@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Mapping, Tuple
@@ -6,6 +6,11 @@ from typing import Any, Mapping, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    import torchvision.models as _tv_models
+except ImportError:  # pragma: no cover
+    _tv_models = None
 
 
 def unwrap_state_dict(checkpoint: Any) -> Mapping[str, Any]:
@@ -29,8 +34,12 @@ def unwrap_state_dict(checkpoint: Any) -> Mapping[str, Any]:
 
 def classify_checkpoint_state_dict(state_dict: Mapping[str, Any]) -> str:
     keys = {str(key) for key in state_dict.keys()}
-    if "stem.conv.weight" in keys or "film.embedding.weight" in keys or "head.4.weight" in keys:
+    # New RegNet-based waypoint predictor
+    if any(key.startswith("backbone_stage") for key in keys) or "waypoint_head.weight" in keys:
         return "waypoint"
+    # Legacy custom-backbone waypoint predictor
+    if "stem.conv.weight" in keys or "film.embedding.weight" in keys or "head.4.weight" in keys:
+        return "waypoint_legacy"
     if any(key.startswith("speed_branch.") for key in keys) or any(key.startswith("command_heads.") for key in keys):
         return "conditional_steering"
     if any(".running_mean" in key for key in keys):
@@ -44,25 +53,55 @@ def classify_checkpoint_state_dict(state_dict: Mapping[str, Any]) -> str:
 class WaypointScaling:
     """Hard-coded scaling factors for waypoint denormalization (meters)."""
 
-    x_scale: float = 30.0
-    y_scale: float = 10.0
+    x_scale: float = 50.0
+    y_scale: float = 15.0
     sigma_scale: float = 10.0
     sigma_eps: float = 1e-4
 
 
-class AggressiveStem(nn.Module):
-    """Aggressive stem to downsample early and save VRAM."""
-
+class PhysicsAwareStem(nn.Module):
+    """
+    Stem nhận thức Vật lý: Tách biệt Không gian (Shared Weights) và Động lực học (Frame Difference).
+    Input: [Batch, 9, H, W] (3 frame RGB)
+    """
     def __init__(self, in_channels: int = 9, out_channels: int = 32) -> None:
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=5, stride=2, padding=2)
+        # Xử lý đặc trưng Không gian (Nhìn cảnh vật) - Shared cho cả 3 frame
+        self.spatial_extractor = nn.Conv2d(
+            in_channels=3, out_channels=16, 
+            kernel_size=5, stride=2, padding=2
+        )
+        
+        # Xử lý đặc trưng Động học (Nhìn chuyển động qua phép trừ ảnh)
+        self.motion_extractor = nn.Conv2d(
+            in_channels=3, out_channels=8, 
+            kernel_size=5, stride=2, padding=2
+        )
+        
+        # Fuse: 3 frame (3*16) + 2 motion diff (2*8) = 48 + 16 = 64 channels
+        self.temporal_fuse = nn.Conv2d(64, out_channels, kernel_size=1, bias=False)
         self.bn = nn.BatchNorm2d(out_channels)
         self.act = nn.ELU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(x)
-        x = self.bn(x)
-        return self.act(x)
+        # Tách 3 frame (Mỗi frame 3 channels)
+        f1, f2, f3 = x[:, :3], x[:, 3:6], x[:, 6:]
+        
+        # Tính Optical Flow Proxy (Vận tốc và Gia tốc)
+        diff_12 = f2 - f1
+        diff_23 = f3 - f2
+        
+        # Trích xuất đặc trưng (Shared weights)
+        feat_f1 = self.spatial_extractor(f1)
+        feat_f2 = self.spatial_extractor(f2)
+        feat_f3 = self.spatial_extractor(f3)
+        
+        feat_d12 = self.motion_extractor(diff_12)
+        feat_d23 = self.motion_extractor(diff_23)
+        
+        # Ghép nối và Fuse
+        fused = torch.cat([feat_f1, feat_f2, feat_f3, feat_d12, feat_d23], dim=1)
+        return self.act(self.bn(self.temporal_fuse(fused)))
 
 
 class DepthwiseBlock(nn.Module):
@@ -146,7 +185,7 @@ class FiLM(nn.Module):
         super().__init__()
         self.embedding = nn.Embedding(num_embeddings=num_commands, embedding_dim=emb_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(emb_dim, emb_dim),
+            nn.Linear(emb_dim + 1, emb_dim),
             nn.ReLU(inplace=True),
             nn.Linear(emb_dim, channels * 2),
         )
@@ -160,9 +199,11 @@ class FiLM(nn.Module):
             self.mlp[-1].bias[: self.channels].fill_(1.0)
             self.mlp[-1].bias[self.channels :].fill_(0.0)
 
-    def forward(self, x: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, command: torch.Tensor, speed: torch.Tensor) -> torch.Tensor:
         emb = self.embedding(command)
-        gamma_beta = self.mlp(emb)
+        speed = speed.view(-1, 1)
+        condition = torch.cat([emb, speed], dim=1)
+        gamma_beta = self.mlp(condition)
         gamma, beta = torch.split(gamma_beta, self.channels, dim=1)
         gamma = gamma.view(-1, self.channels, 1, 1)
         beta = beta.view(-1, self.channels, 1, 1)
@@ -195,65 +236,170 @@ class FPN(nn.Module):
 
 
 class WaypointPredictor(nn.Module):
-    """Spatial-Temporal Waypoint Predictor with CBAM + FiLM + FPN."""
+    """Spatial-Temporal Waypoint Predictor with RegNetY-400MF + CBAM + FiLM + FPN.
 
-    def __init__(self, scaling: WaypointScaling | None = None) -> None:
+    Architecture:
+        Input [B, 9, 66, 200]  (3 temporal YUV frames)
+          -> PhysicsAwareStem       -> [B, 32, 33, 100]  (temporal + motion features)
+          -> Adapter                -> [B, 32, 33, 100]  (bridge to RegNet trunk)
+          -> RegNetY-400MF stages   -> 48 / 104 / 208 / 440 channels
+          -> CBAM(440) + FiLM(cmd, speed, 440)
+          -> FPN(104, 208, 440 -> 128) + sum fusion
+          -> Shared FC features (128-d)
+          -> Waypoint head: 15 values (10 coords + 5 sigma)
+          -> Speed head: 1 value (normalized speed prediction)
+
+    Output: [B, 16]  where [:10]=waypoints, [10:15]=sigma, [15:16]=speed_pred
+    """
+
+    # RegNetY-400MF stage output channels (from torchvision)
+    _REGNET_CHANNELS: Tuple[int, int, int, int] = (48, 104, 208, 440)
+
+    def __init__(
+        self,
+        scaling: WaypointScaling | None = None,
+        pretrained_backbone: bool = True,
+    ) -> None:
         super().__init__()
         self.scaling = scaling or WaypointScaling()
-        self.stem = AggressiveStem(in_channels=9, out_channels=32)
 
-        self.block1 = DepthwiseBlock(32, 64, stride=2)
-        self.block2 = DepthwiseBlock(64, 128, stride=2)
-        self.block3 = DepthwiseBlock(128, 256, stride=2)
+        # ── Temporal pre-processor (kept from original design) ──
+        self.stem = PhysicsAwareStem(in_channels=9, out_channels=32)
 
-        self.cbam = CBAM(256)
-        self.film = FiLM(num_commands=4, emb_dim=64, channels=256)
+        # ── Adapter: bridge stem output to RegNet trunk input ──
+        # RegNet stem normally outputs 32ch; we skip it and feed our
+        # 32ch temporal features directly into the trunk stages.
+        self.adapter = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
 
-        self.fpn = FPN(in_channels=(64, 128, 256), out_channels=128)
-        self.head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(128, 128),
+        # ── RegNetY-400MF backbone (pretrained, stem skipped) ──
+        self._init_backbone(pretrained_backbone)
+
+        c1, c2, c3, c4 = self._REGNET_CHANNELS  # 48, 104, 208, 440
+
+        # ── Attention & Conditioning on deepest features ──
+        self.cbam = CBAM(c4)
+        self.film = FiLM(num_commands=4, emb_dim=64, channels=c4)
+
+        # ── Multi-scale Feature Pyramid ──
+        self.fpn = FPN(in_channels=(c2, c3, c4), out_channels=128)
+
+        # ── Shared feature extractor ──
+        self.shared_features = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
             nn.ELU(inplace=True),
-            nn.Linear(128, 15),
+            nn.AdaptiveAvgPool2d((2, 4)),
+            nn.Flatten(),
+            nn.Linear(512, 128),
+            nn.ELU(inplace=True),
+            nn.Dropout(p=0.3),
         )
 
-        self._init_weights()
+        # ── Waypoint + Uncertainty head ──
+        self.waypoint_head = nn.Linear(128, 15)
 
-    def _init_weights(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-    def forward(self, x: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
-        x = x.to(memory_format=torch.channels_last)
-        p2 = self.stem(x)
-        p3 = self.block1(p2)
-        p4 = self.block2(p3)
-        p5 = self.block3(p4)
-
-        p5 = self.cbam(p5)
-        p5 = self.film(p5, command)
-
-        f3, f4, f5 = self.fpn(p3, p4, p5)
-        fused = f3 + F.interpolate(f4, size=f3.shape[-2:], mode="nearest") + F.interpolate(
-            f5,
-            size=f3.shape[-2:],
-            mode="nearest",
+        # ── Speed prediction head (auxiliary, CILRS-style regularizer) ──
+        self.speed_head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.3),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
         )
 
-        out = self.head(fused)
-        coords = torch.tanh(out[:, :10])
-        sigma = F.softplus(out[:, 10:])
+        self._init_non_backbone_weights()
+
+    def _init_backbone(self, pretrained: bool) -> None:
+        """Load RegNetY-400MF trunk stages from torchvision."""
+        if _tv_models is None:
+            raise ImportError(
+                "torchvision is required for WaypointPredictor. "
+                "Install with: pip install torchvision"
+            )
+        weights = (
+            _tv_models.RegNet_Y_400MF_Weights.IMAGENET1K_V2
+            if pretrained
+            else None
+        )
+        _regnet = _tv_models.regnet_y_400mf(weights=weights)
+        # Extract trunk stages, skip stem (we use PhysicsAwareStem instead)
+        # and skip fc classifier (we use our own heads).
+        self.backbone_stage1 = _regnet.trunk_output.block1  # 32->48, stride 2
+        self.backbone_stage2 = _regnet.trunk_output.block2  # 48->104, stride 2
+        self.backbone_stage3 = _regnet.trunk_output.block3  # 104->208, stride 2
+        self.backbone_stage4 = _regnet.trunk_output.block4  # 208->440, stride 2
+        del _regnet
+
+    def _init_non_backbone_weights(self) -> None:
+        """Initialize only non-backbone weights; backbone keeps pretrained."""
+        for parent in (
+            self.stem, self.adapter, self.cbam, self.film,
+            self.fpn, self.shared_features, self.waypoint_head, self.speed_head,
+        ):
+            for module in parent.modules():
+                if isinstance(module, nn.Conv2d):
+                    nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+                elif isinstance(module, nn.BatchNorm2d):
+                    nn.init.ones_(module.weight)
+                    nn.init.zeros_(module.bias)
+                elif isinstance(module, nn.Linear):
+                    nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
+    def get_backbone_params(self) -> list[nn.Parameter]:
+        """Return backbone parameters (for differential learning rate)."""
+        params: list[nn.Parameter] = []
+        for stage in (
+            self.backbone_stage1, self.backbone_stage2,
+            self.backbone_stage3, self.backbone_stage4,
+        ):
+            params.extend(stage.parameters())
+        return params
+
+    def get_non_backbone_params(self) -> list[nn.Parameter]:
+        """Return non-backbone parameters."""
+        backbone_ids = {id(p) for p in self.get_backbone_params()}
+        return [p for p in self.parameters() if id(p) not in backbone_ids]
+
+    def forward(
+        self, x: torch.Tensor, command: torch.Tensor, speed: torch.Tensor,
+    ) -> torch.Tensor:
+        # ── Temporal pre-processing ──
+        p2 = self.stem(x)             # [B, 32, H/2, W/2]
+        p2 = self.adapter(p2)         # [B, 32, H/2, W/2]
+
+        # ── RegNet backbone stages ──
+        s1 = self.backbone_stage1(p2)  # [B, 48,  ...]
+        s2 = self.backbone_stage2(s1)  # [B, 104, ...]
+        s3 = self.backbone_stage3(s2)  # [B, 208, ...]
+        s4 = self.backbone_stage4(s3)  # [B, 440, ...]
+
+        # ── Attention + Conditioning on deepest features ──
+        s4 = self.cbam(s4)
+        s4 = self.film(s4, command, speed)
+
+        # ── FPN multi-scale fusion ──
+        f3, f4, f5 = self.fpn(s2, s3, s4)
+        fused = (
+            f3
+            + F.interpolate(f4, size=f3.shape[-2:], mode="nearest")
+            + F.interpolate(f5, size=f3.shape[-2:], mode="nearest")
+        )
+
+        # ── Shared features ──
+        features = self.shared_features(fused)  # [B, 128]
+
+        # ── Waypoint + Uncertainty output ──
+        wp_out = self.waypoint_head(features)    # [B, 15]
+        coords = torch.tanh(wp_out[:, :10])
+        sigma = F.softplus(wp_out[:, 10:15])
 
         coords_view = coords.view(-1, 5, 2)
         x_scaled = coords_view[..., 0] * self.scaling.x_scale
@@ -261,7 +407,11 @@ class WaypointPredictor(nn.Module):
         coords = torch.stack([x_scaled, y_scaled], dim=-1).view(-1, 10)
 
         sigma = sigma * self.scaling.sigma_scale + self.scaling.sigma_eps
-        return torch.cat([coords, sigma], dim=1)
+
+        # ── Speed prediction (auxiliary) ──
+        speed_pred = self.speed_head(features)   # [B, 1]
+
+        return torch.cat([coords, sigma, speed_pred], dim=1)  # [B, 16]
 
 
 class CIL_NvidiaCNN(WaypointPredictor):

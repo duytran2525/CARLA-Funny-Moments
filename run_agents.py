@@ -3592,7 +3592,7 @@ class CILAgent(BaseAgent):
         checkpoint = torch.load(model_path, map_location=self._device)
         state_dict = unwrap_state_dict(checkpoint)
         model_kind = classify_checkpoint_state_dict(state_dict)
-        if model_kind != "waypoint":
+        if model_kind not in ("waypoint", "waypoint_legacy"):
             raise RuntimeError(
                 f"Incompatible CIL checkpoint '{model_path.name}' detected as '{model_kind}'. "
                 "Train or provide a waypoint predictor checkpoint such as models/waypoint_predictor.pth."
@@ -3892,21 +3892,24 @@ class CILAgent(BaseAgent):
 
         command_idx = max(0, min(3, int(command)))
         command_tensor = torch.tensor([command_idx], dtype=torch.long)
+        speed_norm = clamp(speed_kmh / 120.0, 0.0, 1.0)
+        speed_tensor = torch.tensor([speed_norm], dtype=torch.float32)
 
         image_tensor = image_tensor.to(self._device, non_blocking=True)
         command_tensor = command_tensor.to(self._device, non_blocking=True)
+        speed_tensor = speed_tensor.to(self._device, non_blocking=True)
 
         with torch.inference_mode():
-            predictions = self._model(image_tensor, command_tensor)
+            predictions = self._model(image_tensor, command_tensor, speed_tensor)
 
         if torch.is_tensor(predictions):
             pred_tensor = predictions.detach().squeeze(0).cpu().float().numpy()
-            if pred_tensor.shape[0] == 15:
+            if pred_tensor.shape[0] >= 15:
                 wp_array = pred_tensor[:10].reshape(5, 2)
-                mean_uncertainty = float(np.mean(pred_tensor[10:]))
+                mean_uncertainty = float(np.mean(pred_tensor[10:15]))
             else:
                 logging.error(
-                    "Shape Model Output bị sai: %s (Kỳ vọng: 15). Dùng Zeros.",
+                    "Shape Model Output bị sai: %s (Kỳ vọng: >=15). Dùng Zeros.",
                     pred_tensor.shape,
                 )
                 wp_array = np.zeros((5, 2), dtype=np.float32)
