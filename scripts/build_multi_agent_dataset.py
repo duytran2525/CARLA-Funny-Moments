@@ -42,8 +42,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=2, help="Sliding window stride in frames.")
     parser.add_argument("--dt", type=float, default=0.1, help="Expected sampling dt in seconds.")
     parser.add_argument("--max-dt-error", type=float, default=0.03)
-    parser.add_argument("--adjacency-radius-m", type=float, default=15.0)
+    parser.add_argument("--adjacency-radius-m", type=float, default=40.0)
     parser.add_argument("--min-agents", type=int, default=1)
+    parser.add_argument(
+        "--max-step-m",
+        type=float,
+        default=6.0,
+        help="Max per-agent displacement (metres) between consecutive frames; agents that exceed this are filtered out.",
+    )
+    parser.add_argument(
+        "--min-valid-ratio",
+        type=float,
+        default=0.5,
+        help="Minimum fraction of valid history frames an agent must retain after teleportation filtering.",
+    )
     parser.add_argument(
         "--allow-missing",
         action="store_true",
@@ -93,6 +105,8 @@ def main() -> int:
         min_agents=max(1, int(args.min_agents)),
         expected_dt=float(args.dt),
         max_dt_error=float(args.max_dt_error),
+        max_step_m=float(args.max_step_m),
+        min_valid_ratio=float(args.min_valid_ratio),
     )
 
     frames = read_raw_frames(raw_csv)
@@ -131,6 +145,8 @@ def main() -> int:
             "min_agents": config.min_agents,
             "expected_dt": config.expected_dt,
             "max_dt_error": config.max_dt_error,
+            "max_step_m": config.max_step_m,
+            "min_valid_ratio": config.min_valid_ratio,
         },
     }
     (out_dir / "build_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
