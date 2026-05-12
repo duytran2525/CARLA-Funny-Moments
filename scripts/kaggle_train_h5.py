@@ -377,7 +377,7 @@ class WaypointCarlaDatasetH5(Dataset):
         waypoints = sample["waypoints"].copy()
         command = int(sample["command"])
         recovery = float(sample["recovery_flag"])
-        speed_norm = float(sample.get("speed_kmh", 0.0)) / 120.0  # normalize to [0, 1]
+        speed_norm = min(float(sample.get("speed_kmh", 0.0)), 120.0) / 120.0  # clamp + normalize to [0, 1]
 
         # ── Augmentation decisions ──
         do_flip = self.is_training and random.random() > 0.5
@@ -652,8 +652,9 @@ def main():
         # Linear LR warmup
         if epoch < warmup_epochs:
             warmup_lr = base_lr * (epoch + 1) / max(1, warmup_epochs)
-            for pg in optimizer.param_groups:
-                pg["lr"] = warmup_lr * (backbone_lr_ratio if pg is optimizer.param_groups[1] else 1.0)
+            for idx, pg in enumerate(optimizer.param_groups):
+                scale = backbone_lr_ratio if idx == 1 else 1.0
+                pg["lr"] = warmup_lr * scale
 
         # ── TRAIN ──
         model.train()
@@ -670,8 +671,8 @@ def main():
                 pred_wp = out[:, :10].view(-1, 5, 2)
                 tgt_wp = wps.view(-1, 5, 2)
                 loss_wp = huber(pred_wp, tgt_wp)
-                pred_sig = out[:, 10:15].view(-1, 5, 1).expand(-1, 5, 2).clamp(sigma_min, sigma_max)
-                pred_var = pred_sig.pow(2)
+                pred_sig = out[:, 10:15].view(-1, 5, 1).expand(-1, 5, 2)
+                pred_var = pred_sig.pow(2).clamp(sigma_min**2, sigma_max**2)
                 loss_gnll = 0.5 * ((tgt_wp - pred_wp)**2 / pred_var + torch.log(pred_var))
 
                 vel = pred_wp[:, 1:] - pred_wp[:, :-1]
@@ -758,10 +759,10 @@ def main():
                 with torch.amp.autocast("cuda" if use_amp else "cpu", enabled=use_amp):
                     out = model(imgs, cmds, speeds)
                     pred_wp = out[:, :10].view(-1, 5, 2)
-                    pred_sig = out[:, 10:15].view(-1, 5, 1).expand(-1, 5, 2).clamp(sigma_min, sigma_max)
+                    pred_sig = out[:, 10:15].view(-1, 5, 1).expand(-1, 5, 2)
                     tgt_wp = wps.view(-1, 5, 2)
                     loss_wp = huber(pred_wp, tgt_wp)
-                    pred_var = pred_sig.pow(2)
+                    pred_var = pred_sig.pow(2).clamp(sigma_min**2, sigma_max**2)
                     loss_g = 0.5 * ((tgt_wp - pred_wp) ** 2 / pred_var + torch.log(pred_var))
 
                     vel = pred_wp[:, 1:] - pred_wp[:, :-1]

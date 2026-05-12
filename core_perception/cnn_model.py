@@ -282,7 +282,7 @@ class WaypointPredictor(nn.Module):
 
         # ── Attention & Conditioning on deepest features ──
         self.cbam = CBAM(c4)
-        self.film = FiLM(num_commands=4, emb_dim=64, channels=c4)
+        self.film = FiLM(num_commands=4, emb_dim=128, channels=c4)
 
         # ── Multi-scale Feature Pyramid ──
         self.fpn = FPN(in_channels=(c2, c3, c4), out_channels=128)
