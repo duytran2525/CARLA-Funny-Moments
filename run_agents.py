@@ -5315,8 +5315,11 @@ class YoloDetectAgent(BaseAgent):
             "gt_occlusion_filter": {
                 "enabled": bool(self._depth_camera is not None),
                 "method": "projected_3d_bbox_visible_area_plus_depth_map",
-                "min_visible_area_ratio": 0.20,
+                "min_visible_area_ratio": 0.35,
                 "min_depth_visible_ratio": 0.20,
+                "max_gt_distance_m": 50.0,
+                "min_gt_bbox_dim_px": 10,
+                "min_gt_bbox_area_px": 400,
             },
             "tracking_metrics_dir": str(self._tracking_metrics_dir) if self._tracking_metrics_dir is not None else "",
             "predictions_path": str(self._tracking_predictions_path) if self._tracking_predictions_path is not None else "",
@@ -5504,6 +5507,27 @@ class YoloDetectAgent(BaseAgent):
         except Exception:
             return
 
+        # ── GT quality filters ──────────────────────────────────────
+        # Only include actors within reasonable camera detection range.
+        # Objects beyond this distance produce tiny bboxes (< 10px) that
+        # no detector can realistically identify.
+        MAX_GT_DISTANCE_M = 50.0
+        # Minimum projected bbox dimensions (pixels).  Objects smaller
+        # than this are invisible to any trained detector.
+        MIN_GT_BBOX_DIM = 10
+        # Minimum projected bbox area (pixels²).
+        MIN_GT_BBOX_AREA = 400
+        # Minimum fraction of the raw 3D projection that must be visible
+        # inside the image frame.  Tightened from 0.20 to 0.35 to
+        # reduce phantom GT from 3D → 2D projection artifacts.
+        MIN_VISIBLE_AREA_RATIO = 0.35
+        # ────────────────────────────────────────────────────────────
+
+        try:
+            ego_location = ego_vehicle.get_location()
+        except Exception:
+            ego_location = None
+
         for actor in actors:
             try:
                 actor_id = int(actor.id)
@@ -5515,6 +5539,16 @@ class YoloDetectAgent(BaseAgent):
             class_name = self._infer_gt_class_name(actor)
             if class_name is None:
                 continue
+
+            # ── Distance filter: skip actors beyond effective camera range ──
+            if ego_location is not None:
+                try:
+                    actor_location = actor.get_location()
+                    distance = ego_location.distance(actor_location)
+                    if distance > MAX_GT_DISTANCE_M:
+                        continue
+                except Exception:
+                    pass
 
             bbox_3d = getattr(actor, "bounding_box", None)
             if bbox_3d is None:
@@ -5565,11 +5599,17 @@ class YoloDetectAgent(BaseAgent):
             y2 = min(float(image_h - 1), raw_y2)
             width = max(0.0, x2 - x1)
             height = max(0.0, y2 - y1)
-            if width < 1.0 or height < 1.0:
+
+            # ── Minimum bbox dimension filter ──
+            if width < MIN_GT_BBOX_DIM or height < MIN_GT_BBOX_DIM:
                 continue
+            # ── Minimum bbox area filter ──
+            if width * height < MIN_GT_BBOX_AREA:
+                continue
+
             if raw_area > 1.0:
                 visible_area_ratio = (width * height) / raw_area
-                if visible_area_ratio < 0.20:
+                if visible_area_ratio < MIN_VISIBLE_AREA_RATIO:
                     continue
 
             depth_visibility = self._projected_depth_visibility_ratio(
