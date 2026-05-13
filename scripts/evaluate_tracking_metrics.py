@@ -490,8 +490,18 @@ def _compute_hota(
 def compute_simple_tracking_metrics(
     predictions_txt: Path,
     ground_truth_txt: Path,
-    iou_threshold: float = 0.5,
+    iou_threshold: float = 0.3,
 ) -> dict:
+    """Compute tracking metrics using greedy IoU matching.
+
+    The default ``iou_threshold`` is 0.3 (not the MOTChallenge standard 0.5)
+    because CARLA ground-truth bounding boxes are generated via 3D→2D
+    projection of the actor's full 3D bounding box.  This projection
+    produces bboxes that are systematically larger/different than a 2D
+    detector's output, resulting in structurally lower IoU even when both
+    see the same object.  0.3 compensates for this domain gap while still
+    rejecting clearly wrong matches.
+    """
     predictions = _read_mot_txt(predictions_txt)
     ground_truth = _read_mot_txt(ground_truth_txt)
 
@@ -876,7 +886,7 @@ def main() -> int:
     parser.add_argument("--tracker-name", default="BoTSORT", help="Tracker name used in TrackEval.")
     parser.add_argument("--benchmark", default="CARLA_MOT", help="Benchmark folder name for TrackEval.")
     parser.add_argument("--seqinfo", default="", help="Optional seqinfo.ini path.")
-    parser.add_argument("--iou-threshold", type=float, default=0.5, help="IoU threshold for built-in simple metrics.")
+    parser.add_argument("--iou-threshold", type=float, default=0.3, help="IoU threshold for built-in simple metrics (default 0.3 for 3D-projected GT).")
     parser.add_argument(
         "--prepare-only",
         action="store_true",

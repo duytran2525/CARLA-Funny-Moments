@@ -5392,6 +5392,9 @@ class YoloDetectAgent(BaseAgent):
             # Includes both generic tokens and known CARLA vehicle brand names
             # for bicycles (diamondback, gazelle, bh, crossbike) and
             # motorcycles (vespa, yamaha, harley, kawasaki).
+            # Model-specific names (yzf, ninja, zx125, low_rider, century,
+            # omafiets) are also listed explicitly for self-documentation
+            # even though the brand tokens already cover them.
             two_wheel_tokens = (
                 "bike",
                 "bicycle",
@@ -5406,6 +5409,13 @@ class YoloDetectAgent(BaseAgent):
                 "bh",
                 "crossbike",
                 "cyclist",
+                # Explicit CARLA model names (redundant but self-documenting)
+                "yzf",          # vehicle.yamaha.yzf
+                "ninja",        # vehicle.kawasaki.ninja
+                "zx125",        # vehicle.vespa.zx125
+                "low_rider",    # vehicle.harley-davidson.low_rider
+                "century",      # vehicle.diamondback.century
+                "omafiets",     # vehicle.gazelle.omafiets
             )
             if any(token in type_id for token in two_wheel_tokens):
                 return "two_wheeler"
@@ -5508,19 +5518,26 @@ class YoloDetectAgent(BaseAgent):
             return
 
         # ── GT quality filters ──────────────────────────────────────
-        # Only include actors within reasonable camera detection range.
-        # Objects beyond this distance produce tiny bboxes (< 10px) that
-        # no detector can realistically identify.
-        MAX_GT_DISTANCE_M = 50.0
+        # Only include actors within the effective camera detection range.
+        # Reduced from 50m to 40m because 3D→2D projected bboxes for
+        # objects at 40-50m are unreliably small and create false
+        # negatives when the detector can barely see them.
+        MAX_GT_DISTANCE_M = 40.0
         # Minimum projected bbox dimensions (pixels).  Objects smaller
         # than this are invisible to any trained detector.
         MIN_GT_BBOX_DIM = 10
-        # Minimum projected bbox area (pixels²).
-        MIN_GT_BBOX_AREA = 400
+        # Minimum projected bbox area (pixels²).  Tightened from 400 to
+        # 600 to filter tiny GT that detectors cannot reliably match.
+        MIN_GT_BBOX_AREA = 600
         # Minimum fraction of the raw 3D projection that must be visible
-        # inside the image frame.  Tightened from 0.20 to 0.35 to
-        # reduce phantom GT from 3D → 2D projection artifacts.
-        MIN_VISIBLE_AREA_RATIO = 0.35
+        # inside the image frame.  Tightened from 0.35 to 0.50 to
+        # reduce phantom GT from 3D → 2D projection artifacts where
+        # most of the 3D bbox is off-screen.
+        MIN_VISIBLE_AREA_RATIO = 0.50
+        # Maximum bbox aspect ratio (width/height or height/width).
+        # 3D projections of objects viewed at extreme angles can produce
+        # very elongated bboxes that no 2D detector would generate.
+        MAX_GT_BBOX_ASPECT_RATIO = 6.0
         # ────────────────────────────────────────────────────────────
 
         try:
@@ -5605,6 +5622,15 @@ class YoloDetectAgent(BaseAgent):
                 continue
             # ── Minimum bbox area filter ──
             if width * height < MIN_GT_BBOX_AREA:
+                continue
+            # ── Aspect ratio filter: reject extreme 3D projection artifacts ──
+            aspect = max(width, height) / max(min(width, height), 1.0)
+            if aspect > MAX_GT_BBOX_ASPECT_RATIO:
+                continue
+            # ── Center-point visibility: reject GT whose center is off-screen ──
+            cx = x1 + width / 2.0
+            cy = y1 + height / 2.0
+            if cx < 0.0 or cx >= float(image_w) or cy < 0.0 or cy >= float(image_h):
                 continue
 
             if raw_area > 1.0:

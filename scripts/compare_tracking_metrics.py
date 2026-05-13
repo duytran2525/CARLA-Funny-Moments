@@ -282,7 +282,7 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
-def load_tracking_run(source: Path, name: str, iou_threshold: float = 0.5) -> Dict[str, Any]:
+def load_tracking_run(source: Path, name: str, iou_threshold: float = 0.3) -> Dict[str, Any]:
     source = source.resolve()
     if source.is_file():
         metrics = _read_summary_csv(source)
@@ -559,8 +559,8 @@ def main() -> int:
     parser.add_argument(
         "--iou-threshold",
         type=float,
-        default=0.5,
-        help="IoU threshold used only when a raw metrics dir has no summary CSV yet.",
+        default=0.3,
+        help="IoU threshold used only when a raw metrics dir has no summary CSV yet (default 0.3 for 3D-projected GT).",
     )
     args = parser.parse_args()
 
