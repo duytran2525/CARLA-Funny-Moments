@@ -52,7 +52,7 @@ early_stopping_patience: 6       # 6 epochs patience (enough for 25 total epochs
 # ── Reproducibility & I/O ──
 seed: 42
 model_save_path: models/waypoint_predictor.pth
-# resume_checkpoint: "/kaggle/input/model-checkpoint/waypoint_predictor_h5.pth"
+resume_checkpoint: "/kaggle/input/datasets/yudtrann/model1/waypoint_predictor_h5.pth"
 num_workers: 4
 prefetch_factor: 4
 log_every_batches: 200
