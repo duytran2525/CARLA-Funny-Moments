@@ -75,11 +75,13 @@ class WindowBuildConfig:
     history_frames: int = 20
     future_frames: int = 30
     stride: int = 2
-    adjacency_radius_m: float = 15.0
+    adjacency_radius_m: float = 40.0
     require_complete_tracks: bool = True
     min_agents: int = 1
     expected_dt: float = 0.1
     max_dt_error: float = 0.03
+    max_step_m: float = 6.0
+    min_valid_ratio: float = 0.5
 
 
 def write_raw_header(csv_path: Path) -> None:
@@ -195,14 +197,19 @@ def actor_feature_in_anchor_frame(actor: ActorState, anchor_ego: EgoState) -> tu
     rel_vy = float(actor.vy) - float(anchor_ego.vy)
     local_vx, local_vy = rotate_global_to_ego_forward_y(rel_vx, rel_vy, anchor_ego.yaw)
 
-    rel_yaw = normalize_angle_rad(math.radians(float(actor.yaw) - float(anchor_ego.yaw)))
+    # Rotate the actor's global heading unit vector through the SAME transform
+    # used for positions and velocities, ensuring geometric consistency.
+    actor_yaw_rad = math.radians(float(actor.yaw))
+    heading_x, heading_y = rotate_global_to_ego_forward_y(
+        math.cos(actor_yaw_rad), math.sin(actor_yaw_rad), anchor_ego.yaw
+    )
     return (
         local_x,
         local_y,
         local_vx,
         local_vy,
-        math.cos(rel_yaw),
-        math.sin(rel_yaw),
+        heading_x,
+        heading_y,
     )
 
 
@@ -254,6 +261,62 @@ def _build_adjacency(anchor_positions: Any, adjacency_radius_m: float) -> Any:
     return adjacency
 
 
+def _filter_teleportation(
+    x: Any,
+    x_mask: Any,
+    y: Any,
+    y_mask: Any,
+    max_step_m: float,
+) -> None:
+    """Invalidate agent frames where consecutive-frame displacement exceeds *max_step_m*.
+
+    CARLA may recycle actor IDs: a destroyed NPC's ID can be reused by a newly
+    spawned vehicle.  When this happens inside a sliding window the pipeline
+    silently joins two unrelated trajectories, producing 40-50 m jumps in a
+    single 0.1 s timestep.  This function detects those jumps and zeros out
+    everything from the first violation onward so downstream code never sees
+    physically impossible motion.
+    """
+    n_agents = int(x.shape[0])
+    history_len = int(x.shape[1])
+    future_len = int(y.shape[1])
+    threshold = float(max_step_m)
+
+    for agent_idx in range(n_agents):
+        # --- history X ---
+        for t in range(1, history_len):
+            if not (x_mask[agent_idx, t] and x_mask[agent_idx, t - 1]):
+                continue
+            dx = float(x[agent_idx, t, 0] - x[agent_idx, t - 1, 0])
+            dy = float(x[agent_idx, t, 1] - x[agent_idx, t - 1, 1])
+            if math.hypot(dx, dy) > threshold:
+                x_mask[agent_idx, t:] = False
+                x[agent_idx, t:] = 0.0
+                break
+
+        # --- future Y ---
+        # Check continuity between last valid history position and first future position,
+        # then between consecutive future positions.
+        last_hist_pos = None
+        for t in range(history_len - 1, -1, -1):
+            if x_mask[agent_idx, t]:
+                last_hist_pos = (float(x[agent_idx, t, 0]), float(x[agent_idx, t, 1]))
+                break
+
+        for t in range(future_len):
+            if not y_mask[agent_idx, t]:
+                continue
+            cur_pos = (float(y[agent_idx, t, 0]), float(y[agent_idx, t, 1]))
+            if last_hist_pos is not None:
+                dx = cur_pos[0] - last_hist_pos[0]
+                dy = cur_pos[1] - last_hist_pos[1]
+                if math.hypot(dx, dy) > threshold:
+                    y_mask[agent_idx, t:] = False
+                    y[agent_idx, t:] = 0.0
+                    break
+            last_hist_pos = cur_pos
+
+
 def build_window_sample(
     history: Sequence[FrameData],
     future: Sequence[FrameData],
@@ -300,6 +363,40 @@ def build_window_sample(
                 dtype=np.float32,
             )
             y_mask[agent_idx, fut_idx] = True
+
+    # --- Teleportation filter: reject physically impossible jumps ----------
+    _filter_teleportation(x, x_mask, y, y_mask, max_step_m=float(config.max_step_m))
+
+    # --- Drop agents that lost too many frames after filtering -------------
+    min_valid_history = max(1, int(history_len * float(config.min_valid_ratio)))
+    keep_mask = np.array(
+        [int(x_mask[i].sum()) >= min_valid_history for i in range(n_agents)],
+        dtype=np.bool_,
+    )
+    if int(keep_mask.sum()) < n_agents:
+        keep_indices = np.where(keep_mask)[0]
+        if len(keep_indices) == 0:
+            # All agents filtered out – return empty sample that caller can skip
+            return {
+                "x": np.zeros((0, history_len, 6), dtype=np.float32),
+                "y": np.zeros((0, future_len, 2), dtype=np.float32),
+                "adj": np.zeros((0, 0), dtype=np.float32),
+                "x_mask": np.zeros((0, history_len), dtype=np.bool_),
+                "y_mask": np.zeros((0, future_len), dtype=np.bool_),
+                "actor_ids": np.array([], dtype=np.int64),
+                "anchor_frame": int(anchor.frame),
+                "anchor_timestamp": float(anchor.timestamp),
+                "town": str(anchor.town),
+                "run_id": str(anchor.run_id),
+                "ego_pose": np.asarray([anchor.ego.x, anchor.ego.y, anchor.ego.yaw], dtype=np.float32),
+            }
+        x = x[keep_indices]
+        y = y[keep_indices]
+        x_mask = x_mask[keep_indices]
+        y_mask = y_mask[keep_indices]
+        anchor_positions = anchor_positions[keep_indices]
+        actor_ids = [actor_ids[i] for i in keep_indices]
+        n_agents = len(actor_ids)
 
     return {
         "x": x,
@@ -351,15 +448,17 @@ def build_multi_agent_samples(
         if len(actor_ids) < int(config.min_agents):
             continue
 
-        samples.append(
-            build_window_sample(
-                history=history,
-                future=future,
-                anchor=anchor,
-                actor_ids=actor_ids,
-                config=config,
-            )
+        sample = build_window_sample(
+            history=history,
+            future=future,
+            anchor=anchor,
+            actor_ids=actor_ids,
+            config=config,
         )
+        # Skip samples where teleportation filtering removed all agents.
+        if int(sample["x"].shape[0]) < int(config.min_agents):
+            continue
+        samples.append(sample)
     return samples
 
 

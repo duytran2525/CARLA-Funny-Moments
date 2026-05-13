@@ -1794,6 +1794,7 @@ class LaneFollowAgent(BaseAgent):
 
         self._yolo_detector = YoloDetector(
             str(model_path),
+            display_classes=["pedestrian", "vehicle", "two_wheeler"],
             camera_fov_deg=self.config.camera_fov,
             obstacle_base_distance_m=8.0,
             camera_mount_x_m=1.5,
@@ -3592,7 +3593,7 @@ class CILAgent(BaseAgent):
         checkpoint = torch.load(model_path, map_location=self._device)
         state_dict = unwrap_state_dict(checkpoint)
         model_kind = classify_checkpoint_state_dict(state_dict)
-        if model_kind not in ("waypoint", "waypoint_legacy"):
+        if model_kind != "waypoint":
             raise RuntimeError(
                 f"Incompatible CIL checkpoint '{model_path.name}' detected as '{model_kind}'. "
                 "Train or provide a waypoint predictor checkpoint such as models/waypoint_predictor.pth."
@@ -3892,24 +3893,21 @@ class CILAgent(BaseAgent):
 
         command_idx = max(0, min(3, int(command)))
         command_tensor = torch.tensor([command_idx], dtype=torch.long)
-        speed_norm = clamp(speed_kmh / 120.0, 0.0, 1.0)
-        speed_tensor = torch.tensor([speed_norm], dtype=torch.float32)
 
         image_tensor = image_tensor.to(self._device, non_blocking=True)
         command_tensor = command_tensor.to(self._device, non_blocking=True)
-        speed_tensor = speed_tensor.to(self._device, non_blocking=True)
 
         with torch.inference_mode():
-            predictions = self._model(image_tensor, command_tensor, speed_tensor)
+            predictions = self._model(image_tensor, command_tensor)
 
         if torch.is_tensor(predictions):
             pred_tensor = predictions.detach().squeeze(0).cpu().float().numpy()
-            if pred_tensor.shape[0] >= 15:
+            if pred_tensor.shape[0] == 15:
                 wp_array = pred_tensor[:10].reshape(5, 2)
-                mean_uncertainty = float(np.mean(pred_tensor[10:15]))
+                mean_uncertainty = float(np.mean(pred_tensor[10:]))
             else:
                 logging.error(
-                    "Shape Model Output bị sai: %s (Kỳ vọng: >=15). Dùng Zeros.",
+                    "Shape Model Output bị sai: %s (Kỳ vọng: 15). Dùng Zeros.",
                     pred_tensor.shape,
                 )
                 wp_array = np.zeros((5, 2), dtype=np.float32)
@@ -4726,8 +4724,12 @@ class YoloDetectAgent(BaseAgent):
         elif model_path.suffix.lower() != ".engine":
             detector_imgsz = 448
 
+        # Restrict to CARLA-compatible classes that ground truth API can generate
+        carla_compatible_classes = ["pedestrian", "vehicle", "two_wheeler"]
+
         self._detector = YoloDetector(
             str(model_path),
+            display_classes=carla_compatible_classes,
             inference_imgsz=detector_imgsz,
             camera_fov_deg=self.config.camera_fov,
             obstacle_base_distance_m=8.0,
@@ -4742,6 +4744,7 @@ class YoloDetectAgent(BaseAgent):
         if secondary_tracker and secondary_tracker != str(self.config.yolo_tracker_config):
             self._secondary_detector = YoloDetector(
                 str(model_path),
+                display_classes=carla_compatible_classes,
                 inference_imgsz=detector_imgsz,
                 camera_fov_deg=self.config.camera_fov,
                 obstacle_base_distance_m=8.0,
@@ -4752,7 +4755,11 @@ class YoloDetectAgent(BaseAgent):
                 tracker_config=secondary_tracker,
                 enable_tracking_metrics_logging=True,
             )
-            logging.info("Secondary YOLO tracker enabled for same-sequence metrics: %s", secondary_tracker)
+            logging.info(
+                "Secondary YOLO tracker enabled for same-sequence metrics (%s), restricted to CARLA-compatible classes: %s",
+                secondary_tracker,
+                ", ".join(carla_compatible_classes),
+            )
         else:
             self._secondary_detector = None
         self._init_tracking_metrics_workspace(model_path)
@@ -4775,12 +4782,14 @@ class YoloDetectAgent(BaseAgent):
                     (time.perf_counter() - warmup_t0) * 1000.0,
                 )
         logging.info(
-            "YOLO runtime config: every_n_ticks=%d visualize=%s draw_overlay=%s imgsz=%s tracker=%s",
+            "YOLO runtime config: every_n_ticks=%d visualize=%s draw_overlay=%s imgsz=%s tracker=%s "
+            "classes_for_tracking_metrics=%s",
             int(self.config.yolo_inference_every_n_ticks),
             bool(self.config.yolo_visualize),
             bool(self.config.yolo_draw_overlay),
             detector_imgsz if detector_imgsz is not None else "engine-default",
             self.config.yolo_tracker_config,
+            "[" + ", ".join(carla_compatible_classes) + "]",
         )
         if TrafficSupervisor is None:
             logging.warning("TrafficSupervisor unavailable. yolo_detect will run without supervisor brake fusion.")
@@ -5306,8 +5315,11 @@ class YoloDetectAgent(BaseAgent):
             "gt_occlusion_filter": {
                 "enabled": bool(self._depth_camera is not None),
                 "method": "projected_3d_bbox_visible_area_plus_depth_map",
-                "min_visible_area_ratio": 0.20,
+                "min_visible_area_ratio": 0.35,
                 "min_depth_visible_ratio": 0.20,
+                "max_gt_distance_m": 50.0,
+                "min_gt_bbox_dim_px": 10,
+                "min_gt_bbox_area_px": 400,
             },
             "tracking_metrics_dir": str(self._tracking_metrics_dir) if self._tracking_metrics_dir is not None else "",
             "predictions_path": str(self._tracking_predictions_path) if self._tracking_predictions_path is not None else "",
@@ -5377,6 +5389,12 @@ class YoloDetectAgent(BaseAgent):
             return "pedestrian"
         if type_id.startswith("vehicle."):
             # Match detector's two_wheeler class for bikes/motorbikes.
+            # Includes both generic tokens and known CARLA vehicle brand names
+            # for bicycles (diamondback, gazelle, bh, crossbike) and
+            # motorcycles (vespa, yamaha, harley, kawasaki).
+            # Model-specific names (yzf, ninja, zx125, low_rider, century,
+            # omafiets) are also listed explicitly for self-documentation
+            # even though the brand tokens already cover them.
             two_wheel_tokens = (
                 "bike",
                 "bicycle",
@@ -5386,6 +5404,18 @@ class YoloDetectAgent(BaseAgent):
                 "yamaha",
                 "harley",
                 "kawasaki",
+                "diamondback",
+                "gazelle",
+                "bh",
+                "crossbike",
+                "cyclist",
+                # Explicit CARLA model names (redundant but self-documenting)
+                "yzf",          # vehicle.yamaha.yzf
+                "ninja",        # vehicle.kawasaki.ninja
+                "zx125",        # vehicle.vespa.zx125
+                "low_rider",    # vehicle.harley-davidson.low_rider
+                "century",      # vehicle.diamondback.century
+                "omafiets",     # vehicle.gazelle.omafiets
             )
             if any(token in type_id for token in two_wheel_tokens):
                 return "two_wheeler"
@@ -5487,6 +5517,34 @@ class YoloDetectAgent(BaseAgent):
         except Exception:
             return
 
+        # ── GT quality filters ──────────────────────────────────────
+        # Only include actors within the effective camera detection range.
+        # Reduced from 50m to 40m because 3D→2D projected bboxes for
+        # objects at 40-50m are unreliably small and create false
+        # negatives when the detector can barely see them.
+        MAX_GT_DISTANCE_M = 40.0
+        # Minimum projected bbox dimensions (pixels).  Objects smaller
+        # than this are invisible to any trained detector.
+        MIN_GT_BBOX_DIM = 10
+        # Minimum projected bbox area (pixels²).  Tightened from 400 to
+        # 600 to filter tiny GT that detectors cannot reliably match.
+        MIN_GT_BBOX_AREA = 600
+        # Minimum fraction of the raw 3D projection that must be visible
+        # inside the image frame.  Tightened from 0.35 to 0.50 to
+        # reduce phantom GT from 3D → 2D projection artifacts where
+        # most of the 3D bbox is off-screen.
+        MIN_VISIBLE_AREA_RATIO = 0.50
+        # Maximum bbox aspect ratio (width/height or height/width).
+        # 3D projections of objects viewed at extreme angles can produce
+        # very elongated bboxes that no 2D detector would generate.
+        MAX_GT_BBOX_ASPECT_RATIO = 6.0
+        # ────────────────────────────────────────────────────────────
+
+        try:
+            ego_location = ego_vehicle.get_location()
+        except Exception:
+            ego_location = None
+
         for actor in actors:
             try:
                 actor_id = int(actor.id)
@@ -5498,6 +5556,16 @@ class YoloDetectAgent(BaseAgent):
             class_name = self._infer_gt_class_name(actor)
             if class_name is None:
                 continue
+
+            # ── Distance filter: skip actors beyond effective camera range ──
+            if ego_location is not None:
+                try:
+                    actor_location = actor.get_location()
+                    distance = ego_location.distance(actor_location)
+                    if distance > MAX_GT_DISTANCE_M:
+                        continue
+                except Exception:
+                    pass
 
             bbox_3d = getattr(actor, "bounding_box", None)
             if bbox_3d is None:
@@ -5548,11 +5616,26 @@ class YoloDetectAgent(BaseAgent):
             y2 = min(float(image_h - 1), raw_y2)
             width = max(0.0, x2 - x1)
             height = max(0.0, y2 - y1)
-            if width < 1.0 or height < 1.0:
+
+            # ── Minimum bbox dimension filter ──
+            if width < MIN_GT_BBOX_DIM or height < MIN_GT_BBOX_DIM:
                 continue
+            # ── Minimum bbox area filter ──
+            if width * height < MIN_GT_BBOX_AREA:
+                continue
+            # ── Aspect ratio filter: reject extreme 3D projection artifacts ──
+            aspect = max(width, height) / max(min(width, height), 1.0)
+            if aspect > MAX_GT_BBOX_ASPECT_RATIO:
+                continue
+            # ── Center-point visibility: reject GT whose center is off-screen ──
+            cx = x1 + width / 2.0
+            cy = y1 + height / 2.0
+            if cx < 0.0 or cx >= float(image_w) or cy < 0.0 or cy >= float(image_h):
+                continue
+
             if raw_area > 1.0:
                 visible_area_ratio = (width * height) / raw_area
-                if visible_area_ratio < 0.20:
+                if visible_area_ratio < MIN_VISIBLE_AREA_RATIO:
                     continue
 
             depth_visibility = self._projected_depth_visibility_ratio(

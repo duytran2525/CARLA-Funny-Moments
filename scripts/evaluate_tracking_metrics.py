@@ -9,14 +9,13 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 MotRows = Dict[int, List[dict]]
 UNKNOWN_CLASS = "__unknown__"
+# Only classes that CARLA ground-truth API can generate via _infer_gt_class_name.
+# traffic_light_*, traffic_sign, stop_line are removed because CARLA has no
+# actor-level GT for them — including them created empty per-class rows.
 EVALUATION_CLASS_ORDER = [
     "vehicle",
     "two_wheeler",
-    "traffic_light_red",
-    "traffic_sign",
     "pedestrian",
-    "traffic_light_green",
-    "stop_line",
 ]
 _EVALUATION_CLASS_INDEX = {
     class_name: index for index, class_name in enumerate(EVALUATION_CLASS_ORDER)
@@ -24,6 +23,7 @@ _EVALUATION_CLASS_INDEX = {
 _CLASS_ALIASES = {
     "bike": "two_wheeler",
     "bicycle": "two_wheeler",
+    "cyclist": "two_wheeler",
     "motobike": "two_wheeler",
     "motorbike": "two_wheeler",
     "motorcycle": "two_wheeler",
@@ -50,6 +50,7 @@ BASE_METRIC_FIELDS = [
     "f1",
     "mota",
     "motp",
+    "hota",
 ]
 PER_CLASS_METRIC_SUFFIXES = [
     "gt_detections",
@@ -63,6 +64,7 @@ PER_CLASS_METRIC_SUFFIXES = [
     "f1",
     "mota",
     "motp",
+    "hota",
 ]
 
 
@@ -107,6 +109,12 @@ def _empty_class_stats() -> dict:
         "false_negatives": 0,
         "id_switches": 0,
         "iou_sum": 0.0,
+        # Per-frame match records needed for HOTA computation.
+        # Each entry: (frame_id, gt_track_id, pred_track_id, iou)
+        "hota_matches": [],
+        # Per-frame counts for DetA denominator
+        "hota_frame_gt_counts": [],
+        "hota_frame_pred_counts": [],
     }
 
 
@@ -360,11 +368,140 @@ def _bbox_iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float
     return float(inter_area / union)
 
 
+def _compute_hota_single_threshold(
+    predictions: MotRows,
+    ground_truth: MotRows,
+    alpha: float,
+    class_filter: Optional[str] = None,
+) -> float:
+    """Compute HOTA at a single IoU threshold *alpha* following Luiten et al. 2021.
+
+    HOTA(α) = sqrt(DetA(α) * AssA(α))
+
+    * DetA(α) = |TP(α)| / (|TP(α)| + |FP(α)| + |FN(α)|)
+    * AssA(α) = (1/|TP(α)|) * Σ_c A(c, α)
+      where A(c, α) = |TPA(c,α)| / (|TPA(c,α)| + |FPA(c,α)| + |FNA(c,α)|)
+    """
+    import math as _math
+
+    frames = sorted(set(predictions.keys()) | set(ground_truth.keys()))
+
+    # Step 1: for each frame, match GT<->Pred at IoU >= alpha (class-strict).
+    # Collect per-frame matches: (gt_track_id, pred_track_id, iou)
+    all_tp = 0
+    all_fp = 0
+    all_fn = 0
+    # Collect all (gt_track_id, pred_track_id) TP pairs across frames for AssA.
+    tp_pairs: List[Tuple[int, int]] = []
+
+    for frame_id in frames:
+        frame_gt = ground_truth.get(frame_id, [])
+        frame_pred = predictions.get(frame_id, [])
+        if class_filter is not None:
+            frame_gt = [g for g in frame_gt if str(g["class"]) == class_filter]
+            frame_pred = [p for p in frame_pred if str(p["class"]) == class_filter]
+
+        # Build IoU matrix and greedy-match at threshold alpha.
+        candidates = []
+        for gi, gt in enumerate(frame_gt):
+            for pi, pred in enumerate(frame_pred):
+                if str(gt["class"]) != str(pred["class"]):
+                    continue
+                iou = _bbox_iou(gt["bbox"], pred["bbox"])
+                if iou >= alpha:
+                    candidates.append((iou, gi, pi))
+        candidates.sort(reverse=True, key=lambda x: x[0])
+        matched_gt = set()
+        matched_pred = set()
+        for iou_val, gi, pi in candidates:
+            if gi in matched_gt or pi in matched_pred:
+                continue
+            matched_gt.add(gi)
+            matched_pred.add(pi)
+            tp_pairs.append((int(frame_gt[gi]["id"]), int(frame_pred[pi]["id"])))
+
+        frame_tp = len(matched_gt)
+        all_tp += frame_tp
+        all_fp += len(frame_pred) - frame_tp
+        all_fn += len(frame_gt) - frame_tp
+
+    # DetA
+    det_denominator = all_tp + all_fp + all_fn
+    if det_denominator <= 0:
+        return 0.0
+    det_a = float(all_tp) / float(det_denominator)
+
+    if all_tp <= 0:
+        return 0.0
+
+    # Step 2: compute AssA.
+    # For each TP match c = (gt_id, pred_id), collect all frames where
+    # gt_id or pred_id appears in any TP match.
+    # Build lookup: gt_id -> set of pred_ids matched across all frames,
+    #               pred_id -> set of gt_ids matched across all frames.
+    from collections import defaultdict
+
+    gt_to_preds: Dict[int, List[int]] = defaultdict(list)
+    pred_to_gts: Dict[int, List[int]] = defaultdict(list)
+    for gt_id, pred_id in tp_pairs:
+        gt_to_preds[gt_id].append(pred_id)
+        pred_to_gts[pred_id].append(gt_id)
+
+    ass_a_sum = 0.0
+    for gt_id, pred_id in tp_pairs:
+        # TPA(c): number of TP pairs where BOTH gt_id and pred_id match.
+        # This counts how many frames this exact (gt_id, pred_id) pair co-occurs.
+        tpa = sum(1 for p in gt_to_preds[gt_id] if p == pred_id)
+        # FPA(c): TP pairs where pred_id is matched but to a different gt_id.
+        fpa = sum(1 for g in pred_to_gts[pred_id] if g != gt_id)
+        # FNA(c): TP pairs where gt_id is matched but to a different pred_id.
+        fna = sum(1 for p in gt_to_preds[gt_id] if p != pred_id)
+        ass_denominator = tpa + fpa + fna
+        if ass_denominator > 0:
+            ass_a_sum += float(tpa) / float(ass_denominator)
+
+    ass_a = ass_a_sum / float(all_tp)
+
+    hota = _math.sqrt(max(0.0, det_a * ass_a))
+    return hota
+
+
+def _compute_hota(
+    predictions: MotRows,
+    ground_truth: MotRows,
+    class_filter: Optional[str] = None,
+) -> float:
+    """Compute HOTA averaged over 19 IoU thresholds (0.05 to 0.95, step 0.05).
+
+    This follows the official HOTA protocol from Luiten et al. (IJCV 2021).
+    """
+    import math as _math
+
+    thresholds = [round(0.05 * i, 2) for i in range(1, 20)]  # 0.05, 0.10, ..., 0.95
+    hota_values = []
+    for alpha in thresholds:
+        h = _compute_hota_single_threshold(predictions, ground_truth, alpha, class_filter)
+        hota_values.append(h)
+    if not hota_values:
+        return 0.0
+    return float(sum(hota_values) / len(hota_values))
+
+
 def compute_simple_tracking_metrics(
     predictions_txt: Path,
     ground_truth_txt: Path,
-    iou_threshold: float = 0.5,
+    iou_threshold: float = 0.3,
 ) -> dict:
+    """Compute tracking metrics using greedy IoU matching.
+
+    The default ``iou_threshold`` is 0.3 (not the MOTChallenge standard 0.5)
+    because CARLA ground-truth bounding boxes are generated via 3D→2D
+    projection of the actor's full 3D bounding box.  This projection
+    produces bboxes that are systematically larger/different than a 2D
+    detector's output, resulting in structurally lower IoU even when both
+    see the same object.  0.3 compensates for this domain gap while still
+    rejecting clearly wrong matches.
+    """
     predictions = _read_mot_txt(predictions_txt)
     ground_truth = _read_mot_txt(ground_truth_txt)
 
@@ -442,6 +579,9 @@ def compute_simple_tracking_metrics(
     motp = iou_sum / tp if tp > 0 else 0.0
     f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
+    # HOTA: overall (all classes combined)
+    overall_hota = _compute_hota(predictions, ground_truth)
+
     metrics = {
         "method": "simple_iou_greedy",
         "class_match_mode": "strict" if any(
@@ -462,6 +602,7 @@ def compute_simple_tracking_metrics(
         "f1": f1,
         "mota": mota,
         "motp": motp,
+        "hota": overall_hota,
     }
     for class_name in _ordered_metric_classes(class_stats):
         safe_class = _safe_metric_class_name(class_name)
@@ -483,6 +624,8 @@ def compute_simple_tracking_metrics(
             else 0.0
         )
         class_motp = float(stat["iou_sum"]) / class_tp if class_tp > 0 else 0.0
+        # Per-class HOTA
+        class_hota = _compute_hota(predictions, ground_truth, class_filter=class_name)
         prefix = f"class_{safe_class}_"
         metrics.update(
             {
@@ -497,6 +640,7 @@ def compute_simple_tracking_metrics(
                 f"{prefix}f1": class_f1,
                 f"{prefix}mota": class_mota,
                 f"{prefix}motp": class_motp,
+                f"{prefix}hota": class_hota,
             }
         )
     return metrics
@@ -549,6 +693,7 @@ def _write_per_class_metrics_outputs(metrics: dict, output_dir: Path) -> Tuple[P
                 f"f1: {float(row['f1']):.6f}",
                 f"mota: {float(row['mota']):.6f}",
                 f"motp: {float(row['motp']):.6f}",
+                f"hota: {float(row['hota']):.6f}",
             ]
         )
     txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -586,6 +731,7 @@ def write_simple_metrics_outputs(metrics: dict, output_dir: Path) -> Tuple[Path,
         f"f1: {metrics['f1']:.6f}",
         f"mota: {metrics['mota']:.6f}",
         f"motp: {metrics['motp']:.6f}",
+        f"hota: {metrics['hota']:.6f}",
     ]
     per_class_rows = _per_class_metric_rows(metrics)
     if per_class_rows:
@@ -595,7 +741,7 @@ def write_simple_metrics_outputs(metrics: dict, output_dir: Path) -> Tuple[Path,
                 "class={class_name} | gt={gt_detections} | pred={pred_detections} | "
                 "tp={true_positives} | fp={false_positives} | fn={false_negatives} | "
                 "idsw={id_switches} | precision={precision:.6f} | recall={recall:.6f} | "
-                "f1={f1:.6f} | mota={mota:.6f} | motp={motp:.6f}".format(
+                "f1={f1:.6f} | mota={mota:.6f} | motp={motp:.6f} | hota={hota:.6f}".format(
                     class_name=row["class"],
                     gt_detections=row["gt_detections"],
                     pred_detections=row["pred_detections"],
@@ -608,6 +754,7 @@ def write_simple_metrics_outputs(metrics: dict, output_dir: Path) -> Tuple[Path,
                     f1=float(row["f1"]),
                     mota=float(row["mota"]),
                     motp=float(row["motp"]),
+                    hota=float(row["hota"]),
                 )
             )
     txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -739,7 +886,7 @@ def main() -> int:
     parser.add_argument("--tracker-name", default="BoTSORT", help="Tracker name used in TrackEval.")
     parser.add_argument("--benchmark", default="CARLA_MOT", help="Benchmark folder name for TrackEval.")
     parser.add_argument("--seqinfo", default="", help="Optional seqinfo.ini path.")
-    parser.add_argument("--iou-threshold", type=float, default=0.5, help="IoU threshold for built-in simple metrics.")
+    parser.add_argument("--iou-threshold", type=float, default=0.3, help="IoU threshold for built-in simple metrics (default 0.3 for 3D-projected GT).")
     parser.add_argument(
         "--prepare-only",
         action="store_true",

@@ -121,9 +121,11 @@ class EvaluateTrackingMetricsTests(unittest.TestCase):
             )
             gt.write_text("1,101,10,10,20,20,1,-1,-1,-1,pedestrian\n", encoding="utf-8")
 
+            # two_wheeler and pedestrian are in EVALUATION_CLASS_ORDER and sort first;
+            # traffic_light_red and stop_line are now outside and sort alphabetically after.
             self.assertEqual(
                 _classes_in_mot_files(pred, gt),
-                ["two_wheeler", "traffic_light_red", "pedestrian", "stop_line"],
+                ["two_wheeler", "pedestrian", "stop_line", "traffic_light_red"],
             )
 
     def test_prepare_trackeval_bundle(self):
