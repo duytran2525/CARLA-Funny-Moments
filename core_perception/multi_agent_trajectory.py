@@ -247,14 +247,20 @@ def _select_actor_ids(
     return complete_ids
 
 
-def _build_adjacency(anchor_positions: Any, adjacency_radius_m: float) -> Any:
-    n_agents = int(anchor_positions.shape[0])
+def _build_adjacency(positions: Any, adjacency_radius_m: float) -> Any:
+    """Build a symmetric adjacency matrix from pairwise 2-D distances.
+
+    *positions* should be **global (world) coordinates** stored as float64 so
+    that distance comparisons near the radius boundary are not affected by
+    float32 quantisation of the ego-centric transform.
+    """
+    n_agents = int(positions.shape[0])
     adjacency = np.eye(n_agents, dtype=np.float32)
     radius = float(adjacency_radius_m)
     for i in range(n_agents):
         for j in range(i + 1, n_agents):
-            dx = float(anchor_positions[i, 0] - anchor_positions[j, 0])
-            dy = float(anchor_positions[i, 1] - anchor_positions[j, 1])
+            dx = float(positions[i, 0]) - float(positions[j, 0])
+            dy = float(positions[i, 1]) - float(positions[j, 1])
             if math.hypot(dx, dy) <= radius:
                 adjacency[i, j] = 1.0
                 adjacency[j, i] = 1.0
@@ -335,6 +341,10 @@ def build_window_sample(
     x_mask = np.zeros((n_agents, history_len), dtype=np.bool_)
     y_mask = np.zeros((n_agents, future_len), dtype=np.bool_)
     anchor_positions = np.zeros((n_agents, 2), dtype=np.float32)
+    # Global (world) positions kept in float64 for precise adjacency distance
+    # computation.  The ego-centric anchor_positions above are only used if
+    # needed downstream; adjacency is computed from global_positions.
+    global_positions = np.zeros((n_agents, 2), dtype=np.float64)
 
     for agent_idx, actor_id in enumerate(actor_ids):
         anchor_actor = anchor.actors.get(actor_id)
@@ -342,6 +352,9 @@ def build_window_sample(
             anchor_positions[agent_idx] = np.asarray(
                 actor_position_in_anchor_frame(anchor_actor, anchor.ego),
                 dtype=np.float32,
+            )
+            global_positions[agent_idx] = np.asarray(
+                [anchor_actor.x, anchor_actor.y], dtype=np.float64,
             )
 
         for hist_idx, frame in enumerate(history):
@@ -395,13 +408,14 @@ def build_window_sample(
         x_mask = x_mask[keep_indices]
         y_mask = y_mask[keep_indices]
         anchor_positions = anchor_positions[keep_indices]
+        global_positions = global_positions[keep_indices]
         actor_ids = [actor_ids[i] for i in keep_indices]
         n_agents = len(actor_ids)
 
     return {
         "x": x,
         "y": y,
-        "adj": _build_adjacency(anchor_positions, config.adjacency_radius_m),
+        "adj": _build_adjacency(global_positions, config.adjacency_radius_m),
         "x_mask": x_mask,
         "y_mask": y_mask,
         "actor_ids": np.asarray(list(actor_ids), dtype=np.int64),
