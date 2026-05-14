@@ -13,7 +13,7 @@ from core_perception.cnn_model import (
     WaypointPredictor,
     classify_checkpoint_state_dict,
 )
-from run_agents import CILAgent
+from run_agents import AGENT_REGISTRY, CILAgent, CILYoloAgent
 
 
 class CnnModelCompatibilityTests(unittest.TestCase):
@@ -82,6 +82,10 @@ class CnnModelCompatibilityTests(unittest.TestCase):
         self.assertEqual(int(model.seen_command.item()), 2)
         self.assertAlmostEqual(float(model.seen_speed.item()), 0.5)
         self.assertAlmostEqual(mean_uncertainty, 12.0)
+
+    def test_cil_yolo_agent_is_registered_separately(self) -> None:
+        self.assertIs(AGENT_REGISTRY["cil_yolo"], CILYoloAgent)
+        self.assertIs(AGENT_REGISTRY["cil"], CILAgent)
 
 
 if __name__ == "__main__":

@@ -2374,6 +2374,15 @@ class CILAgent(BaseAgent):
         self._frame_history = deque(maxlen=3)
         self._frame_lock = threading.Lock()
         self._waiting_frame_logged = False
+        self._cil_yolo_enabled = False
+        self._yolo_detector = None
+        self._traffic_supervisor = None
+        self._last_supervisor_ts: Optional[float] = None
+        self._last_yolo_detection_step: Optional[int] = None
+        self._cached_yolo_emergency = False
+        self._cached_yolo_debug_info: Dict[str, Any] = {}
+        self._cached_yolo_annotated_frame = None
+        self._yolo_window_name = "CARLA CIL + YOLO"
         self._collector: Optional[DataCollector] = None
         self._data_cameras = []
         self._video_writer = None
@@ -2467,6 +2476,8 @@ class CILAgent(BaseAgent):
             self._frame_history.clear()
         self._camera = self._spawn_camera(world, vehicle)
         self._camera.listen(self._on_camera_frame)
+        if self._cil_yolo_enabled:
+            self._init_cil_yolo_fusion()
         self._init_navigation_agent(world, vehicle)
         self._command_oracle.reset()
 
@@ -2523,6 +2534,228 @@ class CILAgent(BaseAgent):
             ]
         )
         self._telemetry_fp.flush()
+
+    def _init_cil_yolo_fusion(self) -> None:
+        if YoloDetector is None:
+            logging.warning("YoloDetector unavailable; cil_yolo will run as plain CIL.")
+            self._yolo_detector = None
+            return
+
+        model_path = resolve_yolo_model_path(self.config.yolo_model_path)
+        if not model_path.exists():
+            logging.warning("YOLO model file not found: %s. cil_yolo will run as plain CIL.", model_path)
+            self._yolo_detector = None
+            return
+
+        detector_imgsz = int(self.config.yolo_inference_imgsz)
+        detector_imgsz_arg = detector_imgsz if detector_imgsz > 0 else None
+        self._yolo_detector = YoloDetector(
+            str(model_path),
+            display_classes=["pedestrian", "vehicle", "two_wheeler"],
+            inference_imgsz=detector_imgsz_arg,
+            camera_fov_deg=self.config.camera_fov,
+            obstacle_base_distance_m=8.0,
+            camera_mount_x_m=1.5,
+            camera_mount_y_m=0.0,
+            camera_mount_z_m=2.2,
+            camera_pitch_deg=-8.0,
+            tracker_config=self.config.yolo_tracker_config,
+        )
+
+        warmup_fn = getattr(self._yolo_detector, "warmup", None)
+        if callable(warmup_fn):
+            warmup_t0 = time.perf_counter()
+            warmup_fn(self.config.camera_width, self.config.camera_height)
+            logging.info("cil_yolo detector warmup completed in %.1f ms.", (time.perf_counter() - warmup_t0) * 1000.0)
+
+        if TrafficSupervisor is None:
+            self._traffic_supervisor = None
+            logging.warning("TrafficSupervisor unavailable; cil_yolo will use detector-only fallback.")
+        else:
+            try:
+                self._traffic_supervisor = TrafficSupervisor(build_supervisor_config())
+                self._last_supervisor_ts = None
+                logging.info("TrafficSupervisor integrated into CIL+YOLO control loop.")
+            except Exception as exc:
+                self._traffic_supervisor = None
+                logging.warning("Failed to initialize TrafficSupervisor for cil_yolo: %s", exc)
+
+        logging.info(
+            "CIL+YOLO fusion enabled. Detector=%s every_n_ticks=%d visualize=%s draw_overlay=%s",
+            model_path,
+            int(self.config.yolo_inference_every_n_ticks),
+            bool(self.config.yolo_visualize),
+            bool(self.config.yolo_draw_overlay),
+        )
+
+    def _annotate_cil_yolo_frame(
+        self,
+        frame_bgr: Any,
+        detections: list[Dict[str, Any]],
+        debug_info: Dict[str, Any],
+        sup_debug: Dict[str, Any],
+        speed_kmh: float,
+        control: Any,
+    ) -> Any:
+        annotated = frame_bgr.copy()
+        if not self.config.yolo_draw_overlay:
+            return annotated
+
+        _draw_red_light_zone_rois(annotated, sup_debug)
+        _draw_yellow_danger_corridor(annotated, debug_info, sup_debug)
+        for det in detections:
+            x1, y1, x2, y2 = [int(v) for v in det.get("box", (0, 0, 0, 0))]
+            class_name = str(det.get("class_name", "unknown"))
+            confidence = float(det.get("confidence", 0.0))
+            distance = float(det.get("distance", float("inf")))
+            danger_match = bool(det.get("danger_match", False))
+            in_danger_roi = bool(det.get("in_danger_roi", False))
+            if class_name == "traffic_light_red" or danger_match:
+                color = (0, 0, 255)
+            elif class_name == "traffic_light_green":
+                color = (0, 255, 0)
+            elif in_danger_roi or distance < 10.0:
+                color = (0, 165, 255)
+            else:
+                color = (0, 255, 0)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(
+                annotated,
+                f"{class_name} {confidence:.2f} ({distance:.1f}m)",
+                (x1, max(18, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
+            )
+
+        supervisor_brake = float(debug_info.get("supervisor_brake", 0.0))
+        state = str(debug_info.get("supervisor_state", "n/a"))
+        reason = str(debug_info.get("decision_reason", "none"))
+        status_color = (0, int(round(255.0 * (1.0 - supervisor_brake))), int(round(255.0 * supervisor_brake)))
+        cv2.putText(
+            annotated,
+            f"CIL+YOLO {state} brake={supervisor_brake:.2f} reason={reason}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            status_color,
+            2,
+        )
+        cv2.putText(
+            annotated,
+            f"speed={speed_kmh:.1f} km/h steer={float(control.steer):+.3f} thr={float(control.throttle):.2f} brk={float(control.brake):.2f}",
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (40, 220, 255),
+            2,
+        )
+        return annotated
+
+    def _run_cil_yolo_fusion(
+        self,
+        frame_rgb: Any,
+        step_idx: int,
+        current_steer: float,
+        speed_kmh: float,
+        control: Any,
+    ) -> tuple[bool, Dict[str, Any], Any]:
+        if self._yolo_detector is None:
+            return False, {}, None
+
+        detect_every_n = max(1, int(self.config.yolo_inference_every_n_ticks))
+        should_run_detector = (
+            self._last_yolo_detection_step is None
+            or detect_every_n <= 1
+            or (step_idx - int(self._last_yolo_detection_step)) >= detect_every_n
+        )
+        if not should_run_detector:
+            cached_debug_info = dict(self._cached_yolo_debug_info)
+            cached_debug_info["detector_cache_hit"] = True
+            cached_debug_info["detector_cache_age_ticks"] = (
+                0 if self._last_yolo_detection_step is None else step_idx - int(self._last_yolo_detection_step)
+            )
+            return (
+                bool(self._cached_yolo_emergency),
+                cached_debug_info,
+                self._cached_yolo_annotated_frame,
+            )
+
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        detections, detector_emergency = self._yolo_detector.detect_and_evaluate(
+            frame_bgr,
+            distance_threshold=None,
+            depth_map_m=None,
+            vehicle_steer=current_steer,
+            speed_kmh=speed_kmh,
+        )
+        debug_info = {}
+        if hasattr(self._yolo_detector, "get_last_debug_info"):
+            debug_info = self._yolo_detector.get_last_debug_info() or {}
+        debug_info = dict(debug_info)
+        debug_info["detector_cache_hit"] = False
+        debug_info["detector_cache_age_ticks"] = 0
+
+        supervisor_brake = 0.0
+        sup_debug: Dict[str, Any] = {}
+        supervisor_target_type = "none"
+        if self._traffic_supervisor is not None:
+            now_ts = time.time()
+            if self._last_supervisor_ts is None:
+                dt = self.config.fixed_delta if self.config.sync else (1.0 / 30.0)
+            elif self.config.sync:
+                dt = self.config.fixed_delta
+            else:
+                dt = max(1e-3, now_ts - float(self._last_supervisor_ts))
+            self._last_supervisor_ts = now_ts
+            try:
+                supervisor_brake = float(
+                    self._traffic_supervisor.compute(
+                        detections=to_supervisor_detections(detections),
+                        current_speed=float(speed_kmh) / 3.6,
+                        image_shape=frame_bgr.shape,
+                        distance_threshold=None,
+                        vehicle_steer=float(current_steer),
+                        dt=dt,
+                    )
+                )
+                supervisor_brake = clamp(supervisor_brake, 0.0, 1.0)
+                sup_debug = self._traffic_supervisor.get_debug_info()
+                supervisor_target_type = str(sup_debug.get("selected_target_type", "none"))
+            except Exception as exc:
+                logging.warning("CIL+YOLO TrafficSupervisor compute failed: %s", exc)
+                supervisor_brake = 0.0
+                sup_debug = {}
+
+        hard_supervisor_emergency = supervisor_brake >= 0.60 and supervisor_target_type == "obstacle"
+        is_emergency = bool(hard_supervisor_emergency or (detector_emergency and self._traffic_supervisor is None))
+
+        debug_info["supervisor_brake"] = float(supervisor_brake)
+        debug_info["decision_reason"] = supervisor_target_type
+        if sup_debug:
+            debug_info["supervisor_state"] = str(sup_debug.get("state", "n/a"))
+            debug_info["red_hard_stop_active"] = bool(sup_debug.get("red_hard_stop_active", False))
+            debug_info["locked_zone"] = sup_debug.get("locked_zone")
+            debug_info["green_immunity_counter"] = int(sup_debug.get("green_immunity_counter", 0))
+            debug_info["obstacle_reason"] = str(sup_debug.get("obstacle_reason", ""))
+
+        annotated = None
+        if self.config.yolo_visualize:
+            annotated = self._annotate_cil_yolo_frame(
+                frame_bgr,
+                detections,
+                debug_info,
+                sup_debug,
+                speed_kmh,
+                control,
+            )
+
+        self._last_yolo_detection_step = int(step_idx)
+        self._cached_yolo_emergency = bool(is_emergency)
+        self._cached_yolo_debug_info = dict(debug_info)
+        self._cached_yolo_annotated_frame = annotated
+        return bool(is_emergency), debug_info, annotated
 
     def _accumulate_tick_timing(self, stage_s: Dict[str, float], step_idx: int) -> None:
         if not self.config.cil_profile_tick_timing:
@@ -4386,6 +4619,33 @@ class CILAgent(BaseAgent):
             hand_brake=False,
             reverse=False,
         )
+        yolo_debug_info: Dict[str, Any] = {}
+        yolo_emergency = False
+        if self._cil_yolo_enabled and self._yolo_detector is not None:
+            yolo_emergency, yolo_debug_info, annotated_yolo_frame = self._run_cil_yolo_fusion(
+                frame,
+                step_idx=step_idx,
+                current_steer=float(control.steer),
+                speed_kmh=float(speed_kmh),
+                control=control,
+            )
+            supervisor_brake = float(yolo_debug_info.get("supervisor_brake", 0.0))
+            red_hard_stop_active = bool(yolo_debug_info.get("red_hard_stop_active", False))
+            supervisor_reason = str(yolo_debug_info.get("decision_reason", "none")).strip().lower()
+            hold_hand_brake = bool(
+                red_hard_stop_active
+                and supervisor_brake >= 0.99
+                and supervisor_reason in ("stop_line", "red_light", "traffic_light_red")
+                and float(speed_kmh) <= 2.0
+            )
+            if yolo_emergency or supervisor_brake > 0.0:
+                emergency_floor = 0.6 if yolo_emergency else 0.0
+                control.throttle = 0.0
+                control.brake = float(clamp(max(float(control.brake), supervisor_brake, emergency_floor), 0.0, 1.0))
+                control.hand_brake = bool(hold_hand_brake)
+            if annotated_yolo_frame is not None:
+                cv2.imshow(self._yolo_window_name, annotated_yolo_frame)
+                cv2.waitKey(1)
         vehicle.apply_control(control)
         vehicle_location = vehicle.get_location()
         rotation = vehicle.get_transform().rotation
@@ -4475,7 +4735,7 @@ class CILAgent(BaseAgent):
         
         if step_idx % 20 == 0:
             logging.info(
-                "cil tick=%d speed=%.1f km/h target=%.1f cmd=%d phase=%s next=%d src=%s reset=%s s_from_start=%.1f d_turn=%.1f d_junc=%.1f trigger=%.1f steer=%.3f source=%.3f unc=%.3f veto=%s throttle=%.2f brake=%.2f",
+                "cil tick=%d speed=%.1f km/h target=%.1f cmd=%d phase=%s next=%d src=%s reset=%s s_from_start=%.1f d_turn=%.1f d_junc=%.1f trigger=%.1f steer=%.3f source=%.3f unc=%.3f veto=%s throttle=%.2f brake=%.2f yolo=%s yolo_brake=%.2f yolo_reason=%s",
                 step_idx,
                 speed_kmh,
                 adaptive_target_kmh,
@@ -4494,6 +4754,9 @@ class CILAgent(BaseAgent):
                 str(ai_is_confused),
                 control.throttle,
                 control.brake,
+                str(bool(self._cil_yolo_enabled and self._yolo_detector is not None)),
+                float(yolo_debug_info.get("supervisor_brake", 0.0)),
+                str(yolo_debug_info.get("decision_reason", "none")),
             )
 
         if self._telemetry_writer is not None:
@@ -4542,6 +4805,18 @@ class CILAgent(BaseAgent):
             self._camera.destroy()
             self._camera = None
             logging.info("Destroyed CIL RGB camera.")
+        self._yolo_detector = None
+        self._traffic_supervisor = None
+        self._last_supervisor_ts = None
+        self._last_yolo_detection_step = None
+        self._cached_yolo_emergency = False
+        self._cached_yolo_debug_info = {}
+        self._cached_yolo_annotated_frame = None
+        if self._cil_yolo_enabled and cv2 is not None:
+            try:
+                cv2.destroyWindow(self._yolo_window_name)
+            except Exception:
+                pass
         for sensor in self._data_cameras:
             try:
                 sensor.stop()
@@ -4580,6 +4855,14 @@ class CILAgent(BaseAgent):
 
     def should_stop(self) -> bool:
         return self._stop_requested
+
+
+class CILYoloAgent(CILAgent):
+    name = "cil_yolo"
+
+    def __init__(self, config: RunConfig) -> None:
+        super().__init__(config)
+        self._cil_yolo_enabled = True
 
 
 class YoloDetectAgent(BaseAgent):
@@ -6143,6 +6426,7 @@ AGENT_REGISTRY: Dict[str, Type[BaseAgent]] = {
     AutopilotAgent.name: AutopilotAgent,
     LaneFollowAgent.name: LaneFollowAgent,
     CILAgent.name: CILAgent,
+    CILYoloAgent.name: CILYoloAgent,
     YoloDetectAgent.name: YoloDetectAgent,
     NoopAgent.name: NoopAgent,
 }
@@ -6201,7 +6485,7 @@ def parse_args() -> argparse.Namespace:
         "--agent",
         choices=sorted(AGENT_REGISTRY),
         default="lane_follow",
-        help="Choose lane_follow/cil/autopilot/yolo_detect agent mode.",
+        help="Choose lane_follow/cil/cil_yolo/autopilot/yolo_detect agent mode.",
     )
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)

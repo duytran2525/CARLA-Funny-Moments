@@ -42,6 +42,7 @@ Ví dụ:
 ```powershell
 python run_agents.py --agent lane_follow
 python run_agents.py --agent cil --cil-model-path models/waypoint_predictor.pth
+python run_agents.py --agent cil_yolo --cil-model-path models/waypoint_predictor.pth --yolo-model-path models/yolo26m_best.engine
 python run_agents.py --agent yolo_detect --yolo-model-path models/yolo26m_best.engine
 ```
 

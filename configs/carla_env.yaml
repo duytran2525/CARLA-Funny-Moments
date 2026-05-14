@@ -51,6 +51,7 @@ yolo:
   # backend:
   # - "tm": native CARLA Traffic Manager autopilot
   # - "planner": BasicAgent/BehaviorAgent route planner
+  # - ignored by agent=cil_yolo; CIL drives and YOLO/TrafficSupervisor only overrides braking
   backend: "tm"
   # Chỉ dùng khi backend="planner"
   nav_agent_type: "basic"

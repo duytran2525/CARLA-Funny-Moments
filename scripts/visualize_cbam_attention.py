@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import queue
 import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import cv2
 import numpy as np
 import torch
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -19,6 +25,7 @@ from core_perception.cnn_model import CIL_NvidiaCNN, unwrap_state_dict
 MODEL_INPUT_SIZE = (200, 66)
 DEFAULT_MODEL_PATH = Path("models/waypoint_predictor_h5.pth")
 DEFAULT_OUTPUT_DIR = Path("outputs/cbam_attention")
+DEFAULT_CARLA_CONFIG = Path("configs/carla_env.yaml")
 
 
 def clamp01(values: np.ndarray) -> np.ndarray:
@@ -34,6 +41,41 @@ def normalize_map(values: np.ndarray, lower: float | None = None, upper: float |
     if upper <= lower + 1e-8:
         return np.zeros_like(values, dtype=np.float32)
     return clamp01((values - lower) / (upper - lower))
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    if yaml is None or not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as fp:
+        data = yaml.safe_load(fp) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def cfg_get(config: dict[str, Any], section: str, key: str, default: Any) -> Any:
+    section_value = config.get(section, {})
+    if isinstance(section_value, dict):
+        return section_value.get(key, default)
+    return default
+
+
+def carla_image_to_rgb(image: Any) -> np.ndarray:
+    array = np.frombuffer(image.raw_data, dtype=np.uint8)
+    array = array.reshape((image.height, image.width, 4))
+    return array[:, :, :3][:, :, ::-1].copy()
+
+
+def drain_queue(frame_queue: queue.Queue[Any]) -> None:
+    while True:
+        try:
+            frame_queue.get_nowait()
+        except queue.Empty:
+            return
+
+
+def parse_spawn_indices(raw: str | None, start: int, count: int) -> list[int]:
+    if raw:
+        return [int(part.strip()) for part in raw.split(",") if part.strip()]
+    return [start + offset * 3 for offset in range(max(1, count))]
 
 
 def make_synthetic_scene(width: int, height: int, variant: str) -> np.ndarray:
@@ -101,6 +143,124 @@ def make_synthetic_scene(width: int, height: int, variant: str) -> np.ndarray:
         image = cv2.addWeighted(overlay, 0.28, image, 0.72, 0)
 
     return image
+
+
+def capture_carla_temporal_samples(args: argparse.Namespace) -> list[tuple[str, list[np.ndarray]]]:
+    try:
+        import carla
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "Cannot import carla. Set PYTHONPATH to <CARLA_ROOT>/PythonAPI/carla before using --carla-live."
+        ) from exc
+
+    config = load_config(args.carla_config)
+    host = str(args.carla_host or cfg_get(config, "carla", "host", "127.0.0.1"))
+    port = int(args.carla_port or cfg_get(config, "carla", "port", 2000))
+    map_name = str(args.carla_map or cfg_get(config, "carla", "map", "Town06"))
+    timeout = float(args.carla_timeout or cfg_get(config, "carla", "timeout", 60.0))
+    fixed_delta = float(cfg_get(config, "carla", "fixed_delta", 0.03))
+    width = int(cfg_get(config, "camera", "width", 640))
+    height = int(cfg_get(config, "camera", "height", 360))
+    fov = float(cfg_get(config, "camera", "fov", 90.0))
+    vehicle_filter = str(cfg_get(config, "vehicle", "filter", "vehicle.tesla.model3"))
+    configured_spawn = int(cfg_get(config, "vehicle", "spawn_point", 0))
+    weather_preset = str(cfg_get(config, "weather", "preset", "ClearNoon"))
+    spawn_indices = parse_spawn_indices(args.carla_spawn_indices, configured_spawn, args.carla_count)
+
+    client = carla.Client(host, port)
+    client.set_timeout(timeout)
+    world = client.get_world()
+    if args.carla_reload_world and not world.get_map().name.endswith(map_name):
+        world = client.load_world(map_name)
+    map_name = str(world.get_map().name).replace("\\", "/").split("/")[-1]
+
+    original_settings = world.get_settings()
+    actors: list[Any] = []
+    camera = None
+    vehicle = None
+    try:
+        settings = world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = fixed_delta
+        settings.no_rendering_mode = False
+        world.apply_settings(settings)
+
+        if hasattr(carla.WeatherParameters, weather_preset):
+            world.set_weather(getattr(carla.WeatherParameters, weather_preset))
+
+        blueprint_library = world.get_blueprint_library()
+        vehicle_blueprints = blueprint_library.filter(vehicle_filter) or blueprint_library.filter("vehicle.*")
+        if not vehicle_blueprints:
+            raise RuntimeError("No vehicle blueprint available in CARLA.")
+
+        spawn_points = world.get_map().get_spawn_points()
+        if not spawn_points:
+            raise RuntimeError("No spawn points available in current CARLA map.")
+
+        spawn_indices = [idx % len(spawn_points) for idx in spawn_indices]
+        vehicle = world.try_spawn_actor(vehicle_blueprints[0], spawn_points[spawn_indices[0]])
+        if vehicle is None:
+            for transform in spawn_points:
+                vehicle = world.try_spawn_actor(vehicle_blueprints[0], transform)
+                if vehicle is not None:
+                    break
+        if vehicle is None:
+            raise RuntimeError("Could not spawn ego vehicle for CARLA capture.")
+        actors.append(vehicle)
+
+        camera_bp = blueprint_library.find("sensor.camera.rgb")
+        camera_bp.set_attribute("image_size_x", str(width))
+        camera_bp.set_attribute("image_size_y", str(height))
+        camera_bp.set_attribute("fov", str(fov))
+        if camera_bp.has_attribute("sensor_tick"):
+            camera_bp.set_attribute("sensor_tick", str(fixed_delta))
+
+        camera_transform = carla.Transform(carla.Location(x=1.5, z=2.2), carla.Rotation(pitch=-8.0))
+        camera = world.spawn_actor(camera_bp, camera_transform, attach_to=vehicle)
+        actors.append(camera)
+        frame_queue: queue.Queue[Any] = queue.Queue()
+        camera.listen(frame_queue.put)
+
+        samples: list[tuple[str, list[np.ndarray]]] = []
+        raw_dir = args.output_dir / "carla_inputs"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        frame_count = max(3, int(args.carla_temporal_frames))
+        frame_skip = max(1, int(args.carla_frame_skip))
+
+        for spawn_idx in spawn_indices:
+            vehicle.set_transform(spawn_points[spawn_idx])
+            vehicle.set_target_velocity(carla.Vector3D())
+            vehicle.set_target_angular_velocity(carla.Vector3D())
+            drain_queue(frame_queue)
+            for _ in range(max(1, int(args.carla_warmup_ticks))):
+                world.tick()
+
+            frames: list[np.ndarray] = []
+            for frame_idx in range(frame_count):
+                for _ in range(frame_skip):
+                    world.tick()
+                image = frame_queue.get(timeout=timeout)
+                rgb = carla_image_to_rgb(image)
+                frames.append(rgb)
+                save_rgb(raw_dir / f"{map_name}_spawn_{spawn_idx:03d}_frame_{frame_idx:02d}.png", rgb)
+
+            samples.append((f"{map_name}_spawn_{spawn_idx:03d}", frames[-3:]))
+        return samples
+    finally:
+        if camera is not None:
+            try:
+                camera.stop()
+            except RuntimeError:
+                pass
+        for actor in reversed(actors):
+            try:
+                actor.destroy()
+            except RuntimeError:
+                pass
+        try:
+            world.apply_settings(original_settings)
+        except RuntimeError:
+            pass
 
 
 def save_rgb(path: Path, image: np.ndarray) -> None:
@@ -174,14 +334,33 @@ def extract_cbam_maps(
     return before_map, after_map, spatial_map, channel_weights
 
 
-def full_frame_heatmap(heatmap: np.ndarray, original_shape: tuple[int, int, int]) -> np.ndarray:
+def full_frame_heatmap(
+    heatmap: np.ndarray,
+    original_shape: tuple[int, int, int],
+    interpolation: int = cv2.INTER_CUBIC,
+) -> np.ndarray:
     height, width = original_shape[:2]
     crop_y = int(height * 0.45)
     crop_h = height - crop_y
-    resized = cv2.resize(heatmap.astype(np.float32), (width, crop_h), interpolation=cv2.INTER_CUBIC)
+    resized = cv2.resize(heatmap.astype(np.float32), (width, crop_h), interpolation=interpolation)
     full = np.zeros((height, width), dtype=np.float32)
     full[crop_y:, :] = resized
     return clamp01(full)
+
+
+def draw_feature_grid(rgb: np.ndarray, grid_shape: tuple[int, int]) -> np.ndarray:
+    output = rgb.copy()
+    height, width = output.shape[:2]
+    crop_y = int(height * 0.45)
+    grid_h, grid_w = grid_shape
+    for idx in range(1, grid_w):
+        x = int(round(idx * width / max(1, grid_w)))
+        cv2.line(output, (x, crop_y), (x, height - 1), (255, 255, 255), 1, cv2.LINE_AA)
+    for idx in range(1, grid_h):
+        y = crop_y + int(round(idx * (height - crop_y) / max(1, grid_h)))
+        cv2.line(output, (0, y), (width - 1, y), (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.rectangle(output, (0, crop_y), (width - 1, height - 1), (255, 255, 255), 1)
+    return output
 
 
 def overlay_heatmap(rgb: np.ndarray, heatmap: np.ndarray, title: str, alpha: float = 0.54) -> np.ndarray:
@@ -215,20 +394,26 @@ def create_visualization(
     device: torch.device,
     command: int,
     speed_kmh: float,
+    temporal_frames: Iterable[np.ndarray] | None = None,
 ) -> dict[str, Path]:
-    image_tensor = preprocess_frames(make_temporal_frames(rgb), device)
+    frames = list(temporal_frames) if temporal_frames is not None else make_temporal_frames(rgb)
+    if len(frames) < 3:
+        frames = [frames[-1] if frames else rgb] * (3 - len(frames)) + frames
+    frames = frames[-3:]
+    image_tensor = preprocess_frames(frames, device)
     before_raw, after_raw, spatial_raw, channel_weights = extract_cbam_maps(model, image_tensor, command, speed_kmh)
 
     lower = float(np.percentile(np.concatenate([before_raw.ravel(), after_raw.ravel()]), 2.0))
     upper = float(np.percentile(np.concatenate([before_raw.ravel(), after_raw.ravel()]), 98.0))
     before_map = full_frame_heatmap(normalize_map(before_raw, lower, upper), rgb.shape)
     after_map = full_frame_heatmap(normalize_map(after_raw, lower, upper), rgb.shape)
-    spatial_map = full_frame_heatmap(normalize_map(spatial_raw, 0.0, 1.0), rgb.shape)
+    spatial_map = full_frame_heatmap(normalize_map(spatial_raw, 0.0, 1.0), rgb.shape, interpolation=cv2.INTER_NEAREST)
 
     original_img = annotate_original(rgb, "Original input")
     before_img = overlay_heatmap(rgb, before_map, "Before CBAM: raw Stage-4 activation")
     after_img = overlay_heatmap(rgb, after_map, "After CBAM: refined activation")
     spatial_img = overlay_heatmap(rgb, spatial_map, "CBAM spatial attention mask")
+    spatial_grid_img = draw_feature_grid(spatial_img, spatial_raw.shape)
 
     comparison = build_comparison(original_img, before_img, spatial_img, after_img)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -239,6 +424,7 @@ def create_visualization(
         "after": output_dir / f"{name}_03_after_cbam.png",
         "compare": output_dir / f"{name}_04_compare.png",
         "channel": output_dir / f"{name}_05_channel_weights.png",
+        "grid": output_dir / f"{name}_06_cbam_spatial_grid.png",
     }
     save_rgb(paths["original"], original_img)
     save_rgb(paths["before"], before_img)
@@ -246,6 +432,7 @@ def create_visualization(
     save_rgb(paths["after"], after_img)
     save_rgb(paths["compare"], comparison)
     save_channel_weights(paths["channel"], channel_weights)
+    save_rgb(paths["grid"], spatial_grid_img)
     return paths
 
 
@@ -273,10 +460,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--images", type=Path, nargs="*", default=None, help="Optional RGB road images. If omitted, synthetic road scenes are generated.")
+    parser.add_argument("--temporal-images", type=Path, nargs=3, default=None, help="Three ordered RGB frames for one temporal CIL sample: old middle current.")
+    parser.add_argument("--carla-live", action="store_true", help="Capture real RGB frames from a running CARLA server and visualize CBAM on them.")
+    parser.add_argument("--carla-config", type=Path, default=DEFAULT_CARLA_CONFIG)
+    parser.add_argument("--carla-host", default=None)
+    parser.add_argument("--carla-port", type=int, default=None)
+    parser.add_argument("--carla-map", default=None)
+    parser.add_argument("--carla-reload-world", action="store_true", help="Load the configured map before capture if the current CARLA map differs.")
+    parser.add_argument("--carla-spawn-indices", default=None, help="Comma-separated spawn indices. Default: config spawn, spawn+3, ...")
+    parser.add_argument("--carla-count", type=int, default=1, help="Number of CARLA spawn locations to capture.")
+    parser.add_argument("--carla-temporal-frames", type=int, default=3, help="Number of sensor frames to capture per sample.")
+    parser.add_argument("--carla-frame-skip", type=int, default=2, help="World ticks between captured temporal frames.")
+    parser.add_argument("--carla-warmup-ticks", type=int, default=8)
+    parser.add_argument("--carla-timeout", type=float, default=None)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--command", type=int, default=0)
     parser.add_argument("--speed-kmh", type=float, default=30.0)
-    return parser.parse_args()
+    args = parser.parse_args()
+    selected_sources = sum(bool(value) for value in (args.carla_live, args.images, args.temporal_images))
+    if selected_sources > 1:
+        parser.error("--carla-live, --images, and --temporal-images are mutually exclusive.")
+    return args
 
 
 def main() -> None:
@@ -292,8 +496,16 @@ def main() -> None:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.images:
-        samples = [(path.stem, load_rgb(path)) for path in args.images]
+    if args.carla_live:
+        samples = [
+            (name, frames[-1], frames)
+            for name, frames in capture_carla_temporal_samples(args)
+        ]
+    elif args.temporal_images:
+        frames = [load_rgb(path) for path in args.temporal_images]
+        samples = [(args.temporal_images[-1].stem, frames[-1], frames)]
+    elif args.images:
+        samples = [(path.stem, load_rgb(path), None) for path in args.images]
     else:
         sample_dir = output_dir / "synthetic_inputs"
         samples = []
@@ -301,11 +513,20 @@ def main() -> None:
             rgb = make_synthetic_scene(640, 360, variant)
             raw_path = sample_dir / f"{variant}.png"
             save_rgb(raw_path, rgb)
-            samples.append((variant, rgb))
+            samples.append((variant, rgb, None))
 
     written: list[Path] = []
-    for name, rgb in samples:
-        paths = create_visualization(model, rgb, name, output_dir, device, args.command, args.speed_kmh)
+    for name, rgb, temporal_frames in samples:
+        paths = create_visualization(
+            model,
+            rgb,
+            name,
+            output_dir,
+            device,
+            args.command,
+            args.speed_kmh,
+            temporal_frames=temporal_frames,
+        )
         written.extend(paths.values())
 
     for path in written:
