@@ -4,8 +4,6 @@ outputs/*
 !data/.gitkeep
 !outputs/.gitkeep
 
-*.txt
-
 # Trọng số mô hình
 models/*.pth
 models/*.pt

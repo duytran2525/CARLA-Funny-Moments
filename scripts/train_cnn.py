@@ -77,7 +77,7 @@ def print_gpu_info():
 
 
 def collate_waypoint_batch(batch):
-    images, waypoints, commands, recovery_flags = zip(*batch)
+    images, waypoints, commands, recovery_flags, speeds = zip(*batch)
     return (
         torch.stack(images),
         torch.stack(waypoints).float(),
@@ -85,6 +85,7 @@ def collate_waypoint_batch(batch):
         torch.stack(recovery_flags).float()
         if torch.is_tensor(recovery_flags[0])
         else torch.tensor(recovery_flags, dtype=torch.float32),
+        torch.stack(speeds).float(),
     )
 
 
@@ -394,9 +395,11 @@ def main():
     sigma_min = float(config.get("sigma_min", 0.01))
     sigma_max = float(config.get("sigma_max", 10.0))
     warmup_epochs = int(config.get("warmup_epochs", 1))
+    aggressive_memory_cleanup = _to_bool(config.get("aggressive_memory_cleanup"), False)
 
     print(f"Optimizer: Adam (lr={base_lr})")
-    print(f"Loss weights: waypoint={lambda_wp} gnll={lambda_gnll} smoothness={lambda_smoothness}")
+    lambda_speed = float(config.get("loss_lambda_speed", 0.5))
+    print(f"Loss weights: waypoint={lambda_wp} gnll={lambda_gnll} smoothness={lambda_smoothness} speed={lambda_speed}")
     print(f"Mixed precision: {'enabled' if use_amp else 'disabled'}")
     print(f"Grad clip: {grad_clip_norm}, sigma range: [{sigma_min}, {sigma_max}]")
     print(f"Warmup epochs: {warmup_epochs}")
@@ -421,31 +424,40 @@ def main():
         running_loss = 0.0
         nan_batches = 0
 
-        for i, (images, waypoints, commands, recovery_flags) in enumerate(train_loader):
+        for i, (images, waypoints, commands, recovery_flags, speeds) in enumerate(train_loader):
             del recovery_flags
             images = images.to(primary_device, non_blocking=True)
             if primary_device.type == "cuda":
                 images = images.contiguous(memory_format=torch.channels_last)
             commands = commands.to(primary_device, non_blocking=True)
             waypoints = waypoints.to(primary_device, non_blocking=True)
+            speeds = speeds.to(primary_device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(device_type="cuda" if use_amp else "cpu", enabled=use_amp):
-                outputs = model(images, commands)
+                outputs = model(images, commands, speeds)
                 pred_wp = outputs[:, :10].view(-1, 5, 2)
-                # Model already applies softplus (cnn_model.py L256) — only clamp here
-                pred_sigma = outputs[:, 10:].view(-1, 5, 1).expand(-1, 5, 2).clamp(sigma_min, sigma_max)
+                # Model outputs sigma; GNLL uses variance for numerical consistency.
+                pred_sigma = outputs[:, 10:15].view(-1, 5, 1).expand(-1, 5, 2).clamp(sigma_min, sigma_max)
+                pred_var = pred_sigma.pow(2).clamp(sigma_min**2, sigma_max**2)
                 target_wp = waypoints.view(-1, 5, 2)
 
                 loss_wp = huber_loss(pred_wp, target_wp)
-                loss_gnll = 0.5 * ((target_wp - pred_wp) ** 2 / pred_sigma + torch.log(pred_sigma))
-                
+                loss_gnll = 0.5 * ((target_wp - pred_wp) ** 2 / pred_var + torch.log(pred_var))
+
                 vel = pred_wp[:, 1:] - pred_wp[:, :-1]
                 accel = vel[:, 1:] - vel[:, :-1]
                 smoothness_loss = accel.pow(2).mean()
 
-                loss = lambda_wp * loss_wp + lambda_gnll * loss_gnll.mean() + lambda_smoothness * smoothness_loss
+                # Speed prediction loss (CILRS-style auxiliary regularizer)
+                pred_speed = outputs[:, 15]
+                loss_speed = torch.nn.functional.mse_loss(pred_speed, speeds)
+
+                loss = (lambda_wp * loss_wp
+                        + lambda_gnll * loss_gnll.mean()
+                        + lambda_smoothness * smoothness_loss
+                        + lambda_speed * loss_speed)
 
             # Skip NaN/Inf batches to protect optimizer state
             if not torch.isfinite(loss):
@@ -481,28 +493,37 @@ def main():
         val_samples = 0
 
         with torch.no_grad():
-            for i, (images, waypoints, commands, recovery_flags) in enumerate(val_loader):
+            for i, (images, waypoints, commands, recovery_flags, speeds) in enumerate(val_loader):
                 del recovery_flags
                 images = images.to(primary_device, non_blocking=True)
                 if primary_device.type == "cuda":
                     images = images.contiguous(memory_format=torch.channels_last)
                 commands = commands.to(primary_device, non_blocking=True)
                 waypoints = waypoints.to(primary_device, non_blocking=True)
+                speeds = speeds.to(primary_device, non_blocking=True)
 
                 with torch.amp.autocast(device_type="cuda" if use_amp else "cpu", enabled=use_amp):
-                    outputs = model(images, commands)
+                    outputs = model(images, commands, speeds)
                     pred_wp = outputs[:, :10].view(-1, 5, 2)
-                    pred_sigma = outputs[:, 10:].view(-1, 5, 1).expand(-1, 5, 2).clamp(sigma_min, sigma_max)
+                    pred_sigma = outputs[:, 10:15].view(-1, 5, 1).expand(-1, 5, 2).clamp(sigma_min, sigma_max)
+                    pred_var = pred_sigma.pow(2).clamp(sigma_min**2, sigma_max**2)
                     target_wp = waypoints.view(-1, 5, 2)
 
                     loss_wp = huber_loss(pred_wp, target_wp)
-                    loss_gnll = 0.5 * ((target_wp - pred_wp) ** 2 / pred_sigma + torch.log(pred_sigma))
-                    
+                    loss_gnll = 0.5 * ((target_wp - pred_wp) ** 2 / pred_var + torch.log(pred_var))
+
                     vel = pred_wp[:, 1:] - pred_wp[:, :-1]
                     accel = vel[:, 1:] - vel[:, :-1]
                     smoothness_loss = accel.pow(2).mean()
 
-                    loss = lambda_wp * loss_wp + lambda_gnll * loss_gnll.mean() + lambda_smoothness * smoothness_loss
+                    # Speed prediction loss (CILRS-style auxiliary regularizer)
+                    pred_speed = outputs[:, 15]
+                    loss_speed = torch.nn.functional.mse_loss(pred_speed, speeds)
+
+                    loss = (lambda_wp * loss_wp
+                            + lambda_gnll * loss_gnll.mean()
+                            + lambda_smoothness * smoothness_loss
+                            + lambda_speed * loss_speed)
 
                 bs = images.size(0)
                 val_loss += float(loss.item()) * bs
@@ -547,7 +568,7 @@ def main():
                 print(f"\nEarly stopping after epoch {epoch + 1}")
                 break
 
-        if torch.cuda.is_available():
+        if aggressive_memory_cleanup and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     print("\n" + "=" * 70)

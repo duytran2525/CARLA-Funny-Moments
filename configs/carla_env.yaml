@@ -7,14 +7,14 @@ carla:
   fixed_delta: 0.03
   no_rendering: false
 
-  map: "Town06"
+  map: "Town02"
 
 
 
 vehicle:
   filter: "vehicle.tesla.model3"
-  spawn_point: 1 
-  destination_point: 15
+  spawn_point: 5
+  destination_point: 20
   role_name: "hero"
 
 spectator:
@@ -34,7 +34,7 @@ weather:
   preset: "ClearNoon"
 
 cil:
-  target_speed_kmh: 30
+  target_speed_kmh: 50
   max_throttle: 0.8
   max_brake: 0.80
   steer_smoothing: 0.85
@@ -70,10 +70,10 @@ yolo:
   debug_overlay: true
 
 traffic_spawn:
-  vehicle_count: 0
-  bike_count: 0
-  motorbike_count: 0
-  pedestrian_count: 0
+  vehicle_count: 50
+  bike_count: 30
+  motorbike_count: 40
+  pedestrian_count: 10
   npc_enable_autopilot: true
 
 recording:

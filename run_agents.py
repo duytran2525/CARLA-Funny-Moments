@@ -234,6 +234,51 @@ def decode_carla_depth_to_meters(image) -> Any:
     return normalized * 1000.0
 
 
+def build_supervisor_config() -> Dict[str, Any]:
+    """Default TrafficSupervisor configuration (shared by all agents)."""
+    return {
+        "confidence_threshold": 0.5,
+        "temporal_filter_frames": 3,
+        "red_light_distance_threshold": 30.0,
+        "red_stopline_trigger_distance_m": 7.0,
+        "red_hard_stop_min_brake": 1.0,
+        "red_hard_stop_hold_seconds": 1.5,
+        "green_immunity_frames": 10,
+        "stop_line_crawl_start_distance_m": 18.0,
+        "stop_line_crawl_end_distance_m": 7.0,
+        "stop_line_crawl_max_brake": 0.2,
+        "stop_line_crawl_target_speed_kmh": 12.0,
+        "stop_line_crawl_preview_brake": 0.03,
+        "stop_line_tracking_max_missing_seconds": 3.5,
+        "obstacle_distance_threshold": 5.0,
+        "max_stopped_time": 30.0,
+    }
+
+
+def to_supervisor_detections(detections: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    """Convert YOLO detection dicts into TrafficSupervisor input format."""
+    supervisor_inputs: list[Dict[str, Any]] = []
+    for det in detections:
+        box = det.get("box")
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        x1, y1, x2, y2 = [int(v) for v in box]
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        distance_m = float(det.get("distance", float("inf")))
+        if not math.isfinite(distance_m):
+            distance_m = float("inf")
+        supervisor_inputs.append(
+            {
+                "class_name": str(det.get("class_name", "unknown")),
+                "confidence": float(det.get("confidence", 0.0)),
+                "bbox": (x1, y1, w, h),
+                "distance_m": distance_m,
+                "relative_velocity_kmh": float(det.get("relative_velocity_kmh", 0.0)),
+            }
+        )
+    return supervisor_inputs
+
 def _draw_yellow_danger_corridor(
     frame_bgr: Any,
     debug_info: Dict[str, Any],
@@ -566,15 +611,8 @@ def resolve_model_path(model_path: str) -> Path:
         )
 
     def is_steering_candidate(path: Path) -> bool:
-        if torch is None or unwrap_state_dict is None or classify_checkpoint_state_dict is None:
-            return True
-        try:
-            checkpoint = torch.load(path, map_location="cpu")
-            state_dict = unwrap_state_dict(checkpoint)
-            kind = classify_checkpoint_state_dict(state_dict)
-        except Exception:
-            return True
-        return kind in {"steering", "steering_v2", "conditional_steering"}
+        name = path.name.lower()
+        return "waypoint" not in name and "cil" not in name
 
     preferred = newest("cnn_steering TL=*.pth")
     if preferred:
@@ -612,15 +650,8 @@ def resolve_cil_model_path(model_path: str) -> Path:
         )
 
     def is_waypoint_candidate(path: Path) -> bool:
-        if torch is None or unwrap_state_dict is None or classify_checkpoint_state_dict is None:
-            return False
-        try:
-            checkpoint = torch.load(path, map_location="cpu")
-            state_dict = unwrap_state_dict(checkpoint)
-            kind = classify_checkpoint_state_dict(state_dict)
-        except Exception:
-            return False
-        return kind == "waypoint"
+        name = path.name.lower()
+        return "waypoint" in name or "cil" in name
 
     preferred = newest("waypoint_predictor*.pth")
     preferred = [path for path in preferred if is_waypoint_candidate(path)]
@@ -1807,7 +1838,7 @@ class LaneFollowAgent(BaseAgent):
             logging.warning("TrafficSupervisor unavailable. lane_follow will use detector-only emergency fallback.")
         else:
             try:
-                self._traffic_supervisor = TrafficSupervisor(self._build_supervisor_config())
+                self._traffic_supervisor = TrafficSupervisor(build_supervisor_config())
                 self._last_supervisor_ts = None
                 logging.info("TrafficSupervisor integrated into lane_follow YOLO loop.")
             except Exception as exc:
@@ -1815,53 +1846,6 @@ class LaneFollowAgent(BaseAgent):
                 logging.warning("Failed to initialize TrafficSupervisor for lane_follow: %s", exc)
         self._yolo_enabled = True
         logging.info("YOLO detection integrated with lane_follow. Model: %s", model_path)
-
-    @staticmethod
-    def _build_supervisor_config() -> Dict[str, Any]:
-        return {
-            "confidence_threshold": 0.5,
-            "temporal_filter_frames": 3,
-            "red_light_distance_threshold": 30.0,
-            "red_stopline_trigger_distance_m": 7.0,
-            "red_hard_stop_min_brake": 1.0,
-            "red_hard_stop_hold_seconds": 1.5,
-            "green_immunity_frames": 10,
-            "stop_line_crawl_start_distance_m": 18.0,
-            "stop_line_crawl_end_distance_m": 7.0,
-            "stop_line_crawl_max_brake": 0.2,
-            "stop_line_crawl_target_speed_kmh": 12.0,
-            "stop_line_crawl_preview_brake": 0.03,
-            "stop_line_tracking_max_missing_seconds": 3.5,
-            "obstacle_distance_threshold": 5.0,
-            "max_stopped_time": 30.0,
-        }
-
-    @staticmethod
-    def _to_supervisor_detections(detections: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
-        supervisor_inputs: list[Dict[str, Any]] = []
-        for det in detections:
-            box = det.get("box")
-            if not isinstance(box, (list, tuple)) or len(box) != 4:
-                continue
-
-            x1, y1, x2, y2 = [int(v) for v in box]
-            w = max(1, x2 - x1)
-            h = max(1, y2 - y1)
-            distance_m = float(det.get("distance", float("inf")))
-            if not math.isfinite(distance_m):
-                distance_m = float("inf")
-
-            supervisor_inputs.append(
-                {
-                    "class_name": str(det.get("class_name", "unknown")),
-                    "confidence": float(det.get("confidence", 0.0)),
-                    "bbox": (x1, y1, w, h),
-                    "distance_m": distance_m,
-                    "relative_velocity_kmh": float(det.get("relative_velocity_kmh", 0.0)),
-                }
-            )
-
-        return supervisor_inputs
 
     def _load_model(self):
         if torch is None:
@@ -1892,7 +1876,7 @@ class LaneFollowAgent(BaseAgent):
 
         self._device = torch.device(device_name)
 
-        checkpoint = torch.load(model_path, map_location=self._device)
+        checkpoint = torch.load(model_path, map_location=self._device, weights_only=True)
         state_dict = unwrap_state_dict(checkpoint)
         model_kind = classify_checkpoint_state_dict(state_dict)
 
@@ -2048,7 +2032,7 @@ class LaneFollowAgent(BaseAgent):
             self._last_supervisor_ts = now_ts
 
             try:
-                sup_dets = self._to_supervisor_detections(detections)
+                sup_dets = to_supervisor_detections(detections)
                 supervisor_brake = float(
                     self._traffic_supervisor.compute(
                         detections=sup_dets,
@@ -3590,7 +3574,7 @@ class CILAgent(BaseAgent):
 
         self._device = torch.device(device_name)
 
-        checkpoint = torch.load(model_path, map_location=self._device)
+        checkpoint = torch.load(model_path, map_location=self._device, weights_only=True)
         state_dict = unwrap_state_dict(checkpoint)
         model_kind = classify_checkpoint_state_dict(state_dict)
         if model_kind != "waypoint":
@@ -3599,7 +3583,7 @@ class CILAgent(BaseAgent):
                 "Train or provide a waypoint predictor checkpoint such as models/waypoint_predictor.pth."
             )
 
-        model = CIL_NvidiaCNN().to(self._device)
+        model = CIL_NvidiaCNN(pretrained_backbone=False).to(self._device)
         model.load_state_dict(state_dict, strict=True)
         model.eval()
         logging.info("Loaded CIL model from %s on %s", model_path, self._device)
@@ -3892,22 +3876,25 @@ class CILAgent(BaseAgent):
         image_tensor.unsqueeze_(0)
 
         command_idx = max(0, min(3, int(command)))
+        speed_norm = clamp(float(speed_kmh) / self.CIL_MAX_SPEED_KMH, 0.0, 1.0)
         command_tensor = torch.tensor([command_idx], dtype=torch.long)
+        speed_tensor = torch.tensor([speed_norm], dtype=torch.float32)
 
         image_tensor = image_tensor.to(self._device, non_blocking=True)
         command_tensor = command_tensor.to(self._device, non_blocking=True)
+        speed_tensor = speed_tensor.to(self._device, non_blocking=True)
 
         with torch.inference_mode():
-            predictions = self._model(image_tensor, command_tensor)
+            predictions = self._model(image_tensor, command_tensor, speed_tensor)
 
         if torch.is_tensor(predictions):
             pred_tensor = predictions.detach().squeeze(0).cpu().float().numpy()
-            if pred_tensor.shape[0] == 15:
+            if pred_tensor.shape[0] >= 15:
                 wp_array = pred_tensor[:10].reshape(5, 2)
-                mean_uncertainty = float(np.mean(pred_tensor[10:]))
+                mean_uncertainty = float(np.mean(pred_tensor[10:15]))
             else:
                 logging.error(
-                    "Shape Model Output bị sai: %s (Kỳ vọng: 15). Dùng Zeros.",
+                    "Shape Model Output bị sai: %s (Kỳ vọng ít nhất 15). Dùng Zeros.",
                     pred_tensor.shape,
                 )
                 wp_array = np.zeros((5, 2), dtype=np.float32)
@@ -3918,29 +3905,6 @@ class CILAgent(BaseAgent):
             mean_uncertainty = 0.0
 
         return wp_array, mean_uncertainty
-
-    def _predict_cil_steering(self, rgb_frame, speed_kmh: float, command: int) -> float:
-        height = rgb_frame.shape[0]
-        cropped = rgb_frame[int(height * 0.45) :, :, :]
-        resized = cv2.resize(cropped, (200, 66), interpolation=cv2.INTER_AREA)
-
-        yuv_image = cv2.cvtColor(resized, cv2.COLOR_RGB2YUV)
-        image_tensor = torch.from_numpy(yuv_image).permute(2, 0, 1).float().div_(255.0)
-        image_tensor.sub_(0.5).div_(0.5)
-        image_tensor.unsqueeze_(0)
-
-        speed_norm = clamp(speed_kmh / self.CIL_MAX_SPEED_KMH, 0.0, 1.0)
-        command_idx = max(0, min(3, int(command)))
-        speed_tensor = torch.tensor([speed_norm], dtype=torch.float32)
-        command_tensor = torch.tensor([command_idx], dtype=torch.long)
-
-        image_tensor = image_tensor.to(self._device, non_blocking=True)
-        speed_tensor = speed_tensor.to(self._device, non_blocking=True)
-        command_tensor = command_tensor.to(self._device, non_blocking=True)
-
-        with torch.inference_mode():
-            steering_value = float(self._model(image_tensor, speed_tensor, command_tensor).item())
-        return clamp(steering_value, -1.0, 1.0)
 
     def _stabilize_cil_steering(
         self,
@@ -4796,7 +4760,7 @@ class YoloDetectAgent(BaseAgent):
             self._traffic_supervisor = None
         else:
             try:
-                self._traffic_supervisor = TrafficSupervisor(self._build_supervisor_config())
+                self._traffic_supervisor = TrafficSupervisor(build_supervisor_config())
                 logging.info("TrafficSupervisor integrated into yolo_detect control loop.")
             except Exception as exc:
                 self._traffic_supervisor = None
@@ -5099,53 +5063,6 @@ class YoloDetectAgent(BaseAgent):
             self._latest_rgb = None
             self._latest_depth_m = None
         return frame, depth_m
-
-    @staticmethod
-    def _build_supervisor_config() -> Dict[str, Any]:
-        return {
-            "confidence_threshold": 0.5,
-            "temporal_filter_frames": 3,
-            "red_light_distance_threshold": 30.0,
-            "red_stopline_trigger_distance_m": 7.0,
-            "red_hard_stop_min_brake": 1.0,
-            "red_hard_stop_hold_seconds": 1.5,
-            "green_immunity_frames": 10,
-            "stop_line_crawl_start_distance_m": 18.0,
-            "stop_line_crawl_end_distance_m": 7.0,
-            "stop_line_crawl_max_brake": 0.2,
-            "stop_line_crawl_target_speed_kmh": 12.0,
-            "stop_line_crawl_preview_brake": 0.03,
-            "stop_line_tracking_max_missing_seconds": 3.5,
-            "obstacle_distance_threshold": 5.0,
-            "max_stopped_time": 30.0,
-        }
-
-    @staticmethod
-    def _to_supervisor_detections(detections: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
-        supervisor_inputs: list[Dict[str, Any]] = []
-        for det in detections:
-            box = det.get("box")
-            if not isinstance(box, (list, tuple)) or len(box) != 4:
-                continue
-
-            x1, y1, x2, y2 = [int(v) for v in box]
-            w = max(1, x2 - x1)
-            h = max(1, y2 - y1)
-
-            distance_m = float(det.get("distance", float("inf")))
-            if not math.isfinite(distance_m):
-                distance_m = float("inf")
-
-            supervisor_inputs.append(
-                {
-                    "class_name": str(det.get("class_name", "unknown")),
-                    "confidence": float(det.get("confidence", 0.0)),
-                    "bbox": (x1, y1, w, h),
-                    "distance_m": distance_m,
-                    "relative_velocity_kmh": float(det.get("relative_velocity_kmh", 0.0)),
-                }
-            )
-        return supervisor_inputs
 
     def _update_hud_fps(self) -> float:
         now = time.perf_counter()
@@ -5857,7 +5774,7 @@ class YoloDetectAgent(BaseAgent):
                     speed_kmh = 0.0
 
                 # Compute supervisor advisory signal for downstream code/debug only.
-                sup_dets = self._to_supervisor_detections(detections)
+                sup_dets = to_supervisor_detections(detections)
                 supervisor_brake = float(
                     self._traffic_supervisor.compute(
                         detections=sup_dets,

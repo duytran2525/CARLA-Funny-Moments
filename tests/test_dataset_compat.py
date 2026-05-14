@@ -63,11 +63,12 @@ class WaypointDatasetCompatibilityTests(unittest.TestCase):
                 filter_stationary=False,
             )
             self.assertEqual(len(dataset), 1)
-            image_tensor, waypoint_tensor, command_tensor, recovery_tensor = dataset[0]
+            image_tensor, waypoint_tensor, command_tensor, recovery_tensor, speed_tensor = dataset[0]
             self.assertEqual(tuple(image_tensor.shape), (9, 66, 200))
             self.assertEqual(tuple(waypoint_tensor.shape), (5, 2))
             self.assertEqual(int(command_tensor.item()), 2)
             self.assertEqual(float(recovery_tensor.item()), 1.0)
+            self.assertGreaterEqual(float(speed_tensor.item()), 0.0)
             self.assertEqual(list(dataset.get_recovery_flags()), [1])
 
     def test_legacy_schema_resolves_center_aliases(self) -> None:
@@ -100,7 +101,7 @@ class WaypointDatasetCompatibilityTests(unittest.TestCase):
                 filter_stationary=False,
             )
             self.assertEqual(len(dataset), 1)
-            image_tensor, waypoint_tensor, command_tensor, _recovery_tensor = dataset[0]
+            image_tensor, waypoint_tensor, command_tensor, _recovery_tensor, _speed_tensor = dataset[0]
             self.assertEqual(tuple(image_tensor.shape), (9, 66, 200))
             self.assertEqual(tuple(waypoint_tensor.shape), (5, 2))
             self.assertEqual(int(command_tensor.item()), 2)

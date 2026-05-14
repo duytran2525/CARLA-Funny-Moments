@@ -21,6 +21,7 @@ import gc
 import os
 import random
 import shutil
+import subprocess
 import sys
 import warnings
 from pathlib import Path
@@ -57,28 +58,73 @@ H5_PATH = "/kaggle/input/datasets/yudtrann/dataset-carlav3/carla_images_drive.h5
 CSV_ROOT: str | None = "/kaggle/input/datasets/yudtrann/datasetcarlav2/data_carlav2"
 
 # ============================================================================
-# 1. CLONE REPO & SETUP
+# 1. WORKSPACE SETUP
 # ============================================================================
-print("🚀 ĐANG KHỞI TẠO HỆ THỐNG HUẤN LUYỆN (H5 MODE)...")
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
-if os.path.exists(WORKING_DIR):
-    shutil.rmtree(WORKING_DIR)
-os.system(f"git clone {REPO_URL} {WORKING_DIR}")
-os.chdir(WORKING_DIR)
-os.makedirs("models", exist_ok=True)
 
-sys.path.insert(0, WORKING_DIR)
+def _to_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
 
-print("\n⚙️ ĐANG GHI ĐÈ CẤU HÌNH YAML...")
-yaml_path = os.path.join(WORKING_DIR, "configs", "train_params.yaml")
-with open(yaml_path, "r", encoding="utf-8") as f:
-    config = yaml.safe_load(f)
-config["data_root"] = "/kaggle/working"
-for key in ("csv_path", "data_csv"):
-    config.pop(key, None)
-with open(yaml_path, "w", encoding="utf-8") as f:
-    yaml.dump(config, f)
-print("✅ Đã cập nhật train_params.yaml!")
+
+def _is_relative_to(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def prepare_workspace() -> Path:
+    """Prepare a runnable project directory without side effects on import."""
+    script_root = Path(__file__).resolve().parents[1]
+    target_root = Path(WORKING_DIR)
+    kaggle_detected = Path("/kaggle/input").is_dir()
+    bootstrap_default = kaggle_detected and not _is_relative_to(script_root, target_root)
+    bootstrap_enabled = _env_flag("KAGGLE_BOOTSTRAP", bootstrap_default)
+
+    print("🚀 ĐANG KHỞI TẠO HỆ THỐNG HUẤN LUYỆN (H5 MODE)...")
+    project_dir = script_root
+    if bootstrap_enabled:
+        if _is_relative_to(script_root, target_root):
+            print("  Đang chạy trong WORKING_DIR hiện tại; bỏ qua clone lại repo.")
+        else:
+            if target_root.exists():
+                shutil.rmtree(target_root)
+            subprocess.run(["git", "clone", REPO_URL, str(target_root)], check=True)
+            project_dir = target_root.resolve()
+
+    os.chdir(project_dir)
+    (project_dir / "models").mkdir(exist_ok=True)
+    project_text = str(project_dir)
+    if project_text not in sys.path:
+        sys.path.insert(0, project_text)
+
+    print("\n⚙️ ĐANG GHI ĐÈ CẤU HÌNH YAML...")
+    yaml_path = project_dir / "configs" / "train_params.yaml"
+    with yaml_path.open("r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    config["data_root"] = "/kaggle/working" if Path("/kaggle/working").is_dir() else str(project_dir)
+    for key in ("csv_path", "data_csv"):
+        config.pop(key, None)
+    with yaml_path.open("w", encoding="utf-8") as f:
+        yaml.dump(config, f)
+    print("✅ Đã cập nhật train_params.yaml!")
+    return project_dir
 
 
 # ============================================================================
@@ -450,12 +496,13 @@ class WaypointCarlaDatasetH5(Dataset):
 # 4. TRAINING
 # ============================================================================
 def main():
+    project_dir = prepare_workspace()
     print("\n🔥 BẮT ĐẦU HUẤN LUYỆN (H5)...")
 
     from core_perception.cnn_model import WaypointPredictor
 
     # ── Config ──
-    with open(os.path.join(WORKING_DIR, "configs", "train_params.yaml"), "r") as f:
+    with (project_dir / "configs" / "train_params.yaml").open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     seed = int(config.get("seed", 42))
@@ -488,7 +535,7 @@ def main():
     train_ratio = float(config.get("train_split", 0.75))
     geo_offset = float(config.get("geometric_offset", 0.35))
 
-    include_side = bool(config.get("include_side_cameras_train", True))
+    include_side = _to_bool(config.get("include_side_cameras_train"), True)
     print(f"\n📦 Đang tạo H5 datasets... (side_cameras={include_side})")
     train_dataset = WaypointCarlaDatasetH5(
         h5_path=H5_PATH,
@@ -544,11 +591,11 @@ def main():
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, sampler=sampler,
-        num_workers=0, pin_memory=True, collate_fn=collate_fn,
+        num_workers=0, pin_memory=primary_device.type == "cuda", collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=0, pin_memory=True, collate_fn=collate_fn,
+        num_workers=0, pin_memory=primary_device.type == "cuda", collate_fn=collate_fn,
     )
 
     print(f"DataLoader: batch={batch_size}, workers=0 (h5py safe mode)")
@@ -599,8 +646,9 @@ def main():
     sigma_max = float(config.get("sigma_max", 10.0))
     warmup_epochs = int(config.get("warmup_epochs", 3))
     backbone_freeze_epochs = int(config.get("backbone_freeze_epochs", 5))
+    aggressive_memory_cleanup = _to_bool(config.get("aggressive_memory_cleanup"), False)
 
-    model_save = Path(WORKING_DIR) / "models" / "waypoint_predictor_h5.pth"
+    model_save = project_dir / "models" / "waypoint_predictor_h5.pth"
     model_save.parent.mkdir(exist_ok=True)
 
     epochs = int(config["epochs"])
@@ -613,7 +661,7 @@ def main():
     resume_path = config.get("resume_checkpoint")
     if resume_path and os.path.isfile(resume_path):
         print(f"\n🔄 ĐANG KHÔI PHỤC TỪ CHECKPOINT: {resume_path}")
-        checkpoint = torch.load(resume_path, map_location=primary_device)
+        checkpoint = torch.load(resume_path, map_location=primary_device, weights_only=True)
         
         # Load model
         if "model_state_dict" in checkpoint:
@@ -710,8 +758,9 @@ def main():
             del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_gnll, loss, imgs, cmds, wps, speeds
 
             if i % 50 == 0:
-                gc.collect()
-                if torch.cuda.is_available():
+                if aggressive_memory_cleanup:
+                    gc.collect()
+                if aggressive_memory_cleanup and torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 # CPU RAM check via /proc (Linux/Kaggle)
                 cpu_mb = 0
@@ -742,7 +791,7 @@ def main():
             train_dataset._h5_handle.close()
             train_dataset._h5_handle = None
         gc.collect()
-        if torch.cuda.is_available():
+        if aggressive_memory_cleanup and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         # ── VAL ──
@@ -781,7 +830,7 @@ def main():
                 val_mae += float((pred_wp - tgt_wp).abs().mean().item()) * bs
                 val_samples += bs
                 del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_g, loss, imgs, cmds, wps, speeds
-                if i % 50 == 0:
+                if aggressive_memory_cleanup and i % 50 == 0:
                     gc.collect()
 
         # Flush val H5 handle too

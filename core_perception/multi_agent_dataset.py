@@ -52,7 +52,7 @@ class MultiAgentTrajectoryDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor | str | int | float]:
         sample_path = self.sample_paths[int(index)]
-        sample = torch.load(sample_path, map_location="cpu", weights_only=False)
+        sample = torch.load(sample_path, map_location="cpu", weights_only=True)
         return {
             "x": torch.as_tensor(sample["x"], dtype=torch.float32),
             "y": torch.as_tensor(sample["y"], dtype=torch.float32),
@@ -155,4 +155,3 @@ def collate_multi_agent_trajectory(batch: Iterable[Dict[str, object]]) -> Dict[s
         "run_ids": run_ids,
         "sample_paths": sample_paths,
     }
-
