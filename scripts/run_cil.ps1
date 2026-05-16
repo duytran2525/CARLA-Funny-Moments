@@ -1,12 +1,20 @@
 param(
     [string]$CarlaRoot = "E:\Carla",
     [string]$Config = "configs/carla_env.yaml",
-    [string]$Model = "auto",
+    [ValidateSet("cil", "cil_yolo")]
+    [string]$Agent = "cil_yolo",
+    [string]$Model = "models\waypoint_predictor_h5.pth",
+    [string]$YoloModel = "rtdetr-l.engine",
     [Nullable[double]]$TargetSpeedKmh = $null,
     [Nullable[double]]$MaxThrottle = $null,
     [Nullable[double]]$MaxBrake = $null,
     [Nullable[int]]$Ticks = $null,
     [string]$Device = "auto",
+    [Nullable[int]]$YoloEveryNTicks = $null,
+    [switch]$NoYoloVisualize,
+    [switch]$NoYoloDrawOverlay,
+    [switch]$OpencvRouteMap,
+    [switch]$NoOpencvRouteMap,
     [switch]$NoRandomWeather,
     [Nullable[int]]$NpcVehicleCount = $null,
     [Nullable[int]]$NpcBikeCount = $null,
@@ -50,6 +58,17 @@ else {
     $modelPath = $resolvedModel
 }
 
+if ([System.IO.Path]::IsPathRooted($YoloModel)) {
+    $resolvedYoloModel = $YoloModel
+}
+else {
+    $resolvedYoloModel = Join-Path $repoRoot $YoloModel
+}
+if (-not (Test-Path $resolvedYoloModel)) {
+    throw "YOLO/RT-DETR model file not found: $resolvedYoloModel"
+}
+$yoloModelPath = $resolvedYoloModel
+
 $pythonApi = Join-Path $CarlaRoot "PythonAPI"
 if (-not (Test-Path $pythonApi)) {
     throw "CARLA PythonAPI not found: $pythonApi"
@@ -80,13 +99,16 @@ if ($modelPath -eq "auto") {
 else {
     Write-Host "Model : $modelPath"
 }
+Write-Host "YOLO  : $yoloModelPath"
+Write-Host "Agent : $Agent"
 Write-Host "CARLA : $CarlaRoot"
-Write-Host "----- Running CIL agent -----"
+Write-Host "----- Running CIL + YOLO agent -----"
 
 $runnerArgs = @(
-    "--agent", "cil",
+    "--agent", $Agent,
     "--config", $configPath,
     "--cil-model-path", $modelPath,
+    "--yolo-model-path", $yoloModelPath,
     "--device", $Device
 )
 
@@ -113,6 +135,21 @@ if ($null -ne $NpcPedestrianCount) {
 }
 if ($null -ne $Ticks) {
     $runnerArgs += @("--ticks", [string]$Ticks)
+}
+if ($null -ne $YoloEveryNTicks) {
+    $runnerArgs += @("--yolo-every-n-ticks", [string]$YoloEveryNTicks)
+}
+if ($NoYoloVisualize) {
+    $runnerArgs += "--no-yolo-visualize"
+}
+if ($NoYoloDrawOverlay) {
+    $runnerArgs += "--no-yolo-draw-overlay"
+}
+if ($OpencvRouteMap) {
+    $runnerArgs += "--opencv-route-map"
+}
+if ($NoOpencvRouteMap) {
+    $runnerArgs += "--no-opencv-route-map"
 }
 if ($NoRandomWeather) {
     $runnerArgs += "--no-random-weather"

@@ -60,9 +60,9 @@ yolo:
   tracker: "botsort.yaml"
   inference_every_n_ticks: 1
   inference_imgsz: 0
-  # Bật cửa sổ debug YOLO kiểu cũ.
-  # true  = mở màn hình cv2 của yolo_detect để quan sát trực tiếp.
-  # false = không mở màn hình, tiết kiệm FPS/tài nguyên.
+  # Cửa sổ OpenCV hiển thị kết quả detect (bbox / HUD tùy debug_overlay).
+  # - agent=yolo_detect: bật/tắt màn hình debug YOLO.
+  # - agent=cil_yolo: cửa sổ "CARLA CIL + YOLO"; khi chạy bấm 'y' để bật/tắt. CLI: --no-yolo-visualize.
   debug_window: true
   # Khi debug_window=true:
   # true  = vẽ box, HUD, corridor như giao diện debug cũ.
@@ -89,6 +89,9 @@ runtime:
   fps_log_interval_ticks: 30
   cil_enable_hud: false
   cil_enable_route_map: false
+  # cil_yolo OpenCV: YOLO = yolo.debug_window + phím 'y'; route map = cil_opencv_route_map + phím 'r'.
+  cil_opencv_route_map: true
+  cil_world_waypoint_debug: false
   cil_enable_telemetry_csv: false
   cil_profile_tick_timing: false
   cil_profile_log_interval_ticks: 60

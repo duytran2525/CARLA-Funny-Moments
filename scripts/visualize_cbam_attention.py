@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import queue
 import sys
 from pathlib import Path
@@ -26,6 +27,12 @@ MODEL_INPUT_SIZE = (200, 66)
 DEFAULT_MODEL_PATH = Path("models/waypoint_predictor_h5.pth")
 DEFAULT_OUTPUT_DIR = Path("outputs/cbam_attention")
 DEFAULT_CARLA_CONFIG = Path("configs/carla_env.yaml")
+COMMAND_LABELS = {
+    0: "LANE_FOLLOW",
+    1: "LEFT",
+    2: "RIGHT",
+    3: "STRAIGHT",
+}
 
 
 def clamp01(values: np.ndarray) -> np.ndarray:
@@ -76,6 +83,14 @@ def parse_spawn_indices(raw: str | None, start: int, count: int) -> list[int]:
     if raw:
         return [int(part.strip()) for part in raw.split(",") if part.strip()]
     return [start + offset * 3 for offset in range(max(1, count))]
+
+
+def command_label(command: int) -> str:
+    return COMMAND_LABELS.get(int(command), f"CMD_{int(command)}")
+
+
+def command_suffix(command: int) -> str:
+    return f"cmd{int(command)}_{command_label(command).lower()}"
 
 
 def make_synthetic_scene(width: int, height: int, variant: str) -> np.ndarray:
@@ -386,6 +401,14 @@ def build_comparison(original: np.ndarray, before: np.ndarray, after: np.ndarray
     return np.concatenate([top, bottom], axis=0)
 
 
+def annotate_command_banner(rgb: np.ndarray, command: int, speed_kmh: float) -> np.ndarray:
+    output = rgb.copy()
+    text = f"Command {int(command)}: {command_label(command)} | speed={float(speed_kmh):.1f} km/h"
+    cv2.rectangle(output, (12, output.shape[0] - 52), (560, output.shape[0] - 12), (0, 0, 0), thickness=-1)
+    cv2.putText(output, text, (24, output.shape[0] - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+    return output
+
+
 def create_visualization(
     model: CIL_NvidiaCNN,
     rgb: np.ndarray,
@@ -396,6 +419,7 @@ def create_visualization(
     speed_kmh: float,
     temporal_frames: Iterable[np.ndarray] | None = None,
 ) -> dict[str, Path]:
+    command = max(0, min(3, int(command)))
     frames = list(temporal_frames) if temporal_frames is not None else make_temporal_frames(rgb)
     if len(frames) < 3:
         frames = [frames[-1] if frames else rgb] * (3 - len(frames)) + frames
@@ -409,14 +433,19 @@ def create_visualization(
     after_map = full_frame_heatmap(normalize_map(after_raw, lower, upper), rgb.shape)
     spatial_map = full_frame_heatmap(normalize_map(spatial_raw, 0.0, 1.0), rgb.shape, interpolation=cv2.INTER_NEAREST)
 
-    original_img = annotate_original(rgb, "Original input")
+    original_img = annotate_original(rgb, f"Original input | Command {command}: {command_label(command)}")
     before_img = overlay_heatmap(rgb, before_map, "Before CBAM: raw Stage-4 activation")
     after_img = overlay_heatmap(rgb, after_map, "After CBAM: refined activation")
     spatial_img = overlay_heatmap(rgb, spatial_map, "CBAM spatial attention mask")
     spatial_grid_img = draw_feature_grid(spatial_img, spatial_raw.shape)
 
-    comparison = build_comparison(original_img, before_img, spatial_img, after_img)
+    comparison = annotate_command_banner(
+        build_comparison(original_img, before_img, spatial_img, after_img),
+        command,
+        speed_kmh,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{name}_{command_suffix(command)}"
     paths = {
         "original": output_dir / f"{name}_00_original.png",
         "before": output_dir / f"{name}_01_before_cbam.png",
@@ -475,12 +504,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--carla-timeout", type=float, default=None)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--command", type=int, default=0)
+    parser.add_argument("--commands", type=int, nargs="*", default=None, help="Optional per-sample commands. Values cycle if fewer than samples.")
     parser.add_argument("--speed-kmh", type=float, default=30.0)
     args = parser.parse_args()
     selected_sources = sum(bool(value) for value in (args.carla_live, args.images, args.temporal_images))
     if selected_sources > 1:
         parser.error("--carla-live, --images, and --temporal-images are mutually exclusive.")
     return args
+
+
+def command_for_sample(args: argparse.Namespace, index: int) -> int:
+    commands = args.commands or [args.command]
+    if not commands:
+        return int(args.command)
+    return max(0, min(3, int(commands[index % len(commands)])))
+
+
+def write_manifest(output_dir: Path, rows: list[dict[str, object]]) -> Path:
+    manifest_path = output_dir / "manifest.csv"
+    with manifest_path.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=["sample", "command", "command_label", "speed_kmh", "compare_path", "grid_path"],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    return manifest_path
 
 
 def main() -> None:
@@ -516,18 +565,33 @@ def main() -> None:
             samples.append((variant, rgb, None))
 
     written: list[Path] = []
-    for name, rgb, temporal_frames in samples:
+    manifest_rows: list[dict[str, object]] = []
+    for sample_idx, (name, rgb, temporal_frames) in enumerate(samples):
+        command = command_for_sample(args, sample_idx)
         paths = create_visualization(
             model,
             rgb,
             name,
             output_dir,
             device,
-            args.command,
+            command,
             args.speed_kmh,
             temporal_frames=temporal_frames,
         )
         written.extend(paths.values())
+        manifest_rows.append(
+            {
+                "sample": name,
+                "command": int(command),
+                "command_label": command_label(command),
+                "speed_kmh": f"{float(args.speed_kmh):.3f}",
+                "compare_path": str(paths["compare"]),
+                "grid_path": str(paths["grid"]),
+            }
+        )
+
+    if manifest_rows:
+        written.append(write_manifest(output_dir, manifest_rows))
 
     for path in written:
         print(path)

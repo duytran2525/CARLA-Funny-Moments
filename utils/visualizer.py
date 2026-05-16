@@ -286,6 +286,8 @@ class RouteMapVisualizer:
 		heading_yaw_deg: Optional[float] = None,
 		trajectory_points: Optional[Iterable[Any]] = None,
 		command: Optional[int] = None,
+		*,
+		invoke_wait_key: bool = True,
 	) -> None:
 		if not self.enabled or cv2 is None or np is None:
 			return
@@ -316,7 +318,8 @@ class RouteMapVisualizer:
 				2,
 			)
 			cv2.imshow(self.window_name, canvas)
-			cv2.waitKey(1)
+			if invoke_wait_key:
+				cv2.waitKey(1)
 			return
 
 		bounds_points = list(route_xy)
@@ -382,7 +385,8 @@ class RouteMapVisualizer:
 			ly += 20
 
 		cv2.imshow(self.window_name, canvas)
-		cv2.waitKey(1)
+		if invoke_wait_key:
+			cv2.waitKey(1)
 
 	def close(self) -> None:
 		if not self.enabled or cv2 is None:

@@ -360,8 +360,12 @@ def _draw_yellow_danger_corridor(
 def _draw_red_light_zone_rois(
     frame_bgr: Any,
     supervisor_debug: Dict[str, Any],
+    *,
+    visible: bool = True,
 ) -> bool:
     """Draw static red-light ROI bands used by TrafficSupervisor."""
+    if not visible:
+        return False
     if np is None or cv2 is None:
         return False
     if frame_bgr is None or getattr(frame_bgr, "shape", None) is None:
@@ -746,6 +750,8 @@ class RunConfig:
     fps_log_interval_ticks: int
     cil_enable_hud: bool
     cil_enable_route_map: bool
+    cil_opencv_route_map: bool
+    cil_world_waypoint_debug: bool
     cil_enable_telemetry_csv: bool
     cil_profile_tick_timing: bool
     cil_profile_log_interval_ticks: int
@@ -760,6 +766,7 @@ class RunConfig:
     yolo_inference_every_n_ticks: int
     yolo_visualize: bool
     yolo_draw_overlay: bool
+    yolo_show_red_light_rois: bool
     yolo_inference_imgsz: int
     yolo_tracker_config: str
     yolo_secondary_tracker_config: str
@@ -2088,7 +2095,11 @@ class LaneFollowAgent(BaseAgent):
             is_emergency = bool(detector_emergency)
 
         annotated_frame = frame_bgr.copy()
-        _draw_red_light_zone_rois(annotated_frame, sup_debug)
+        _draw_red_light_zone_rois(
+            annotated_frame,
+            sup_debug,
+            visible=bool(self.config.yolo_show_red_light_rois),
+        )
         _draw_yellow_danger_corridor(annotated_frame, debug_info, sup_debug)
 
         for det in detections:
@@ -2392,6 +2403,8 @@ class CILAgent(BaseAgent):
         self._stop_requested = False
         self._visualizer = None
         self._route_map = None
+        self._opencv_yolo_visible = bool(config.yolo_visualize)
+        self._opencv_route_visible = bool(config.cil_opencv_route_map)
         self._telemetry_fp = None
         self._telemetry_writer = None
         self._nav_agent = None
@@ -2492,21 +2505,29 @@ class CILAgent(BaseAgent):
         if self.config.cil_enable_telemetry_csv:
             self._init_telemetry_logger()
 
-        # Initialize the separate route-map OpenCV window.
-        if RouteMapVisualizer is not None:
+        # Separate OpenCV route-map window (CARLA world route overlay uses cil_enable_route_map).
+        if RouteMapVisualizer is not None and self._opencv_route_visible:
             self._route_map = RouteMapVisualizer(
                 window_name="CIL Route Map",
                 canvas_size=620,
             )
-            logging.info("RouteMapVisualizer window enabled.")
+            logging.info("RouteMapVisualizer OpenCV window enabled (runtime: press 'r' to toggle).")
 
         self._enabled = True
         logging.info(
-            "CIL agent is ready (hud=%s, route_map=%s, telemetry_csv=%s).",
+            "CIL agent is ready (hud=%s, route_map_world=%s, route_map_opencv=%s, telemetry_csv=%s).",
             self.config.cil_enable_hud,
             self.config.cil_enable_route_map,
+            self._opencv_route_visible,
             self.config.cil_enable_telemetry_csv,
         )
+        if self._cil_yolo_enabled:
+            logging.info(
+                "cil_yolo OpenCV: press 'y' to toggle YOLO window, 'r' to toggle route map window "
+                "(initial YOLO=%s, route_cv=%s).",
+                self._opencv_yolo_visible,
+                self._opencv_route_visible,
+            )
 
     def _init_telemetry_logger(self) -> None:
         telemetry_path = (Path(__file__).resolve().parent / "outputs" / "cil_route_debug.csv")
@@ -2581,10 +2602,10 @@ class CILAgent(BaseAgent):
                 logging.warning("Failed to initialize TrafficSupervisor for cil_yolo: %s", exc)
 
         logging.info(
-            "CIL+YOLO fusion enabled. Detector=%s every_n_ticks=%d visualize=%s draw_overlay=%s",
+            "CIL+YOLO fusion enabled. Detector=%s every_n_ticks=%d opencv_yolo=%s draw_overlay=%s",
             model_path,
             int(self.config.yolo_inference_every_n_ticks),
-            bool(self.config.yolo_visualize),
+            bool(self._opencv_yolo_visible),
             bool(self.config.yolo_draw_overlay),
         )
 
@@ -2596,12 +2617,18 @@ class CILAgent(BaseAgent):
         sup_debug: Dict[str, Any],
         speed_kmh: float,
         control: Any,
+        fps: float,
     ) -> Any:
         annotated = frame_bgr.copy()
+        self._draw_cil_yolo_fps_overlay(annotated, fps)
         if not self.config.yolo_draw_overlay:
             return annotated
 
-        _draw_red_light_zone_rois(annotated, sup_debug)
+        _draw_red_light_zone_rois(
+            annotated,
+            sup_debug,
+            visible=bool(self.config.yolo_show_red_light_rois),
+        )
         _draw_yellow_danger_corridor(annotated, debug_info, sup_debug)
         for det in detections:
             x1, y1, x2, y2 = [int(v) for v in det.get("box", (0, 0, 0, 0))]
@@ -2653,6 +2680,35 @@ class CILAgent(BaseAgent):
         )
         return annotated
 
+    @staticmethod
+    def _draw_cil_yolo_fps_overlay(frame_bgr: Any, fps: float) -> None:
+        if cv2 is None or frame_bgr is None or getattr(frame_bgr, "shape", None) is None:
+            return
+
+        text = f"FPS: {float(fps):.1f}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.72
+        thickness = 2
+        text_size, baseline = cv2.getTextSize(text, font, scale, thickness)
+        text_w, text_h = text_size
+        frame_h, frame_w = frame_bgr.shape[:2]
+        pad = 8
+        x1 = max(0, frame_w - text_w - 2 * pad - 10)
+        y1 = 10
+        x2 = min(frame_w - 1, x1 + text_w + 2 * pad)
+        y2 = min(frame_h - 1, y1 + text_h + baseline + 2 * pad)
+        cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 0, 0), -1)
+        cv2.putText(
+            frame_bgr,
+            text,
+            (x1 + pad, y2 - pad - baseline),
+            font,
+            scale,
+            (40, 220, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+
     def _run_cil_yolo_fusion(
         self,
         frame_rgb: Any,
@@ -2660,6 +2716,7 @@ class CILAgent(BaseAgent):
         current_steer: float,
         speed_kmh: float,
         control: Any,
+        fps: float,
     ) -> tuple[bool, Dict[str, Any], Any]:
         if self._yolo_detector is None:
             return False, {}, None
@@ -2676,10 +2733,16 @@ class CILAgent(BaseAgent):
             cached_debug_info["detector_cache_age_ticks"] = (
                 0 if self._last_yolo_detection_step is None else step_idx - int(self._last_yolo_detection_step)
             )
+            annotated = None
+            if self._opencv_yolo_visible:
+                annotated = self._cached_yolo_annotated_frame
+                if annotated is not None:
+                    annotated = annotated.copy()
+                    self._draw_cil_yolo_fps_overlay(annotated, fps)
             return (
                 bool(self._cached_yolo_emergency),
                 cached_debug_info,
-                self._cached_yolo_annotated_frame,
+                annotated,
             )
 
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
@@ -2741,7 +2804,7 @@ class CILAgent(BaseAgent):
             debug_info["obstacle_reason"] = str(sup_debug.get("obstacle_reason", ""))
 
         annotated = None
-        if self.config.yolo_visualize:
+        if self._opencv_yolo_visible:
             annotated = self._annotate_cil_yolo_frame(
                 frame_bgr,
                 detections,
@@ -2749,6 +2812,7 @@ class CILAgent(BaseAgent):
                 sup_debug,
                 speed_kmh,
                 control,
+                fps,
             )
 
         self._last_yolo_detection_step = int(step_idx)
@@ -2756,6 +2820,52 @@ class CILAgent(BaseAgent):
         self._cached_yolo_debug_info = dict(debug_info)
         self._cached_yolo_annotated_frame = annotated
         return bool(is_emergency), debug_info, annotated
+
+    def _ensure_route_map_visualizer(self) -> None:
+        if self._route_map is not None or RouteMapVisualizer is None:
+            return
+        self._route_map = RouteMapVisualizer(
+            window_name="CIL Route Map",
+            canvas_size=620,
+        )
+        logging.info("RouteMapVisualizer created (OpenCV route map window).")
+
+    def _destroy_yolo_opencv_window(self) -> None:
+        if cv2 is None or not self._cil_yolo_enabled:
+            return
+        try:
+            cv2.destroyWindow(self._yolo_window_name)
+        except Exception:
+            pass
+
+    def _destroy_route_opencv_window(self) -> None:
+        if self._route_map is None:
+            return
+        self._route_map.close()
+        self._route_map = None
+
+    def _process_cil_opencv_hotkeys(self, key: int) -> None:
+        if key < 0 or not self._cil_yolo_enabled:
+            return
+        ch = key & 0xFF
+        if ch in (ord("y"), ord("Y")):
+            self._opencv_yolo_visible = not self._opencv_yolo_visible
+            if not self._opencv_yolo_visible:
+                self._destroy_yolo_opencv_window()
+            logging.info(
+                "cil_yolo YOLO OpenCV window %s (press 'y' to toggle).",
+                "ON" if self._opencv_yolo_visible else "OFF",
+            )
+        if ch in (ord("r"), ord("R")):
+            self._opencv_route_visible = not self._opencv_route_visible
+            if not self._opencv_route_visible:
+                self._destroy_route_opencv_window()
+            else:
+                self._ensure_route_map_visualizer()
+            logging.info(
+                "cil_yolo route map OpenCV window %s (press 'r' to toggle).",
+                "ON" if self._opencv_route_visible else "OFF",
+            )
 
     def _accumulate_tick_timing(self, stage_s: Dict[str, float], step_idx: int) -> None:
         if not self.config.cil_profile_tick_timing:
@@ -4529,6 +4639,7 @@ class CILAgent(BaseAgent):
 
         speed_kmh = self._current_speed_kmh()
         self._last_speed_kmh = speed_kmh
+        hud_fps = self._update_hud_fps()
         stage_times["read"] = time.perf_counter() - read_t0
 
         self._write_video_frame(frame)
@@ -4621,6 +4732,7 @@ class CILAgent(BaseAgent):
         )
         yolo_debug_info: Dict[str, Any] = {}
         yolo_emergency = False
+        annotated_yolo_frame = None
         if self._cil_yolo_enabled and self._yolo_detector is not None:
             yolo_emergency, yolo_debug_info, annotated_yolo_frame = self._run_cil_yolo_fusion(
                 frame,
@@ -4628,6 +4740,7 @@ class CILAgent(BaseAgent):
                 current_steer=float(control.steer),
                 speed_kmh=float(speed_kmh),
                 control=control,
+                fps=hud_fps,
             )
             supervisor_brake = float(yolo_debug_info.get("supervisor_brake", 0.0))
             red_hard_stop_active = bool(yolo_debug_info.get("red_hard_stop_active", False))
@@ -4643,16 +4756,13 @@ class CILAgent(BaseAgent):
                 control.throttle = 0.0
                 control.brake = float(clamp(max(float(control.brake), supervisor_brake, emergency_floor), 0.0, 1.0))
                 control.hand_brake = bool(hold_hand_brake)
-            if annotated_yolo_frame is not None:
-                cv2.imshow(self._yolo_window_name, annotated_yolo_frame)
-                cv2.waitKey(1)
         vehicle.apply_control(control)
         vehicle_location = vehicle.get_location()
         rotation = vehicle.get_transform().rotation
         self._update_route_history(vehicle_location)
 
         # ── Debug: draw predicted waypoints in CARLA world ──
-        if step_idx % 3 == 0 and np is not None:
+        if self.config.cil_world_waypoint_debug and step_idx % 3 == 0 and np is not None:
             _yaw_r = math.radians(float(rotation.yaw))
             _cos_y, _sin_y = math.cos(_yaw_r), math.sin(_yaw_r)
             _z_draw = float(vehicle_location.z) + 0.5
@@ -4700,7 +4810,6 @@ class CILAgent(BaseAgent):
 
         viz_t0 = time.perf_counter()
 
-        hud_fps = self._update_hud_fps()
         self._update_spectator_follow()
         self._draw_hud_on_screen(
             step_idx, speed_kmh, adaptive_target_kmh,
@@ -4708,26 +4817,42 @@ class CILAgent(BaseAgent):
             command, hud_fps, destination_distance_m, route_locations,
         )
 
-        # ── Separate OpenCV route-map window ──
-        if self._route_map is not None and step_idx % 3 == 0:
-            vehicle_location = vehicle.get_location()
-            heading_yaw = float(vehicle.get_transform().rotation.yaw)
-            # Use the FULL reference route plan (S→D) instead of the clipped
-            # route_locations so the entire planned path is always visible.
-            full_route_locs = [
-                entry["location"]
-                for entry in self._reference_route_plan
-                if entry.get("location") is not None
-            ] if self._reference_route_plan else route_locations
-            self._route_map.show(
-                route_points=full_route_locs,
-                current_location=vehicle_location,
-                start_location=self._route_start_location,
-                destination_location=self._route_destination_location,
-                heading_yaw_deg=heading_yaw,
-                trajectory_points=self._route_history_xy,
-                command=command,
+        # ── Separate OpenCV route-map window + cil_yolo OpenCV hotkeys (single waitKey) ──
+        opencv_key = -1
+        if cv2 is not None and self._enabled:
+            if (
+                self._cil_yolo_enabled
+                and self._yolo_detector is not None
+                and self._opencv_yolo_visible
+                and annotated_yolo_frame is not None
+            ):
+                cv2.imshow(self._yolo_window_name, annotated_yolo_frame)
+            route_due = self._route_map is not None and self._opencv_route_visible and step_idx % 3 == 0
+            if route_due:
+                vehicle_location = vehicle.get_location()
+                heading_yaw = float(vehicle.get_transform().rotation.yaw)
+                full_route_locs = [
+                    entry["location"]
+                    for entry in self._reference_route_plan
+                    if entry.get("location") is not None
+                ] if self._reference_route_plan else route_locations
+                self._route_map.show(
+                    route_points=full_route_locs,
+                    current_location=vehicle_location,
+                    start_location=self._route_start_location,
+                    destination_location=self._route_destination_location,
+                    heading_yaw_deg=heading_yaw,
+                    trajectory_points=self._route_history_xy,
+                    command=command,
+                    invoke_wait_key=False,
+                )
+            need_opencv_wait = self._cil_yolo_enabled or (
+                self._route_map is not None and self._opencv_route_visible
             )
+            if need_opencv_wait:
+                opencv_key = int(cv2.waitKey(1) & 0xFF)
+            if self._cil_yolo_enabled:
+                self._process_cil_opencv_hotkeys(opencv_key)
 
         stage_times["viz"] = time.perf_counter() - viz_t0
 
@@ -6210,7 +6335,11 @@ class YoloDetectAgent(BaseAgent):
         if self.config.yolo_visualize:
             annotated_frame = frame_bgr.copy()
             if self.config.yolo_draw_overlay:
-                _draw_red_light_zone_rois(annotated_frame, sup_debug)
+                _draw_red_light_zone_rois(
+                    annotated_frame,
+                    sup_debug,
+                    visible=bool(self.config.yolo_show_red_light_rois),
+                )
 
                 yellow_drew = _draw_yellow_danger_corridor(
                     annotated_frame,
@@ -6621,6 +6750,32 @@ def parse_args() -> argparse.Namespace:
         help="Show raw YOLO camera feed without overlay drawing.",
     )
     parser.add_argument(
+        "--yolo-show-red-light-rois",
+        dest="yolo_show_red_light_rois",
+        action="store_true",
+        default=None,
+        help="Draw the two red-light ROI zones on the YOLO debug overlay.",
+    )
+    parser.add_argument(
+        "--no-yolo-show-red-light-rois",
+        dest="yolo_show_red_light_rois",
+        action="store_false",
+        help="Hide the two red-light ROI zones while keeping red-light stop logic enabled.",
+    )
+    parser.add_argument(
+        "--opencv-route-map",
+        dest="opencv_route_map",
+        action="store_true",
+        default=None,
+        help="Enable the separate OpenCV 'CIL Route Map' window (runtime: press 'r' when using cil_yolo).",
+    )
+    parser.add_argument(
+        "--no-opencv-route-map",
+        dest="opencv_route_map",
+        action="store_false",
+        help="Disable the OpenCV route map window at startup.",
+    )
+    parser.add_argument(
         "--device",
         default="auto",
         choices=["auto", "cpu", "cuda"],
@@ -6854,16 +7009,18 @@ def build_config(args: argparse.Namespace) -> RunConfig:
             "Collect-data autopilot forcing zero traffic_spawn counts (vehicles=0 bikes=0 motorbikes=0 pedestrians=0)."
         )
 
-    if args.agent == "cil" and spawn_point_cfg < 0:
+    is_cil_route_agent = args.agent in {"cil", "cil_yolo"}
+
+    if is_cil_route_agent and spawn_point_cfg < 0:
         logging.warning(
-            "CIL route map requires deterministic S point. vehicle.spawn_point < 0, forcing spawn_point=0."
+            "CIL/CIL+YOLO route map requires deterministic S point. vehicle.spawn_point < 0, forcing spawn_point=0."
         )
         spawn_point_cfg = 0
 
-    if args.agent == "cil" and destination_point_cfg < 0:
+    if is_cil_route_agent and destination_point_cfg < 0:
         destination_point_cfg = spawn_point_cfg + 1
         logging.warning(
-            "CIL route map requires deterministic D point. vehicle.destination_point < 0, "
+            "CIL/CIL+YOLO route map requires deterministic D point. vehicle.destination_point < 0, "
             "forcing destination_point=%d.",
             destination_point_cfg,
         )
@@ -6957,6 +7114,10 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     )
     if not yolo_visualize:
         yolo_draw_overlay = False
+    yolo_show_red_light_rois = _to_bool(
+        args.yolo_show_red_light_rois,
+        _to_bool(_cfg_get(env_cfg, "yolo", "show_red_light_rois", True), True),
+    )
     yolo_inference_imgsz = max(
         0,
         int(
@@ -7016,6 +7177,14 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     )
     cil_enable_hud = _to_bool(_cfg_get(env_cfg, "runtime", "cil_enable_hud", False), False)
     cil_enable_route_map = _to_bool(_cfg_get(env_cfg, "runtime", "cil_enable_route_map", False), False)
+    cil_opencv_route_map = _to_bool(
+        pick(args.opencv_route_map, "runtime", "cil_opencv_route_map", True),
+        True,
+    )
+    cil_world_waypoint_debug = _to_bool(
+        _cfg_get(env_cfg, "runtime", "cil_world_waypoint_debug", True),
+        True,
+    )
     cil_enable_telemetry_csv = _to_bool(
         _cfg_get(env_cfg, "runtime", "cil_enable_telemetry_csv", False),
         False,
@@ -7081,6 +7250,8 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         fps_log_interval_ticks=fps_log_interval_ticks,
         cil_enable_hud=cil_enable_hud,
         cil_enable_route_map=cil_enable_route_map,
+        cil_opencv_route_map=cil_opencv_route_map,
+        cil_world_waypoint_debug=cil_world_waypoint_debug,
         cil_enable_telemetry_csv=cil_enable_telemetry_csv,
         cil_profile_tick_timing=cil_profile_tick_timing,
         cil_profile_log_interval_ticks=cil_profile_log_interval_ticks,
@@ -7095,6 +7266,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         yolo_inference_every_n_ticks=int(yolo_inference_every_n_ticks),
         yolo_visualize=bool(yolo_visualize),
         yolo_draw_overlay=bool(yolo_draw_overlay),
+        yolo_show_red_light_rois=bool(yolo_show_red_light_rois),
         yolo_inference_imgsz=int(yolo_inference_imgsz),
         yolo_tracker_config=yolo_tracker_config,
         yolo_secondary_tracker_config=yolo_secondary_tracker_config,
