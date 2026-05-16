@@ -5,6 +5,7 @@ import unittest
 import numpy as np
 import torch
 
+import run_agents
 from core_perception.cnn_model import (
     CIL_NvidiaCNN,
     ConditionalSteeringCNN,
@@ -82,6 +83,75 @@ class CnnModelCompatibilityTests(unittest.TestCase):
         self.assertEqual(int(model.seen_command.item()), 2)
         self.assertAlmostEqual(float(model.seen_speed.item()), 0.5)
         self.assertAlmostEqual(mean_uncertainty, 12.0)
+
+    def test_cil_lane_constraint_falls_back_from_oncoming_lane(self) -> None:
+        class FakeLocation:
+            def __init__(self, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> None:
+                self.x = x
+                self.y = y
+                self.z = z
+
+        class FakeRotation:
+            yaw = 0.0
+
+        class FakeTransform:
+            def __init__(self, location: FakeLocation | None = None) -> None:
+                self.location = location or FakeLocation()
+                self.rotation = FakeRotation()
+
+        class FakeWaypoint:
+            def __init__(self, lane_id: int, location: FakeLocation) -> None:
+                self.lane_id = lane_id
+                self.transform = FakeTransform(location)
+
+            def next(self, distance: float):
+                return [FakeWaypoint(self.lane_id, FakeLocation(x=distance, y=0.0, z=0.0))]
+
+        class FakeMap:
+            def __init__(self) -> None:
+                self.ego_wp = FakeWaypoint(1, FakeLocation())
+
+            def get_waypoint(self, location: FakeLocation, **_kwargs):
+                if abs(location.x) < 1e-6 and abs(location.y) < 1e-6:
+                    return self.ego_wp
+                lane_id = -1 if location.y > 0.0 else 1
+                return FakeWaypoint(lane_id, FakeLocation(x=location.x, y=location.y, z=location.z))
+
+        class FakeWorld:
+            def __init__(self) -> None:
+                self.map = FakeMap()
+
+            def get_map(self) -> FakeMap:
+                return self.map
+
+        class FakeVehicle:
+            def get_transform(self) -> FakeTransform:
+                return FakeTransform(FakeLocation())
+
+        class FakeLaneType:
+            Driving = object()
+
+        class FakeCarla:
+            Location = FakeLocation
+            LaneType = FakeLaneType
+
+        old_carla = run_agents.carla
+        try:
+            run_agents.carla = FakeCarla
+            agent = object.__new__(CILAgent)
+            agent.session = type("Session", (), {"world": FakeWorld()})()
+
+            constrained = agent._constrain_waypoints_to_lane(
+                np.array([[10.0, 5.0]], dtype=np.float32),
+                FakeVehicle(),
+                command=0,
+            )
+        finally:
+            run_agents.carla = old_carla
+
+        self.assertEqual(tuple(constrained.shape), (1, 2))
+        self.assertGreaterEqual(float(constrained[0, 0]), 3.0)
+        self.assertAlmostEqual(float(constrained[0, 1]), 0.0)
 
     def test_cil_yolo_agent_is_registered_separately(self) -> None:
         self.assertIs(AGENT_REGISTRY["cil_yolo"], CILYoloAgent)

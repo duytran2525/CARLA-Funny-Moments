@@ -4,7 +4,7 @@ param(
     [ValidateSet("cil", "cil_yolo")]
     [string]$Agent = "cil_yolo",
     [string]$Model = "models\waypoint_predictor_h5.pth",
-    [string]$YoloModel = "rtdetr-l.engine",
+    [string]$YoloModel = "D:\AI\CARLA-Funny-Moments\models\yolo11m.engine",
     [Nullable[double]]$TargetSpeedKmh = $null,
     [Nullable[double]]$MaxThrottle = $null,
     [Nullable[double]]$MaxBrake = $null,
@@ -55,7 +55,13 @@ else {
     if (-not (Test-Path $resolvedModel)) {
         throw "Model file not found: $resolvedModel"
     }
-    $modelPath = $resolvedModel
+    $modelExt = [System.IO.Path]::GetExtension($resolvedModel).ToLowerInvariant()
+    if ($modelExt -eq ".pth" -or $modelExt -eq ".pt") {
+        $modelPath = $resolvedModel
+    }
+    else {
+        throw "CIL waypoint model must be a PyTorch checkpoint (.pth/.pt), not '$modelExt': $resolvedModel. Use -YoloModel for YOLO/RT-DETR .pt/.engine files."
+    }
 }
 
 if ([System.IO.Path]::IsPathRooted($YoloModel)) {
@@ -66,6 +72,10 @@ else {
 }
 if (-not (Test-Path $resolvedYoloModel)) {
     throw "YOLO/RT-DETR model file not found: $resolvedYoloModel"
+}
+$yoloModelExt = [System.IO.Path]::GetExtension($resolvedYoloModel).ToLowerInvariant()
+if ($yoloModelExt -ne ".pt" -and $yoloModelExt -ne ".engine" -and $yoloModelExt -ne ".onnx") {
+    throw "YOLO/RT-DETR model must be .pt, .engine, or .onnx, not '$yoloModelExt': $resolvedYoloModel"
 }
 $yoloModelPath = $resolvedYoloModel
 
@@ -94,10 +104,10 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "Python: $pythonExe"
 Write-Host "Config: $configPath"
 if ($modelPath -eq "auto") {
-    Write-Host "Model : auto (run_agents.py will auto-select a checkpoint)"
+    Write-Host "CIL   : auto (run_agents.py will auto-select a waypoint checkpoint)"
 }
 else {
-    Write-Host "Model : $modelPath"
+    Write-Host "CIL   : $modelPath"
 }
 Write-Host "YOLO  : $yoloModelPath"
 Write-Host "Agent : $Agent"

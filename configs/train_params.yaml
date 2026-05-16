@@ -40,6 +40,7 @@ loss_lambda_wp: 1.0              # Huber waypoint loss
 loss_lambda_gnll: 0.02           # Re-enabled gently (was 0.0 = disabled)
 loss_lambda_smoothness: 0.1     # Trajectory smoothness regularizer
 loss_lambda_speed: 0.5           # NEW: Speed prediction auxiliary loss (CILRS-style)
+loss_lambda_lane: 0.3            # Penalize predicted waypoints that drift >3m left
 
 # ── Learning Rate Scheduler ──
 lr_scheduler: cosine

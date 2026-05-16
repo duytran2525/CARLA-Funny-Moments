@@ -3907,6 +3907,11 @@ class CILAgent(BaseAgent):
             if not existing:
                 existing = "no .pth file found in models/"
             raise RuntimeError(f"CIL model file not found: {model_path}. Available: {existing}")
+        if model_path.suffix.lower() not in {".pth", ".pt"}:
+            raise RuntimeError(
+                f"CIL model path must be a PyTorch checkpoint (.pth/.pt), got '{model_path.suffix}': {model_path}. "
+                "TensorRT/ONNX detector files belong in --yolo-model-path."
+            )
 
         device_name = self.config.model_device.lower()
         if device_name == "auto":
@@ -3926,8 +3931,38 @@ class CILAgent(BaseAgent):
                 "Train or provide a waypoint predictor checkpoint such as models/waypoint_predictor.pth."
             )
 
+        uses_single_film_checkpoint = (
+            "film.embedding.weight" in state_dict
+            and "film_s4.embedding.weight" not in state_dict
+        )
+        if uses_single_film_checkpoint:
+            upgraded_state_dict = {}
+            for key, value in state_dict.items():
+                clean_key = str(key)
+                if clean_key.startswith("film."):
+                    upgraded_state_dict[f"film_s4.{clean_key[len('film.'):]}"] = value
+                else:
+                    upgraded_state_dict[clean_key] = value
+            state_dict = upgraded_state_dict
+
         model = CIL_NvidiaCNN(pretrained_backbone=False).to(self._device)
-        model.load_state_dict(state_dict, strict=True)
+        if uses_single_film_checkpoint:
+            load_result = model.load_state_dict(state_dict, strict=False)
+            allowed_missing = {key for key in model.state_dict() if key.startswith("film_s3.")}
+            unexpected = set(load_result.unexpected_keys)
+            missing = set(load_result.missing_keys)
+            if unexpected or (missing - allowed_missing):
+                raise RuntimeError(
+                    f"Cannot adapt old single-FiLM CIL checkpoint '{model_path.name}' to current model. "
+                    f"Missing={sorted(missing)} Unexpected={sorted(unexpected)}"
+                )
+            logging.warning(
+                "Loaded old single-FiLM CIL checkpoint '%s' by mapping film.* -> film_s4.*; "
+                "film_s3 stays identity until the model is retrained.",
+                model_path.name,
+            )
+        else:
+            model.load_state_dict(state_dict, strict=True)
         model.eval()
         logging.info("Loaded CIL model from %s on %s", model_path, self._device)
         return model
@@ -4248,6 +4283,78 @@ class CILAgent(BaseAgent):
             mean_uncertainty = 0.0
 
         return wp_array, mean_uncertainty
+
+    def _constrain_waypoints_to_lane(
+        self,
+        pred_waypoints: Any,
+        vehicle: Any,
+        command: int,
+    ) -> Any:
+        """Project predicted ego-frame waypoints onto valid same-direction lanes."""
+        if carla is None or np is None or vehicle is None:
+            return pred_waypoints
+        if self.session is None or self.session.world is None:
+            return pred_waypoints
+
+        try:
+            waypoints = np.asarray(pred_waypoints, dtype=np.float32)
+            if waypoints.ndim != 2 or waypoints.shape[1] != 2:
+                return pred_waypoints
+
+            world_map = self.session.world.get_map()
+            transform = vehicle.get_transform()
+            ego_loc = transform.location
+            yaw_rad = math.radians(float(transform.rotation.yaw))
+            cos_yaw = math.cos(yaw_rad)
+            sin_yaw = math.sin(yaw_rad)
+
+            ego_wp = world_map.get_waypoint(
+                ego_loc,
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving,
+            )
+            if ego_wp is None:
+                return pred_waypoints
+
+            ego_lane_id = int(getattr(ego_wp, "lane_id", 0))
+            constrained = np.array(waypoints, copy=True)
+            prev_valid_wp = ego_wp
+
+            for i in range(constrained.shape[0]):
+                ex = float(waypoints[i, 0])
+                ey = float(waypoints[i, 1])
+
+                wx = float(ego_loc.x) + cos_yaw * ex - sin_yaw * ey
+                wy = float(ego_loc.y) + sin_yaw * ex + cos_yaw * ey
+                world_loc = carla.Location(x=wx, y=wy, z=float(ego_loc.z))
+
+                map_wp = world_map.get_waypoint(
+                    world_loc,
+                    project_to_road=True,
+                    lane_type=carla.LaneType.Driving,
+                )
+                if map_wp is None:
+                    continue
+
+                map_lane_id = int(getattr(map_wp, "lane_id", 0))
+                same_direction = ego_lane_id == 0 or map_lane_id == 0 or (map_lane_id * ego_lane_id) > 0
+                if not same_direction:
+                    next_wps = prev_valid_wp.next(max(3.0, ex * 0.3))
+                    if not next_wps:
+                        continue
+                    map_wp = next_wps[0]
+
+                snapped_loc = map_wp.transform.location
+                dx = float(snapped_loc.x - ego_loc.x)
+                dy = float(snapped_loc.y - ego_loc.y)
+                constrained[i, 0] = cos_yaw * dx + sin_yaw * dy
+                constrained[i, 1] = -sin_yaw * dx + cos_yaw * dy
+                prev_valid_wp = map_wp
+
+            return constrained
+        except Exception as exc:
+            logging.debug("CIL lane constraint skipped: %s", exc)
+            return pred_waypoints
 
     def _stabilize_cil_steering(
         self,
@@ -4691,6 +4798,7 @@ class CILAgent(BaseAgent):
         stage_times["model"] = time.perf_counter() - model_t0
 
         control_t0 = time.perf_counter()
+        pred_waypoints = self._constrain_waypoints_to_lane(pred_waypoints, vehicle, command)
         # NOTE: Huber-only model has no valid uncertainty head → disable VETO
         ai_is_confused = float(mean_uncertainty) > 1e9
 

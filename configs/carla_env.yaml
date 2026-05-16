@@ -66,7 +66,7 @@ yolo:
   # - agent=yolo_detect: bật/tắt màn hình debug YOLO.
   # - agent=cil_yolo: bật/tắt cửa sổ "CARLA CIL + YOLO" lúc khởi động; khi đang chạy bấm phím 'y' để bật/tắt lại.
   # false = không mở cửa sổ, tiết kiệm FPS (CLI: --no-yolo-visualize).
-  debug_window: false
+  debug_window: true
   # Khi debug_window=true:
   # true  = vẽ box, HUD, corridor như giao diện debug cũ.
   # false = chỉ hiện raw camera feed.
@@ -76,8 +76,8 @@ yolo:
 
 traffic_spawn:
   # Giảm vehicle_count / pedestrian_count nếu FPS CARLA thấp (thường là bottleneck lớn hơn OpenCV).
-  vehicle_count: 50
-  bike_count: 40
+  vehicle_count: 30
+  bike_count: 30
   motorbike_count: 30
   pedestrian_count: 10
   npc_enable_autopilot: true

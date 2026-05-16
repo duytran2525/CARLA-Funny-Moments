@@ -584,9 +584,14 @@ def main():
 
     batch_size = int(config.get("batch_size", 48))  # larger batch OK with 0 workers
 
-    rec_flags = train_dataset.get_recovery_flags()
+    command_weights = {0: 1.0, 1: 5.0, 2: 5.0, 3: 2.0}
     rec_weight = float(config.get("recovery_weight", 2.0))
-    weights = [rec_weight if int(fl) == 1 else 1.0 for fl in rec_flags]
+    weights = []
+    for sample in train_dataset.samples:
+        weight = command_weights.get(int(sample.get("command", 0)), 1.0)
+        if int(float(sample.get("recovery_flag", 0.0))) == 1:
+            weight *= rec_weight
+        weights.append(weight)
     sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
     train_loader = DataLoader(
@@ -639,6 +644,7 @@ def main():
     lambda_gnll = float(config.get("loss_lambda_gnll", 0.02))
     lambda_smoothness = float(config.get("loss_lambda_smoothness", 0.1))
     lambda_speed = float(config.get("loss_lambda_speed", 0.5))
+    lambda_lane = float(config.get("loss_lambda_lane", 0.3))
 
     # GNLL stability params
     grad_clip_norm = float(config.get("grad_clip_norm", 1.0))
@@ -719,6 +725,13 @@ def main():
                 pred_wp = out[:, :10].view(-1, 5, 2)
                 tgt_wp = wps.view(-1, 5, 2)
                 loss_wp = huber(pred_wp, tgt_wp)
+                lateral_y = pred_wp[..., 1]
+                lane_penalty = torch.where(
+                    lateral_y > 3.0,
+                    (lateral_y - 3.0).pow(2) * 2.0,
+                    torch.zeros_like(lateral_y),
+                )
+                loss_lane = lane_penalty.mean()
                 pred_sig = out[:, 10:15].view(-1, 5, 1).expand(-1, 5, 2)
                 pred_var = pred_sig.pow(2).clamp(sigma_min**2, sigma_max**2)
                 loss_gnll = 0.5 * ((tgt_wp - pred_wp)**2 / pred_var + torch.log(pred_var))
@@ -734,13 +747,14 @@ def main():
                 loss = (lambda_wp * loss_wp
                         + lambda_gnll * loss_gnll.mean()
                         + lambda_smoothness * smoothness_loss
-                        + lambda_speed * loss_speed)
+                        + lambda_speed * loss_speed
+                        + lambda_lane * loss_lane)
 
             # Skip NaN/Inf batches
             if not torch.isfinite(loss):
                 nan_batches += 1
                 optimizer.zero_grad(set_to_none=True)
-                del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_gnll, loss, imgs, cmds, wps, speeds
+                del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_lane, loss_gnll, loss, imgs, cmds, wps, speeds
                 continue
 
             scaler.scale(loss).backward()
@@ -755,7 +769,7 @@ def main():
             running_loss += float(loss.item())
 
             # Explicit cleanup of intermediate tensors
-            del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_gnll, loss, imgs, cmds, wps, speeds
+            del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_lane, loss_gnll, loss, imgs, cmds, wps, speeds
 
             if i % 50 == 0:
                 if aggressive_memory_cleanup:
@@ -811,6 +825,13 @@ def main():
                     pred_sig = out[:, 10:15].view(-1, 5, 1).expand(-1, 5, 2)
                     tgt_wp = wps.view(-1, 5, 2)
                     loss_wp = huber(pred_wp, tgt_wp)
+                    lateral_y = pred_wp[..., 1]
+                    lane_penalty = torch.where(
+                        lateral_y > 3.0,
+                        (lateral_y - 3.0).pow(2) * 2.0,
+                        torch.zeros_like(lateral_y),
+                    )
+                    loss_lane = lane_penalty.mean()
                     pred_var = pred_sig.pow(2).clamp(sigma_min**2, sigma_max**2)
                     loss_g = 0.5 * ((tgt_wp - pred_wp) ** 2 / pred_var + torch.log(pred_var))
 
@@ -824,12 +845,13 @@ def main():
                     loss = (lambda_wp * loss_wp
                             + lambda_gnll * loss_g.mean()
                             + lambda_smoothness * smoothness_loss
-                            + lambda_speed * loss_speed)
+                            + lambda_speed * loss_speed
+                            + lambda_lane * loss_lane)
                 bs = imgs.size(0)
                 val_loss += float(loss.item()) * bs
                 val_mae += float((pred_wp - tgt_wp).abs().mean().item()) * bs
                 val_samples += bs
-                del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_g, loss, imgs, cmds, wps, speeds
+                del out, pred_wp, pred_sig, tgt_wp, loss_wp, loss_lane, loss_g, loss, imgs, cmds, wps, speeds
                 if aggressive_memory_cleanup and i % 50 == 0:
                     gc.collect()
 

@@ -243,7 +243,8 @@ class WaypointPredictor(nn.Module):
           -> PhysicsAwareStem       -> [B, 32, 33, 100]  (temporal + motion features)
           -> Adapter                -> [B, 32, 33, 100]  (bridge to RegNet trunk)
           -> RegNetY-400MF stages   -> 48 / 104 / 208 / 440 channels
-          -> CBAM(440) + FiLM(cmd, speed, 440)
+          -> FiLM(cmd, speed, 208) on stage 3
+          -> CBAM(440) + FiLM(cmd, speed, 440) on stage 4
           -> FPN(104, 208, 440 -> 128) + sum fusion
           -> Shared FC features (128-d)
           -> Waypoint head: 15 values (10 coords + 5 sigma)
@@ -280,9 +281,10 @@ class WaypointPredictor(nn.Module):
 
         c1, c2, c3, c4 = self._REGNET_CHANNELS  # 48, 104, 208, 440
 
-        # ── Attention & Conditioning on deepest features ──
+        # ── Attention & multi-level conditioning ──
         self.cbam = CBAM(c4)
-        self.film = FiLM(num_commands=4, emb_dim=128, channels=c4)
+        self.film_s3 = FiLM(num_commands=4, emb_dim=64, channels=c3)
+        self.film_s4 = FiLM(num_commands=4, emb_dim=128, channels=c4)
 
         # ── Multi-scale Feature Pyramid ──
         self.fpn = FPN(in_channels=(c2, c3, c4), out_channels=128)
@@ -337,7 +339,7 @@ class WaypointPredictor(nn.Module):
     def _init_non_backbone_weights(self) -> None:
         """Initialize only non-backbone weights; backbone keeps pretrained."""
         for parent in (
-            self.stem, self.adapter, self.cbam, self.film,
+            self.stem, self.adapter, self.cbam, self.film_s3, self.film_s4,
             self.fpn, self.shared_features, self.waypoint_head, self.speed_head,
         ):
             for module in parent.modules():
@@ -352,6 +354,8 @@ class WaypointPredictor(nn.Module):
                     nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
+        self.film_s3._init_identity()
+        self.film_s4._init_identity()
 
     def get_backbone_params(self) -> list[nn.Parameter]:
         """Return backbone parameters (for differential learning rate)."""
@@ -379,11 +383,12 @@ class WaypointPredictor(nn.Module):
         s1 = self.backbone_stage1(p2)  # [B, 48,  ...]
         s2 = self.backbone_stage2(s1)  # [B, 104, ...]
         s3 = self.backbone_stage3(s2)  # [B, 208, ...]
+        s3 = self.film_s3(s3, command, speed)
         s4 = self.backbone_stage4(s3)  # [B, 440, ...]
 
         # ── Attention + Conditioning on deepest features ──
         s4 = self.cbam(s4)
-        s4 = self.film(s4, command, speed)
+        s4 = self.film_s4(s4, command, speed)
 
         # ── FPN multi-scale fusion ──
         f3, f4, f5 = self.fpn(s2, s3, s4)
