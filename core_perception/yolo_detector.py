@@ -283,9 +283,12 @@ class YoloDetector:
         self._predict(warm_frame)
         self._warmed_up = True
 
-    def detect(self, raw_image: np.ndarray) -> List[Dict[str, Any]]:
-        image_bgr = self._prepare_bgr(raw_image)
-        results = self._predict(image_bgr)
+    def _detections_from_results(
+        self,
+        results: Any,
+        *,
+        include_tracking: bool = False,
+    ) -> List[Dict[str, Any]]:
         detections: List[Dict[str, Any]] = []
 
         if len(results) == 0:
@@ -298,48 +301,7 @@ class YoloDetector:
         xyxy = boxes.xyxy.round().to(dtype=torch.int32).cpu().numpy()
         confs = boxes.conf.float().cpu().numpy()
         class_ids = boxes.cls.to(dtype=torch.int32).cpu().numpy()
-
-        for coords, conf, cls_id in zip(xyxy, confs, class_ids):
-            class_name = self._resolve_class_name(cls_id)
-            if class_name not in self.display_classes:
-                continue
-
-            conf = float(conf)
-            if conf < self.conf_threshold:
-                continue
-
-            x1, y1, x2, y2 = [int(v) for v in coords.tolist()]
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            detections.append(
-                {
-                    "class": class_name,
-                    "bbox": [x1, y1, x2, y2],
-                    "conf": conf,
-                }
-            )
-        return detections
-
-    def detect_and_track(self, image_bgr: np.ndarray) -> List[Dict[str, Any]]:
-        """Use Ultralytics built-in tracker (BoT-SORT/ByteTrack)."""
-        frame_bgr = self._prepare_bgr(image_bgr)
-        if self.current_frame_id <= 0:
-            self.current_frame_id = 1
-        results = self._track(frame_bgr)
-        tracked_objects: List[Dict[str, Any]] = []
-
-        if len(results) == 0:
-            return tracked_objects
-
-        boxes = results[0].boxes
-        if boxes is None or len(boxes) == 0:
-            return tracked_objects
-
-        xyxy = boxes.xyxy.round().to(dtype=torch.int32).cpu().numpy()
-        confs = boxes.conf.float().cpu().numpy()
-        class_ids = boxes.cls.to(dtype=torch.int32).cpu().numpy()
-        if boxes.id is not None:
+        if include_tracking and boxes.id is not None:
             track_ids: Sequence[Any] = boxes.id.to(dtype=torch.int32).cpu().numpy()
         else:
             track_ids = [None] * len(boxes)
@@ -363,17 +325,54 @@ class YoloDetector:
                     track_id = int(t_id)
                 except Exception:
                     track_id = None
-            track_id_val = int(track_id) if track_id is not None else -1
 
-            tracked_objects.append(
+            det: Dict[str, Any] = {
+                "class": class_name,
+                "bbox": [x1, y1, x2, y2],
+                "conf": conf,
+            }
+            if include_tracking:
+                det["raw_bbox"] = [x1, y1, x2, y2]
+                det["track_id"] = track_id
+
+            detections.append(det)
+        return detections
+
+    def detect(self, raw_image: np.ndarray) -> List[Dict[str, Any]]:
+        image_bgr = self._prepare_bgr(raw_image)
+        results = self._predict(image_bgr)
+        return self._detections_from_results(results)
+
+    def detect_and_track(self, image_bgr: np.ndarray) -> List[Dict[str, Any]]:
+        """Use Ultralytics built-in tracker (BoT-SORT/ByteTrack)."""
+        frame_bgr = self._prepare_bgr(image_bgr)
+        if self.current_frame_id <= 0:
+            self.current_frame_id = 1
+        results = self._track(frame_bgr)
+        tracked_objects = self._detections_from_results(results, include_tracking=True)
+
+        if not tracked_objects:
+            predicted_objects = self.detect(frame_bgr)
+            tracked_objects = [
                 {
-                    "class": class_name,
-                    "bbox": [x1, y1, x2, y2],
-                    "raw_bbox": [x1, y1, x2, y2],
-                    "conf": conf,
-                    "track_id": track_id,
+                    **obj,
+                    "raw_bbox": list(obj["bbox"]),
+                    "track_id": None,
                 }
-            )
+                for obj in predicted_objects
+            ]
+            if tracked_objects:
+                logging.debug(
+                    "Ultralytics track() returned no usable boxes; falling back to predict() for %d boxes.",
+                    len(tracked_objects),
+                )
+
+        for obj in tracked_objects:
+            x1, y1, x2, y2 = [int(v) for v in obj["bbox"]]
+            class_name = str(obj.get("class", "unknown"))
+            conf = float(obj.get("conf", 0.0))
+            track_id = obj.get("track_id")
+            track_id_val = int(track_id) if track_id is not None else -1
 
             if self._enable_tracking_metrics_logging and class_name in self._metrics_eval_classes:
                 # MOTChallenge tracking-results format plus a repo-local class column:

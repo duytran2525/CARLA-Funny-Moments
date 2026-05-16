@@ -110,6 +110,17 @@ except Exception as exc:
     RouteMapVisualizer = None
 
 
+DETECTOR_DISPLAY_CLASSES = (
+    "vehicle",
+    "two_wheeler",
+    "traffic_light_red",
+    "traffic_sign",
+    "pedestrian",
+    "traffic_light_green",
+    "stop_line",
+)
+
+
 def ensure_navigation_agent_imports() -> None:
     """Try to import CARLA navigation agents, including dynamic PythonAPI paths."""
     global BasicAgent, BehaviorAgent
@@ -1832,7 +1843,7 @@ class LaneFollowAgent(BaseAgent):
 
         self._yolo_detector = YoloDetector(
             str(model_path),
-            display_classes=["pedestrian", "vehicle", "two_wheeler"],
+            display_classes=DETECTOR_DISPLAY_CLASSES,
             camera_fov_deg=self.config.camera_fov,
             obstacle_base_distance_m=8.0,
             camera_mount_x_m=1.5,
@@ -2572,7 +2583,7 @@ class CILAgent(BaseAgent):
         detector_imgsz_arg = detector_imgsz if detector_imgsz > 0 else None
         self._yolo_detector = YoloDetector(
             str(model_path),
-            display_classes=["pedestrian", "vehicle", "two_wheeler"],
+            display_classes=DETECTOR_DISPLAY_CLASSES,
             inference_imgsz=detector_imgsz_arg,
             camera_fov_deg=self.config.camera_fov,
             obstacle_base_distance_m=8.0,
@@ -5204,12 +5215,11 @@ class YoloDetectAgent(BaseAgent):
         elif model_path.suffix.lower() != ".engine":
             detector_imgsz = 448
 
-        # Restrict to CARLA-compatible classes that ground truth API can generate
-        carla_compatible_classes = ["pedestrian", "vehicle", "two_wheeler"]
+        detector_display_classes = list(DETECTOR_DISPLAY_CLASSES)
 
         self._detector = YoloDetector(
             str(model_path),
-            display_classes=carla_compatible_classes,
+            display_classes=detector_display_classes,
             inference_imgsz=detector_imgsz,
             camera_fov_deg=self.config.camera_fov,
             obstacle_base_distance_m=8.0,
@@ -5224,7 +5234,7 @@ class YoloDetectAgent(BaseAgent):
         if secondary_tracker and secondary_tracker != str(self.config.yolo_tracker_config):
             self._secondary_detector = YoloDetector(
                 str(model_path),
-                display_classes=carla_compatible_classes,
+                display_classes=detector_display_classes,
                 inference_imgsz=detector_imgsz,
                 camera_fov_deg=self.config.camera_fov,
                 obstacle_base_distance_m=8.0,
@@ -5236,9 +5246,9 @@ class YoloDetectAgent(BaseAgent):
                 enable_tracking_metrics_logging=True,
             )
             logging.info(
-                "Secondary YOLO tracker enabled for same-sequence metrics (%s), restricted to CARLA-compatible classes: %s",
+                "Secondary YOLO tracker enabled for same-sequence metrics (%s), display classes: %s",
                 secondary_tracker,
-                ", ".join(carla_compatible_classes),
+                ", ".join(detector_display_classes),
             )
         else:
             self._secondary_detector = None
@@ -5269,7 +5279,7 @@ class YoloDetectAgent(BaseAgent):
             bool(self.config.yolo_draw_overlay),
             detector_imgsz if detector_imgsz is not None else "engine-default",
             self.config.yolo_tracker_config,
-            "[" + ", ".join(carla_compatible_classes) + "]",
+            "[" + ", ".join(detector_display_classes) + "]",
         )
         if TrafficSupervisor is None:
             logging.warning("TrafficSupervisor unavailable. yolo_detect will run without supervisor brake fusion.")

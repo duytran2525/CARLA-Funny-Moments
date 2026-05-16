@@ -1,6 +1,7 @@
 import unittest
 
 import numpy as np
+import torch
 
 from core_perception.yolo_detector import YoloDetector
 
@@ -16,6 +17,22 @@ class _FakePredictModel:
                 "input size torch.Size([1, 3, 448, 448]) not equal to max model size (1, 3, 640, 640)"
             )
         return ["ok"]
+
+
+class _FakeBoxes:
+    def __init__(self, xyxy, conf, cls, track_id=None):
+        self.xyxy = torch.tensor(xyxy, dtype=torch.float32)
+        self.conf = torch.tensor(conf, dtype=torch.float32)
+        self.cls = torch.tensor(cls, dtype=torch.float32)
+        self.id = None if track_id is None else torch.tensor(track_id, dtype=torch.float32)
+
+    def __len__(self):
+        return int(self.xyxy.shape[0])
+
+
+class _FakeResult:
+    def __init__(self, boxes):
+        self.boxes = boxes
 
 
 class YoloDetectorCompatTests(unittest.TestCase):
@@ -69,6 +86,30 @@ class YoloDetectorCompatTests(unittest.TestCase):
         self.assertEqual(len(detector.model.calls), 2)
         self.assertEqual(detector.model.calls[0]["imgsz"], 448)
         self.assertEqual(detector.model.calls[1]["imgsz"], 640)
+
+    def test_detect_and_track_falls_back_to_predict_when_tracker_returns_no_boxes(self):
+        detector = YoloDetector.__new__(YoloDetector)
+        detector.conf_threshold = 0.25
+        detector.display_classes = {"vehicle"}
+        detector.class_names = {0: "vehicle"}
+        detector.class_aliases = dict(YoloDetector.CLASS_ALIASES)
+        detector._enable_tracking_metrics_logging = False
+        detector._metrics_eval_classes = set(YoloDetector.METRICS_EVAL_CLASSES)
+        detector.current_frame_id = 1
+        detector.tracking_logs = []
+
+        detector._track = lambda _image: [_FakeResult(_FakeBoxes([], [], []))]
+        detector._predict = lambda _image: [
+            _FakeResult(_FakeBoxes([[10, 20, 110, 120]], [0.9], [0]))
+        ]
+
+        image = np.zeros((240, 320, 3), dtype=np.uint8)
+        result = detector.detect_and_track(image)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["class"], "vehicle")
+        self.assertEqual(result[0]["bbox"], [10, 20, 110, 120])
+        self.assertIsNone(result[0]["track_id"])
 
 
 if __name__ == "__main__":
