@@ -1,4 +1,5 @@
 import numpy as np
+import random
 
 
 class PurePursuitController:
@@ -17,6 +18,7 @@ class PurePursuitController:
         steer_alpha: float = 0.3,  # Hệ số Low-pass filter (Càng nhỏ càng mượt, nhưng trễ)
         max_steer_rate: float = 1.0,  # Tốc độ vặn vô lăng tối đa (Normalized/sec)
         dt: float = 0.05,  # Thời gian 1 frame (20 FPS)
+        lookahead_jitter: float = 0.0,  # ±jitter fraction on look-ahead (e.g. 0.15 = ±15%)
     ):
         self.L = wheelbase
         self.max_steer_rad = np.radians(max_steer_angle_deg)
@@ -25,6 +27,7 @@ class PurePursuitController:
         self.k_lookahead = k_lookahead
         self.min_lookahead = min_lookahead
         self.max_lookahead = max_lookahead
+        self.lookahead_jitter = float(lookahead_jitter)
 
         # Smoothing & Limits
         self.steer_alpha = steer_alpha
@@ -38,9 +41,15 @@ class PurePursuitController:
         Tính toán khoảng cách Look-ahead liên tục và nội suy điểm mục tiêu.
         waypoints: Mảng numpy shape (5, 2) tọa độ Ego-centric.
         """
+        # Apply look-ahead jitter (±jitter%) for humanized driving
+        if self.lookahead_jitter > 0.0:
+            jitter_factor = 1.0 + (random.random() - 0.5) * 2.0 * self.lookahead_jitter
+        else:
+            jitter_factor = 1.0
+
         ld_target = max(
             self.min_lookahead,
-            min(self.max_lookahead, self.k_lookahead * current_speed_ms),
+            min(self.max_lookahead, self.k_lookahead * current_speed_ms * jitter_factor),
         )
 
         distances = np.linalg.norm(waypoints, axis=1)
