@@ -5309,7 +5309,7 @@ class YoloDetectAgent(BaseAgent):
         if int(self.config.yolo_inference_imgsz) > 0:
             detector_imgsz = int(self.config.yolo_inference_imgsz)
         elif model_path.suffix.lower() != ".engine":
-            detector_imgsz = 448
+            detector_imgsz = 640
 
         detector_display_classes = list(DETECTOR_DISPLAY_CLASSES)
 

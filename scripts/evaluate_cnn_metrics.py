@@ -74,24 +74,10 @@ def load_model(device: torch.device) -> torch.nn.Module:
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
         if "model_state_dict" in checkpoint:
-            state_dict = checkpoint["model_state_dict"]
+            model.load_state_dict(checkpoint["model_state_dict"])
         else:
-            state_dict = checkpoint
-
-        # Try strict load first, fallback to non-strict for older checkpoints
-        try:
-            model.load_state_dict(state_dict, strict=True)
-        except RuntimeError:
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
-            if missing:
-                print(f"  [WARN] Missing keys (using defaults): {len(missing)} keys")
-                for k in missing[:5]:
-                    print(f"    - {k}")
-            if unexpected:
-                print(f"  [WARN] Unexpected keys (ignored): {len(unexpected)} keys")
-                for k in unexpected[:5]:
-                    print(f"    - {k}")
-        print("[OK] Model loaded successfully.")
+            model.load_state_dict(checkpoint)
+        print("✅ Model loaded successfully.")
     except Exception as e:
         print(f"[ERROR] Error loading checkpoint: {e}")
         sys.exit(1)
