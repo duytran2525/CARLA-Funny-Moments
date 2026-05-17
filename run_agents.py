@@ -2463,12 +2463,6 @@ class CILAgent(BaseAgent):
             "telemetry": 0.0,
             "total": 0.0,
         }
-        # Online Metrics Evaluation
-        self._metric_cnn_latency_sum: float = 0.0
-        self._metric_cnn_inference_count: int = 0
-        self._metric_min_ttc: float = float('inf')
-        self._metric_initial_route_distance: float = 0.0
-        self._metric_total_frames: int = 0
         # HUD debug drawing
         self._hud_ema_fps: Optional[float] = None
         self._hud_last_tick_time: Optional[float] = None
@@ -2546,12 +2540,7 @@ class CILAgent(BaseAgent):
                 self._opencv_route_visible,
             )
 
-        # Record Initial Route Distance for Metric Evaluation
-        if self._route_start_location and self._route_destination_location:
-            self._metric_initial_route_distance = float(math.hypot(
-                self._route_start_location.x - self._route_destination_location.x,
-                self._route_start_location.y - self._route_destination_location.y
-            ))
+
 
     def _init_telemetry_logger(self) -> None:
         telemetry_path = (Path(__file__).resolve().parent / "outputs" / "cil_route_debug.csv")
@@ -4287,11 +4276,8 @@ class CILAgent(BaseAgent):
         speed_tensor = speed_tensor.to(self._device, non_blocking=True)
 
         with torch.inference_mode():
-            t0 = time.time()
             predictions = self._model(image_tensor, command_tensor, speed_tensor)
-            t1 = time.time()
-            self._metric_cnn_latency_sum += (t1 - t0)
-            self._metric_cnn_inference_count += 1
+
 
         if torch.is_tensor(predictions):
             pred_tensor = predictions.detach().squeeze(0).cpu().float().numpy()
@@ -4743,46 +4729,7 @@ class CILAgent(BaseAgent):
         except Exception:
             pass
 
-    def _update_safety_metrics(self) -> None:
-        """Calculate Ground Truth TTC using CARLA API."""
-        if carla is None or self.session is None or self.session.world is None:
-            return
-        vehicle = self.session.ego_vehicle
-        if vehicle is None:
-            return
-            
-        ego_tf = vehicle.get_transform()
-        ego_loc = ego_tf.location
-        ego_fwd = ego_tf.get_forward_vector()
-        ego_vel = vehicle.get_velocity()
-        
-        actors = self.session.world.get_actors().filter('vehicle.*')
-        min_ttc = float('inf')
-        
-        for actor in actors:
-            if actor.id == vehicle.id:
-                continue
-            
-            other_loc = actor.get_location()
-            dx = other_loc.x - ego_loc.x
-            dy = other_loc.y - ego_loc.y
-            dist = math.hypot(dx, dy)
-            
-            if dist < 1.0 or dist > 50.0:
-                continue
-                
-            dot_fwd = (dx * ego_fwd.x + dy * ego_fwd.y) / dist
-            if dot_fwd < 0.8:
-                continue
-                
-            other_vel = actor.get_velocity()
-            v_rel = (ego_vel.x - other_vel.x) * (dx/dist) + (ego_vel.y - other_vel.y) * (dy/dist)
-            
-            if v_rel > 0.5:
-                ttc = dist / v_rel
-                min_ttc = min(min_ttc, ttc)
-                
-        self._metric_min_ttc = min(self._metric_min_ttc, min_ttc)
+
 
     def run_step(self, step_idx: int) -> None:
         if not self._enabled:
@@ -4790,8 +4737,7 @@ class CILAgent(BaseAgent):
                 logging.info("CIL agent waiting for CARLA runtime.")
             return
 
-        self._metric_total_frames += 1
-        self._update_safety_metrics()
+
 
         tick_t0 = time.perf_counter()
         stage_times = {
@@ -5093,40 +5039,7 @@ class CILAgent(BaseAgent):
         self._accumulate_tick_timing(stage_times, step_idx)
 
     def teardown(self) -> None:
-        # ---- PRINT METRICS SUMMARY ----
-        print("\n" + "="*60)
-        print(" 📊 CIL AGENT ONLINE EVALUATION SUMMARY")
-        print("="*60)
-        print(f" Total Frames Ran:       {self._metric_total_frames}")
-        
-        avg_latency_ms = 0.0
-        if self._metric_cnn_inference_count > 0:
-            avg_latency_ms = (self._metric_cnn_latency_sum / self._metric_cnn_inference_count) * 1000.0
-        print(f" Avg CNN Latency:        {avg_latency_ms:.2f} ms")
-        
-        if self._hud_ema_fps is not None:
-            print(f" System FPS (EMA):       {self._hud_ema_fps:.2f} FPS")
-            
-        if self._metric_min_ttc != float('inf'):
-            print(f" Minimum TTC observed:   {self._metric_min_ttc:.2f} s")
-        else:
-            print(" Minimum TTC observed:   N/A (No vehicles ahead)")
-            
-        route_completion = 0.0
-        if self._route_start_location and self._route_destination_location:
-            current_loc = self._vehicle_location()
-            if current_loc:
-                dist_remaining = math.hypot(
-                    current_loc.x - self._route_destination_location.x,
-                    current_loc.y - self._route_destination_location.y
-                )
-                if self._metric_initial_route_distance > 0:
-                    route_completion = max(0.0, 100.0 * (1.0 - dist_remaining / self._metric_initial_route_distance))
-                    route_completion = min(100.0, route_completion)
-        
-        print(f" Route Completion:       {route_completion:.1f}%")
-        print("="*60 + "\n")
-        # -------------------------------
+
 
         self._route_overlay_bounds = None
         if self._collector is not None:
