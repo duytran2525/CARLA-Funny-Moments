@@ -58,10 +58,25 @@ def main():
     print(f"Loading checkpoint: {checkpoint_path}")
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-        if "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"])
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        
+        # --- TỰ ĐỘNG FIX LỖI TƯƠNG THÍCH MODEL (BACKWARD COMPATIBILITY) ---
+        if "film.embedding.weight" in state_dict and "film_s4.embedding.weight" not in state_dict:
+            print("  ⚠️ [Auto-Fix] Phát hiện file .pth được train từ bản code cũ (chỉ có 1 lớp FiLM).")
+            print("  -> Đang tự động chuyển đổi trọng số sang chuẩn Multi-level FiLM mới...")
+            # Chuyển lớp film cũ thành film_s4 (do film cũ nằm ở tầng cuối)
+            state_dict["film_s4.embedding.weight"] = state_dict.pop("film.embedding.weight")
+            state_dict["film_s4.mlp.0.weight"] = state_dict.pop("film.mlp.0.weight")
+            state_dict["film_s4.mlp.0.bias"] = state_dict.pop("film.mlp.0.bias")
+            state_dict["film_s4.mlp.2.weight"] = state_dict.pop("film.mlp.2.weight")
+            state_dict["film_s4.mlp.2.bias"] = state_dict.pop("film.mlp.2.bias")
+            
+            # Load với strict=False để bỏ qua lớp film_s3. 
+            # (film_s3 sẽ tự động được khởi tạo là ma trận đơn vị - không làm thay đổi kết quả dự đoán)
+            model.load_state_dict(state_dict, strict=False)
         else:
-            model.load_state_dict(checkpoint)
+            model.load_state_dict(state_dict)
+            
         print("✅ Model loaded successfully.")
     except Exception as e:
         print(f"❌ Error loading checkpoint: {e}")
