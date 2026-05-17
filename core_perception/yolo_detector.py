@@ -113,6 +113,21 @@ class YoloDetector:
             self.model = self.model.to(self.device)
         self.class_names = self.model.names
 
+        # ── Fix exported model class names (.engine/.onnx lose metadata) ──
+        if self._is_exported_model and self._has_generic_class_names(self.class_names):
+            restored = self._restore_class_names_from_pt(model_path)
+            if restored is not None:
+                self.class_names = restored
+                # NOTE: Do NOT set model.overrides["names"] here.
+                # Ultralytics merges model.overrides into every model.predict() / model.track()
+                # call as keyword arguments, and "names" is not a valid predictor argument —
+                # it would raise SyntaxError: 'names' is not a valid YOLO argument.
+                # self.class_names is the sole source of truth; _resolve_class_name uses it.
+                logging.info(
+                    "Restored %d class names from .pt for exported model.",
+                    len(restored),
+                )
+
         self.display_classes = set(
             self._normalize_class_name(name)
             for name in (display_classes or self.DEFAULT_DISPLAY_CLASSES)
@@ -150,6 +165,56 @@ class YoloDetector:
     @staticmethod
     def _normalize_class_name(class_name: Any) -> str:
         return str(class_name).strip().lower().replace(" ", "_").replace("-", "_")
+
+    @staticmethod
+    def _has_generic_class_names(names: Any) -> bool:
+        """Check if class names are generic placeholders (class0, class1, ...)."""
+        if not isinstance(names, dict) or len(names) == 0:
+            return False
+        # If any name looks like a real trained class, names are OK
+        sample = [str(v).lower() for v in list(names.values())[:20]]
+        generic_pattern = all(
+            v.startswith("class") and v[5:].isdigit()
+            for v in sample
+        )
+        return generic_pattern
+
+    @staticmethod
+    def _restore_class_names_from_pt(exported_path: str) -> Optional[Dict[int, str]]:
+        """Try to load class names from the matching .pt file next to the exported model."""
+        exported = Path(exported_path)
+        # Try sibling .pt file with same stem
+        pt_path = exported.with_suffix(".pt")
+        if pt_path.exists():
+            try:
+                if "rtdetr" in str(pt_path).lower():
+                    ref_model = RTDETR(str(pt_path))
+                else:
+                    ref_model = YOLO(str(pt_path), task="detect")
+                names = ref_model.names
+                del ref_model
+                if isinstance(names, dict) and len(names) > 0:
+                    logging.info("Found matching .pt at %s with %d classes.", pt_path, len(names))
+                    return names
+            except Exception as exc:
+                logging.debug("Could not load .pt for class names: %s", exc)
+
+        # Fallback: hardcoded class map for this project's custom-trained models
+        _FALLBACK_NAMES = {
+            0: "vehicle",
+            1: "two_wheeler",
+            2: "traffic_light_red",
+            3: "traffic_sign",
+            4: "pedestrian",
+            5: "traffic_light_green",
+            6: "stop_line",
+        }
+        logging.info(
+            "No matching .pt found for %s; using fallback class map (%d classes).",
+            exported.name,
+            len(_FALLBACK_NAMES),
+        )
+        return _FALLBACK_NAMES
 
     def _resolve_class_name(self, cls_id: int) -> str:
         if isinstance(self.class_names, dict):
@@ -546,4 +611,3 @@ class YoloDetector:
         )
         self.tracking_logs = []
         self.current_frame_id = 0
-

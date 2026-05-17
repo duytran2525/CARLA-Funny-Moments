@@ -74,10 +74,20 @@ def load_model(device: torch.device) -> torch.nn.Module:
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
         if "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"])
+            state_dict = checkpoint["model_state_dict"]
         else:
-            model.load_state_dict(checkpoint)
-        print("✅ Model loaded successfully.")
+            state_dict = checkpoint
+
+        # Try strict load first, fallback to non-strict for older checkpoints
+        try:
+            model.load_state_dict(state_dict, strict=True)
+        except RuntimeError:
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"  [WARN] Missing keys (using defaults): {len(missing)} keys")
+            if unexpected:
+                print(f"  [WARN] Unexpected keys (ignored): {len(unexpected)} keys")
+        print("[OK] Model loaded successfully.")
     except Exception as e:
         print(f"[ERROR] Error loading checkpoint: {e}")
         sys.exit(1)
@@ -310,7 +320,7 @@ def evaluate_ade_fde(model: torch.nn.Module, device: torch.device,
 # ============================================================================
 # RESULTS DISPLAY
 # ============================================================================
-def print_results(benchmark: dict, ade_fde: dict | None) -> None:
+def print_results(benchmark: dict, ade_fde: dict | None, online_metrics: dict | None = None) -> None:
     """Print comprehensive metrics report."""
     print("\n")
     print("=" * 60)
@@ -362,15 +372,16 @@ def print_results(benchmark: dict, ade_fde: dict | None) -> None:
     print("\n+---------------------------------------------------------+")
     print("|  [ONLINE] ONLINE METRICS (from CARLA simulation)             |")
     print("+---------------------------------------------------------+")
-    print("|  Route Completion:  Measured at runtime in CILAgent    |")
-    print("|  Min TTC:           Measured at runtime in CILAgent    |")
-    print("|                                                         |")
-    print("|  These metrics are printed automatically when the CIL  |")
-    print("|  agent finishes a run (see teardown() summary).        |")
-    print("|                                                         |")
-    print("|  To collect:                                            |")
-    print("|    python run_agents.py --config configs/cil_light.yaml |")
-    print("|    -> Look for '[STATS] CIL AGENT ONLINE EVALUATION SUMMARY' |")
+    if online_metrics:
+        print(f"|  Route Completion:      {online_metrics.get('route', 'N/A'):<31s}|")
+        print(f"|  Min TTC:               {online_metrics.get('ttc', 'N/A'):<31s}|")
+        print(f"|  Total Frames:          {online_metrics.get('frames', 'N/A'):<31s}|")
+    else:
+        print("|  Route Completion:  N/A (Run --online to collect)      |")
+        print("|  Min TTC:           N/A (Run --online to collect)      |")
+        print("|                                                         |")
+        print("|  To collect:                                            |")
+        print("|    python scripts/evaluate_cnn_metrics.py --online      |")
     print("+---------------------------------------------------------+")
 
     # -- Summary Table --
@@ -387,8 +398,13 @@ def print_results(benchmark: dict, ade_fde: dict | None) -> None:
         print("| FDE                   | N/A (no dataset)         |")
     print(f"| FPS (batch=1)         | {benchmark['fps']:>8.1f} FPS            |")
     print(f"| Latency (batch=1)     | {benchmark['latency_ms']:>8.2f} ms             |")
-    print("| Route Completion      | See CARLA online run     |")
-    print("| TTC (Time-To-Collision| See CARLA online run     |")
+    
+    if online_metrics:
+        print(f"| Route Completion      | {online_metrics.get('route', 'N/A'):<24s} |")
+        print(f"| TTC (Time-To-Collision| {online_metrics.get('ttc', 'N/A'):<24s} |")
+    else:
+        print("| Route Completion      | Run --online to collect  |")
+        print("| TTC (Time-To-Collision| Run --online to collect  |")
     print("+-----------------------+--------------------------+")
     print()
 
@@ -400,6 +416,8 @@ def main():
     parser = argparse.ArgumentParser(description="CIL Waypoint Model Evaluation")
     parser.add_argument("--benchmark-only", action="store_true",
                         help="Only run FPS/Latency benchmark (no dataset needed)")
+    parser.add_argument("--online", action="store_true",
+                        help="Launch CARLA simulation to collect online metrics (TTC, Route Completion)")
     parser.add_argument("--device", default="auto",
                         help="Device: 'cuda', 'cpu', or 'auto' (default)")
     args = parser.parse_args()
@@ -440,8 +458,48 @@ def main():
 
         ade_fde = evaluate_ade_fde(model, device, h5_path, csv_root_hint)
 
+    # Run online metrics (from CARLA simulation)
+    online_metrics = None
+    if getattr(args, "online", False):
+        print("\n" + "=" * 60)
+        print(" [ONLINE] RUNNING CARLA SIMULATION FOR ONLINE METRICS")
+        print("=" * 60)
+        print("  Running: ./scripts/run_cil.ps1 -EvalOnline -Ticks 1000")
+        print("  Please wait, this will take a while...")
+        
+        import subprocess
+        import re
+        try:
+            # Run the simulation for a limited number of ticks (e.g. 1000) so it doesn't run forever
+            result = subprocess.run(
+                ["powershell", "-ExecutionPolicy", "Bypass", "-File", "scripts/run_cil.ps1", "-EvalOnline", "-Ticks", "1000"],
+                cwd=str(PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minutes timeout
+            )
+            
+            output = result.stdout + "\n" + result.stderr
+            
+            # Parse output
+            frames_match = re.search(r"Total Frames Ran:\s+(.+)", output)
+            route_match = re.search(r"Route Completion:\s+(.+)", output)
+            ttc_match = re.search(r"Minimum TTC observed:\s+(.+)", output)
+            
+            online_metrics = {
+                "frames": frames_match.group(1).strip() if frames_match else "N/A",
+                "route": route_match.group(1).strip() if route_match else "N/A",
+                "ttc": ttc_match.group(1).strip() if ttc_match else "N/A",
+            }
+            print("  [OK] Online evaluation finished.")
+        except subprocess.TimeoutExpired:
+            print("  [ERROR] Online evaluation timed out.")
+            online_metrics = {"frames": "Timeout", "route": "Timeout", "ttc": "Timeout"}
+        except Exception as e:
+            print(f"  [ERROR] Failed to run online evaluation: {e}")
+
     # Print results
-    print_results(benchmark, ade_fde)
+    print_results(benchmark, ade_fde, online_metrics)
 
 
 if __name__ == "__main__":

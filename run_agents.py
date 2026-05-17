@@ -737,6 +737,7 @@ class RunConfig:
     camera_width: int  # Camera capture width in pixels
     camera_height: int  # Camera capture height in pixels
     camera_fov: float  # Camera field of view in degrees
+    eval_online: bool  # Print online evaluation metrics
     lock_spectator_on_spawn: bool  # Lock spectator near ego on spawn
     spectator_reapply_each_tick: bool  # Re-apply spectator transform each tick
     spectator_follow_distance: float  # Spectator follow distance from ego
@@ -5093,40 +5094,41 @@ class CILAgent(BaseAgent):
         self._accumulate_tick_timing(stage_times, step_idx)
 
     def teardown(self) -> None:
-        # ---- PRINT METRICS SUMMARY ----
-        print("\n" + "="*60)
-        print(" 📊 CIL AGENT ONLINE EVALUATION SUMMARY")
-        print("="*60)
-        print(f" Total Frames Ran:       {self._metric_total_frames}")
-        
-        avg_latency_ms = 0.0
-        if self._metric_cnn_inference_count > 0:
-            avg_latency_ms = (self._metric_cnn_latency_sum / self._metric_cnn_inference_count) * 1000.0
-        print(f" Avg CNN Latency:        {avg_latency_ms:.2f} ms")
-        
-        if self._hud_ema_fps is not None:
-            print(f" System FPS (EMA):       {self._hud_ema_fps:.2f} FPS")
+        if self.config.eval_online:
+            # ---- PRINT METRICS SUMMARY ----
+            print("\n" + "="*60)
+            print(" 📊 CIL AGENT ONLINE EVALUATION SUMMARY")
+            print("="*60)
+            print(f" Total Frames Ran:       {self._metric_total_frames}")
             
-        if self._metric_min_ttc != float('inf'):
-            print(f" Minimum TTC observed:   {self._metric_min_ttc:.2f} s")
-        else:
-            print(" Minimum TTC observed:   N/A (No vehicles ahead)")
+            avg_latency_ms = 0.0
+            if self._metric_cnn_inference_count > 0:
+                avg_latency_ms = (self._metric_cnn_latency_sum / self._metric_cnn_inference_count) * 1000.0
+            print(f" Avg CNN Latency:        {avg_latency_ms:.2f} ms")
             
-        route_completion = 0.0
-        if self._route_start_location and self._route_destination_location:
-            current_loc = self._vehicle_location()
-            if current_loc:
-                dist_remaining = math.hypot(
-                    current_loc.x - self._route_destination_location.x,
-                    current_loc.y - self._route_destination_location.y
-                )
-                if self._metric_initial_route_distance > 0:
-                    route_completion = max(0.0, 100.0 * (1.0 - dist_remaining / self._metric_initial_route_distance))
-                    route_completion = min(100.0, route_completion)
-        
-        print(f" Route Completion:       {route_completion:.1f}%")
-        print("="*60 + "\n")
-        # -------------------------------
+            if self._hud_ema_fps is not None:
+                print(f" System FPS (EMA):       {self._hud_ema_fps:.2f} FPS")
+                
+            if self._metric_min_ttc != float('inf'):
+                print(f" Minimum TTC observed:   {self._metric_min_ttc:.2f} s")
+            else:
+                print(" Minimum TTC observed:   N/A (No vehicles ahead)")
+                
+            route_completion = 0.0
+            if self._route_start_location and self._route_destination_location:
+                current_loc = self._vehicle_location()
+                if current_loc:
+                    dist_remaining = math.hypot(
+                        current_loc.x - self._route_destination_location.x,
+                        current_loc.y - self._route_destination_location.y
+                    )
+                    if self._metric_initial_route_distance > 0:
+                        route_completion = max(0.0, 100.0 * (1.0 - dist_remaining / self._metric_initial_route_distance))
+                        route_completion = min(100.0, route_completion)
+            
+            print(f" Route Completion:       {route_completion:.1f}%")
+            print("="*60 + "\n")
+            # -------------------------------
 
         self._route_overlay_bounds = None
         if self._collector is not None:
@@ -6964,6 +6966,12 @@ def parse_args() -> argparse.Namespace:
         help="Show raw YOLO camera feed without overlay drawing.",
     )
     parser.add_argument(
+        "--eval-online",
+        action="store_true",
+        default=False,
+        help="Print detailed online metrics summary at teardown.",
+    )
+    parser.add_argument(
         "--yolo-show-red-light-rois",
         dest="yolo_show_red_light_rois",
         action="store_true",
@@ -7440,6 +7448,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         camera_width=camera_width,
         camera_height=camera_height,
         camera_fov=camera_fov,
+        eval_online=args.eval_online,
         lock_spectator_on_spawn=lock_spectator,
         spectator_reapply_each_tick=spectator_reapply_each_tick,
         spectator_follow_distance=spectator_follow_distance,

@@ -4,7 +4,7 @@ param(
     [ValidateSet("cil", "cil_yolo")]
     [string]$Agent = "cil_yolo",
     [string]$Model = "models\waypoint_predictor_h5.pth",
-    [string]$YoloModel = "D:\AI\CARLA-Funny-Moments\models\yolo11m.engine",
+    [string]$YoloModel = "D:\AI\CARLA-Funny-Moments\models\rtdetr-resnet50.engine",
     [Nullable[double]]$TargetSpeedKmh = $null,
     [Nullable[double]]$MaxThrottle = $null,
     [Nullable[double]]$MaxBrake = $null,
@@ -19,7 +19,8 @@ param(
     [Nullable[int]]$NpcVehicleCount = $null,
     [Nullable[int]]$NpcBikeCount = $null,
     [Nullable[int]]$NpcMotorbikeCount = $null,
-    [Nullable[int]]$NpcPedestrianCount = $null
+    [Nullable[int]]$NpcPedestrianCount = $null,
+    [switch]$EvalOnline
 )
 
 $ErrorActionPreference = "Stop"
@@ -163,6 +164,9 @@ if ($NoOpencvRouteMap) {
 }
 if ($NoRandomWeather) {
     $runnerArgs += "--no-random-weather"
+}
+if ($EvalOnline) {
+    $runnerArgs += "--eval-online"
 }
 
 & $pythonExe "run_agents.py" @runnerArgs
