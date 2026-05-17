@@ -78,7 +78,7 @@ traffic_spawn:
   # Giảm vehicle_count / pedestrian_count nếu FPS CARLA thấp (thường là bottleneck lớn hơn OpenCV).
   vehicle_count: 30
   bike_count: 30
-  motorbike_count: 30
+  motorbike_count: 10
   pedestrian_count: 10
   npc_enable_autopilot: true
 
@@ -105,3 +105,8 @@ runtime:
   cil_enable_telemetry_csv: false
   cil_profile_tick_timing: false
   cil_profile_log_interval_ticks: 60
+  # Bật/tắt đánh giá online metrics (Route Completion, TTC, CNN Latency) khi chạy trong CARLA.
+  # false = không hiện bảng tổng kết metrics khi kết thúc (mặc định).
+  # true  = hiện bảng "CIL AGENT ONLINE EVALUATION SUMMARY" sau khi teardown.
+  # Cũng có thể bật bằng CLI: --eval-online (trong run_cil.ps1 dùng -EvalOnline).
+  eval_online: true

@@ -118,11 +118,10 @@ class YoloDetector:
             restored = self._restore_class_names_from_pt(model_path)
             if restored is not None:
                 self.class_names = restored
-                # NOTE: Do NOT set model.overrides["names"] here.
-                # Ultralytics merges model.overrides into every model.predict() / model.track()
-                # call as keyword arguments, and "names" is not a valid predictor argument —
-                # it would raise SyntaxError: 'names' is not a valid YOLO argument.
-                # self.class_names is the sole source of truth; _resolve_class_name uses it.
+                # NOTE: Do NOT set self.model.overrides["names"] — Ultralytics
+                # merges overrides into predict() kwargs, and "names" is not a
+                # valid predict argument. self.class_names is sufficient since
+                # _resolve_class_name() uses it directly.
                 logging.info(
                     "Restored %d class names from .pt for exported model.",
                     len(restored),
