@@ -87,6 +87,13 @@ except Exception as exc:
     logging.warning("Failed to import PurePursuitController: %s", exc)
     PurePursuitController = None
 
+try:
+    from core_control.humanize import SteeringMicroOscillator, WaypointHumanizer
+except Exception as exc:
+    logging.warning("Failed to import humanized driving helpers: %s", exc)
+    SteeringMicroOscillator = None
+    WaypointHumanizer = None
+
 from core_control.carla_manager import CarlaManager, SpectatorConfig
 from core_control.cil_route_planner import CILRoutePlanner
 from core_control.collect_data import DataCollector
@@ -786,6 +793,11 @@ class RunConfig:
     cil_command_trigger_min_m: float
     cil_command_trigger_max_m: float
     cil_use_pure_pursuit: bool
+    humanize_driving: bool
+    lane_snap_blend: float
+    lateral_jitter_amplitude: float
+    steering_micro_amplitude: float
+    lookahead_jitter: float
 
 class BaseSession:
     """Shared interface for CARLA and dry-run sessions."""
@@ -1726,7 +1738,8 @@ class LaneFollowAgent(BaseAgent):
         self._use_pure_pursuit = bool(config.cil_use_pure_pursuit)
         if self._use_pure_pursuit and PurePursuitController is not None and np is not None:
             dt = max(float(config.fixed_delta), 1e-3)
-            self._pure_pursuit = PurePursuitController(dt=dt)
+            lookahead_jitter = float(config.lookahead_jitter) if bool(config.humanize_driving) else 0.0
+            self._pure_pursuit = PurePursuitController(dt=dt, lookahead_jitter=lookahead_jitter)
         else:
             self._pure_pursuit = None
 
@@ -2475,17 +2488,41 @@ class CILAgent(BaseAgent):
             max_brake=config.max_brake,
         )
 
+        # Humanized driving controls
+        self._humanize_driving = bool(config.humanize_driving)
+        self._lane_snap_blend = clamp(float(config.lane_snap_blend), 0.0, 1.0)
+        self._lane_width_m: Optional[float] = None
+        self._humanize_dt = max(float(config.fixed_delta), 1e-3)
+        self._last_humanize_ts: Optional[float] = None
+        self._waypoint_humanizer = None
+        self._steer_micro = None
+        if self._humanize_driving and WaypointHumanizer is not None:
+            jitter_amp = max(0.0, float(config.lateral_jitter_amplitude))
+            if jitter_amp > 0.0:
+                self._waypoint_humanizer = WaypointHumanizer(amplitude=jitter_amp)
+        if self._humanize_driving and SteeringMicroOscillator is not None:
+            micro_amp = max(0.0, float(config.steering_micro_amplitude))
+            if micro_amp > 0.0:
+                self._steer_micro = SteeringMicroOscillator(amplitude=micro_amp)
+
         # Pure pursuit steering controller
         self._use_pure_pursuit = bool(config.cil_use_pure_pursuit)
         if self._use_pure_pursuit and PurePursuitController is not None and np is not None:
             dt = max(float(config.fixed_delta), 1e-3)
-            self._pure_pursuit = PurePursuitController(dt=dt)
+            lookahead_jitter = float(config.lookahead_jitter) if self._humanize_driving else 0.0
+            self._pure_pursuit = PurePursuitController(dt=dt, lookahead_jitter=lookahead_jitter)
         else:
             self._pure_pursuit = None
 
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
         self._route_overlay_bounds = None
+        self._last_humanize_ts = None
+        self._lane_width_m = None
+        if self._waypoint_humanizer is not None:
+            self._waypoint_humanizer.reset()
+        if self._steer_micro is not None:
+            self._steer_micro.reset()
         vehicle = session.ego_vehicle
         world = session.world
         if vehicle is None or world is None:
@@ -4339,8 +4376,15 @@ class CILAgent(BaseAgent):
                 return pred_waypoints
 
             ego_lane_id = int(getattr(ego_wp, "lane_id", 0))
+            try:
+                lane_width = float(getattr(ego_wp, "lane_width", 0.0))
+                if lane_width > 0.1:
+                    self._lane_width_m = lane_width
+            except Exception:
+                pass
             constrained = np.array(waypoints, copy=True)
             prev_valid_wp = ego_wp
+            blend = self._lane_snap_blend if self._humanize_driving else 1.0
 
             for i in range(constrained.shape[0]):
                 ex = float(waypoints[i, 0])
@@ -4369,8 +4413,14 @@ class CILAgent(BaseAgent):
                 snapped_loc = map_wp.transform.location
                 dx = float(snapped_loc.x - ego_loc.x)
                 dy = float(snapped_loc.y - ego_loc.y)
-                constrained[i, 0] = cos_yaw * dx + sin_yaw * dy
-                constrained[i, 1] = -sin_yaw * dx + cos_yaw * dy
+                snapped_x = cos_yaw * dx + sin_yaw * dy
+                snapped_y = -sin_yaw * dx + cos_yaw * dy
+                if blend >= 0.999:
+                    constrained[i, 0] = snapped_x
+                    constrained[i, 1] = snapped_y
+                else:
+                    constrained[i, 0] = blend * snapped_x + (1.0 - blend) * ex
+                    constrained[i, 1] = blend * snapped_y + (1.0 - blend) * ey
                 prev_valid_wp = map_wp
 
             return constrained
@@ -4385,10 +4435,15 @@ class CILAgent(BaseAgent):
         command: int,
         command_phase: str,
     ) -> float:
-        # ──────────────────────────────────────────────────────────────
-        # [TEST] Bypass all smoothing – use 100% raw CNN model steering.
-        # ──────────────────────────────────────────────────────────────
-        self._last_steer = clamp(float(steering_raw), -1.0, 1.0)
+        base = clamp(float(steering_raw), -1.0, 1.0)
+        if self._humanize_driving and self._steer_micro is not None:
+            base = self._steer_micro.apply(
+                steering=base,
+                speed_kmh=speed_kmh,
+                command=command,
+                dt=self._humanize_dt,
+            )
+        self._last_steer = clamp(float(base), -1.0, 1.0)
         return float(self._last_steer)
 
     def _route_locations_to_ego_waypoints(
@@ -4770,6 +4825,16 @@ class CILAgent(BaseAgent):
         if vehicle is None:
             return
 
+        humanize_dt = self._humanize_dt
+        if self._humanize_driving:
+            now_ts = tick_t0
+            if self._last_humanize_ts is None:
+                humanize_dt = self.config.fixed_delta if self.config.sync else (1.0 / 30.0)
+            else:
+                humanize_dt = max(1e-3, now_ts - float(self._last_humanize_ts))
+            self._last_humanize_ts = now_ts
+            self._humanize_dt = humanize_dt
+
         speed_kmh = self._current_speed_kmh()
         self._last_speed_kmh = speed_kmh
         hud_fps = self._update_hud_fps()
@@ -4825,6 +4890,17 @@ class CILAgent(BaseAgent):
 
         control_t0 = time.perf_counter()
         pred_waypoints = self._constrain_waypoints_to_lane(pred_waypoints, vehicle, command)
+        if self._humanize_driving and self._waypoint_humanizer is not None:
+            half_lane_width = None
+            if self._lane_width_m is not None and math.isfinite(float(self._lane_width_m)):
+                half_lane_width = 0.5 * float(self._lane_width_m)
+            pred_waypoints = self._waypoint_humanizer.humanize_waypoints(
+                pred_waypoints,
+                speed_kmh=speed_kmh,
+                command=command,
+                dt=humanize_dt,
+                half_lane_width_m=half_lane_width,
+            )
         # NOTE: Huber-only model has no valid uncertainty head → disable VETO
         ai_is_confused = float(mean_uncertainty) > 1e9
 
@@ -7235,6 +7311,18 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         False,
     )
 
+    humanize_driving = _to_bool(_cfg_get(env_cfg, "cil", "humanize_driving", False), False)
+    lane_snap_blend = clamp(float(_cfg_get(env_cfg, "cil", "lane_snap_blend", 1.0)), 0.0, 1.0)
+    lateral_jitter_amplitude = max(0.0, float(_cfg_get(env_cfg, "cil", "lateral_jitter_amplitude", 0.0)))
+    steering_micro_amplitude = max(0.0, float(_cfg_get(env_cfg, "cil", "steering_micro_amplitude", 0.0)))
+    lookahead_jitter = max(0.0, float(_cfg_get(env_cfg, "cil", "lookahead_jitter", 0.0)))
+
+    if not humanize_driving:
+        lane_snap_blend = 1.0
+        lateral_jitter_amplitude = 0.0
+        steering_micro_amplitude = 0.0
+        lookahead_jitter = 0.0
+
     nav_agent_type = str(pick(args.nav_agent_type, "cil", "nav_agent_type", "basic")).lower()
     if nav_agent_type not in {"basic", "behavior"}:
         logging.warning("Unsupported nav_agent_type=%s. Falling back to 'basic'.", nav_agent_type)
@@ -7460,6 +7548,11 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         cil_command_trigger_min_m=cil_command_trigger_min_m,
         cil_command_trigger_max_m=cil_command_trigger_max_m,
         cil_use_pure_pursuit=cil_use_pure_pursuit,
+        humanize_driving=humanize_driving,
+        lane_snap_blend=lane_snap_blend,
+        lateral_jitter_amplitude=lateral_jitter_amplitude,
+        steering_micro_amplitude=steering_micro_amplitude,
+        lookahead_jitter=lookahead_jitter,
     )
 
 

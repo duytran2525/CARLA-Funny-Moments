@@ -76,10 +76,10 @@ yolo:
 
 traffic_spawn:
   # Giảm vehicle_count / pedestrian_count nếu FPS CARLA thấp (thường là bottleneck lớn hơn OpenCV).
-  vehicle_count: 30
-  bike_count: 30
-  motorbike_count: 10
-  pedestrian_count: 10
+  vehicle_count: 0
+  bike_count: 0
+  motorbike_count: 0
+  pedestrian_count: 0
   npc_enable_autopilot: true
 
 recording:

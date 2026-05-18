@@ -46,6 +46,12 @@ cil:
   recovery_duration_frames: 10
   recovery_steer_offset: 0.3
   use_pure_pursuit: true
+  # ── Humanized Driving (Anti-Cheat) ──
+  humanize_driving: true          # Bật/tắt toàn bộ humanization
+  lane_snap_blend: 0.7            # 0.0=pure CNN, 1.0=snap cứng (default cũ)
+  lateral_jitter_amplitude: 0.25  # Biên độ lệch ngang (mét), 0=tắt
+  steering_micro_amplitude: 0.008 # Biên độ rung vô lăng, 0=tắt
+  lookahead_jitter: 0.15          # ±15% variation look-ahead distance
 
 yolo:
   # backend:
