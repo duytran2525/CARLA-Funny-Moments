@@ -415,22 +415,6 @@ class YoloDetector:
         results = self._track(frame_bgr)
         tracked_objects = self._detections_from_results(results, include_tracking=True)
 
-        if not tracked_objects:
-            predicted_objects = self.detect(frame_bgr)
-            tracked_objects = [
-                {
-                    **obj,
-                    "raw_bbox": list(obj["bbox"]),
-                    "track_id": None,
-                }
-                for obj in predicted_objects
-            ]
-            if tracked_objects:
-                logging.debug(
-                    "Ultralytics track() returned no usable boxes; falling back to predict() for %d boxes.",
-                    len(tracked_objects),
-                )
-
         for obj in tracked_objects:
             x1, y1, x2, y2 = [int(v) for v in obj["bbox"]]
             class_name = str(obj.get("class", "unknown"))

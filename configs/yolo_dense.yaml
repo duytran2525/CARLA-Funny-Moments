@@ -4,7 +4,7 @@
   tm_port: 8000
   timeout: 60.0
   sync: true
-  fixed_delta: 0.03
+  fixed_delta: 0.033333
   no_rendering: false
 
   map: "Town02"
@@ -13,7 +13,7 @@
 
 vehicle:
   filter: "vehicle.tesla.model3"
-  spawn_point: 5 
+  spawn_point: 5
   destination_point: 20
   role_name: "hero"
 
@@ -58,22 +58,22 @@ yolo:
   # Tracker dùng bởi Ultralytics model.track().
   # Chạy 2 lần với "botsort.yaml" và "bytetrack.yaml" để so sánh tracking metrics.
   tracker: "botsort.yaml"
-  inference_every_n_ticks: 1
+  inference_every_n_ticks: 3
   inference_imgsz: 0
   # Cửa sổ OpenCV hiển thị kết quả detect (bbox / HUD tùy debug_overlay).
   # - agent=yolo_detect: bật/tắt màn hình debug YOLO.
   # - agent=cil_yolo: cửa sổ "CARLA CIL + YOLO"; khi chạy bấm 'y' để bật/tắt. CLI: --no-yolo-visualize.
-  debug_window: true
+  debug_window: false
   # Khi debug_window=true:
   # true  = vẽ box, HUD, corridor như giao diện debug cũ.
   # false = chỉ hiện raw camera feed.
-  debug_overlay: true
+  debug_overlay: false
 
 traffic_spawn:
-  vehicle_count: 50
-  bike_count: 30
-  motorbike_count: 40
-  pedestrian_count: 10
+  vehicle_count: 15
+  bike_count: 5
+  motorbike_count: 5
+  pedestrian_count: 5
   npc_enable_autopilot: true
 
 recording:
@@ -85,12 +85,12 @@ recording:
 
 runtime:
   ticks: 0
-  tick_interval: 0.03
+  tick_interval: 0.033333
   fps_log_interval_ticks: 30
   cil_enable_hud: false
   cil_enable_route_map: false
   # cil_yolo OpenCV: YOLO = yolo.debug_window + phím 'y'; route map = cil_opencv_route_map + phím 'r'.
-  cil_opencv_route_map: true
+  cil_opencv_route_map: false
   cil_world_waypoint_debug: false
   cil_enable_telemetry_csv: false
   cil_profile_tick_timing: false

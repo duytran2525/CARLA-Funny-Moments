@@ -4792,8 +4792,30 @@ class CILAgent(BaseAgent):
                 self._cache_reference_route_plan()
             try:
                 if self._nav_agent.done():
-                    self._request_stop_at_destination("planner_done", destination_distance_m)
-                    return
+                    if destination_distance_m is None:
+                        self._request_stop_at_destination("planner_done", destination_distance_m)
+                        return
+                    if destination_distance_m <= self._arrival_distance_m:
+                        self._request_stop_at_destination("planner_done", destination_distance_m)
+                        return
+                    if (
+                        self._route_destination_location is not None
+                        and step_idx - int(self._last_replan_tick) >= 30
+                    ):
+                        try:
+                            set_navigation_destination(
+                                self._nav_agent,
+                                vehicle.get_location(),
+                                self._route_destination_location,
+                            )
+                            self._last_replan_tick = int(step_idx)
+                            logging.warning(
+                                "CIL ignored early planner_done at %.2fm from D; reissued destination.",
+                                float(destination_distance_m),
+                            )
+                        except Exception as exc:
+                            self._last_replan_tick = int(step_idx)
+                            logging.debug("CIL failed to reissue destination after early planner_done: %s", exc)
             except Exception:
                 pass
             self._refresh_planner_state()

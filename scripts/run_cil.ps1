@@ -1,6 +1,6 @@
 param(
     [string]$CarlaRoot = "E:\Carla",
-    [string]$Config = "configs/carla_env.yaml",
+    [string]$Config = "D:\AI\CARLA-Funny-Moments\configs\carla_env.yaml",
     [ValidateSet("cil", "cil_yolo")]
     [string]$Agent = "cil_yolo",
     [string]$Model = "models\waypoint_predictor_h5.pth",
