@@ -4,7 +4,7 @@ param(
     [ValidateSet("cil", "cil_yolo")]
     [string]$Agent = "cil_yolo",
     [string]$Model = "models\waypoint_predictor_h5.pth",
-    [string]$YoloModel = "D:\AI\CARLA-Funny-Moments\models\rtdetr-resnet50.engine",
+    [string]$YoloModel = "D:\AI\CARLA-Funny-Moments\rtdetr-l.engine",
     [Nullable[double]]$TargetSpeedKmh = $null,
     [Nullable[double]]$MaxThrottle = $null,
     [Nullable[double]]$MaxBrake = $null,
