@@ -62,6 +62,23 @@ def parse_args() -> argparse.Namespace:
         help="Keep anchor actors even if missing in some history/future frames; masks mark valid steps.",
     )
     parser.add_argument(
+        "--adaptive-radius",
+        action="store_true",
+        help="Enable adaptive radius mode: compute per-agent radius from velocity magnitude.",
+    )
+    parser.add_argument(
+        "--radius-base",
+        type=float,
+        default=20.0,
+        help="Base radius in meters for adaptive radius mode (default: 20.0).",
+    )
+    parser.add_argument(
+        "--radius-alpha",
+        type=float,
+        default=0.5,
+        help="Velocity scaling factor for adaptive radius mode (default: 0.5).",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=0,
@@ -107,6 +124,9 @@ def main() -> int:
         max_dt_error=float(args.max_dt_error),
         max_step_m=float(args.max_step_m),
         min_valid_ratio=float(args.min_valid_ratio),
+        adaptive_radius_enabled=bool(args.adaptive_radius),
+        radius_base=float(args.radius_base),
+        radius_alpha=float(args.radius_alpha),
     )
 
     frames = read_raw_frames(raw_csv)
@@ -147,6 +167,9 @@ def main() -> int:
             "max_dt_error": config.max_dt_error,
             "max_step_m": config.max_step_m,
             "min_valid_ratio": config.min_valid_ratio,
+            "adaptive_radius_enabled": config.adaptive_radius_enabled,
+            "radius_base": config.radius_base,
+            "radius_alpha": config.radius_alpha,
         },
     }
     (out_dir / "build_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

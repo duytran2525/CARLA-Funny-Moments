@@ -67,7 +67,7 @@ except ImportError:
     yaml = None
 
 from core_control.carla_manager import CarlaManager, SpectatorConfig
-from core_control.collect_data import DataCollector
+from collect_data import DataCollector
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -75,8 +75,8 @@ from core_control.collect_data import DataCollector
 # ═══════════════════════════════════════════════════════════════════════════
 
 CRUISE_DURATION_S: float      = 5.0
-NOISE_DURATION_S: float       = 0.30
-NOISE_INTENSITY: float        = 0.10
+NOISE_DURATION_S: float       = 1.5
+NOISE_INTENSITY: float        = 0.30
 DRIFT_THROTTLE: float         = 0.45
 RECOVERY_DURATION_S: float    = 3.0
 MIN_SPEED_TO_DRIFT_KMH: float = 8.0
@@ -614,12 +614,14 @@ def main() -> int:
                 )
 
                 if should_record:
+                    # Timestamp từ world snapshot (đồng bộ với camera)
                     snapshot  = world.get_snapshot()
                     ts        = float(snapshot.timestamp.elapsed_seconds)
                     sim_frame = snapshot.frame  # <-- Lấy Frame ID chuẩn của CARLA Server
                     
                     route_cmd = _get_route_command(ego, world)
                     junction  = _is_junction(ego, world)
+
                     # add_vehicle_state: đẩy state vào DataCollector
                     # DataCollector tự ghép với ảnh camera qua sensor_queue
                     # is_recovering=True → CSV sẽ có recovery_flag=1

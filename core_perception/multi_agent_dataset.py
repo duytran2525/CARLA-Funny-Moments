@@ -53,8 +53,13 @@ class MultiAgentTrajectoryDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor | str | int | float]:
         sample_path = self.sample_paths[int(index)]
         sample = torch.load(sample_path, map_location="cpu", weights_only=True)
+        
+        # Load and detect format
+        x = torch.as_tensor(sample["x"], dtype=torch.float32)
+        x = self._ensure_6d_features(x)
+        
         return {
-            "x": torch.as_tensor(sample["x"], dtype=torch.float32),
+            "x": x,
             "y": torch.as_tensor(sample["y"], dtype=torch.float32),
             "adj": torch.as_tensor(sample["adj"], dtype=torch.float32),
             "x_mask": torch.as_tensor(sample["x_mask"], dtype=torch.bool),
@@ -67,6 +72,44 @@ class MultiAgentTrajectoryDataset(Dataset):
             "run_id": str(sample.get("run_id", "")),
             "sample_path": str(sample_path),
         }
+    
+    @staticmethod
+    def _ensure_6d_features(x: torch.Tensor) -> torch.Tensor:
+        """
+        Ensure features are 6-dimensional for backward compatibility.
+        
+        Old format (fixed radius): [num_agents, history_steps, 4]
+            Features: (local_x, local_y, heading_x, heading_y)
+        
+        New format (adaptive radius): [num_agents, history_steps, 6]
+            Features: (local_x, local_y, local_vx, local_vy, heading_x, heading_y)
+        
+        If old format is detected (4D features), pad with zero velocity components
+        to create 6D features: (local_x, local_y, 0.0, 0.0, heading_x, heading_y)
+        
+        Args:
+            x: Input features tensor [num_agents, history_steps, feature_dim]
+        
+        Returns:
+            Features tensor with 6D features [num_agents, history_steps, 6]
+        """
+        if x.shape[-1] == 6:
+            # New format with velocity features - return as-is
+            return x
+        elif x.shape[-1] == 4:
+            # Old format without velocity features - pad with zeros
+            num_agents, history_steps, _ = x.shape
+            # Create 6D tensor: (local_x, local_y, local_vx=0, local_vy=0, heading_x, heading_y)
+            x_6d = torch.zeros((num_agents, history_steps, 6), dtype=x.dtype)
+            x_6d[:, :, 0:2] = x[:, :, 0:2]  # local_x, local_y
+            # x_6d[:, :, 2:4] already zeros (local_vx=0, local_vy=0)
+            x_6d[:, :, 4:6] = x[:, :, 2:4]  # heading_x, heading_y
+            return x_6d
+        else:
+            raise ValueError(
+                f"Unexpected feature dimension: {x.shape[-1]}. "
+                f"Expected 4 (old format) or 6 (new format)."
+            )
 
 
 def split_sample_paths(
