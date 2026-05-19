@@ -1,28 +1,28 @@
 """
-collect_recovery_data.py — Intentional Drift Recovery Dataset Collector v3
-==========================================================================
-Changes v3 (based on dataset quality report):
+collect_recovery_data.py — Intentional Drift Recovery Dataset Collector v4
+===========================================================================
+v4: Tái cấu trúc hoàn toàn phần ghi data.
 
-  [CRITICAL] Collision sensor + reverse maneuver thay vì teleport tức thì.
-             Phát hiện va chạm ngay lập tức → lùi xe ~30 ticks → CRUISING.
-             Teleport chỉ còn là fallback khi stuck > STUCK_MAX_TICKS.
+THAY ĐỔI CHÍNH SO VỚI v3:
+  [BREAKING] Bỏ RecoveryCSVWriter + tự ghi ảnh thủ công.
+             Thay bằng DataCollector từ collect_data.py.
 
-  [CRITICAL] MIN_RECORD_SPEED_KMH guard: chỉ ghi frame khi speed >= 2.0 km/h.
-             Loại bỏ 59.7% frames xe đứng yên húc tường khỏi dataset.
+  [OUTPUT]   CSV schema giờ HOÀN TOÀN GIỐNG driving_log.csv của collect_data.py:
+               - Có đủ temporal stacking (img_id_tm06, img_id_tm03)
+               - Có waypoint ground truth (wp_1_x..wp_5_y)
+               - Có 3 camera (center, left, right)
+               - recovery_flag = 1 cho mọi frame được ghi
+               - is_recovering = True → DataCollector tự dense-sample
 
-  [CRITICAL] STUCK_MAX_TICKS giảm từ 150 → 40 ticks để phản ứng nhanh hơn.
+  [REMOVED]  Các cột riêng của v3 (noise_magnitude, phase, cycle_id,
+             post_collision, correction_valid) — không cần thiết cho training.
 
-  [MAJOR]   RECOVERY_WARMUP_TICKS = 5: bỏ qua N tick đầu của RECOVERING để
-             TM kịp nhận ra vị trí và bắt đầu correction thực sự.
+  [SENSORS]  Thêm 2 camera left/right để tương thích với DataCollector.
+             DataCollector yêu cầu đủ 3 camera mới ghi frame.
 
-  [MAJOR]   Thêm cột CSV: noise_magnitude, phase, cycle_id,
-             post_collision, correction_valid.
-             recovery_flag giữ lại để tương thích ngược (luôn = 1).
-
-  [MAJOR]   Balanced noise direction: thay vì random() < 0.5 thuần túy,
-             dùng cumulative counter để đảm bảo left/right ~50/50.
-
-  [MINOR]   Phase.REVERSING mới: trạng thái riêng để reverse ra khỏi chướng ngại.
+  [COMPAT]   Toàn bộ logic Phase (CRUISING/DRIFTING/RECOVERING/REVERSING)
+             và các fix v3 (collision sensor, STUCK detection, balanced noise)
+             được GIỮ NGUYÊN.
 
 Sử dụng:
   python scripts/collect_recovery_data.py --ticks 20000 --out-dir data/recovery
@@ -31,15 +31,12 @@ Sử dụng:
 from __future__ import annotations
 
 import argparse
-import csv
 import enum
 import logging
 import math
-import os
 import queue
 import random
 import sys
-import time
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -55,10 +52,9 @@ except ImportError as exc:
     ) from exc
 
 try:
-    import cv2
     import numpy as np
 except ImportError as exc:
-    raise RuntimeError("opencv-python and numpy are required.") from exc
+    raise RuntimeError("numpy is required.") from exc
 
 try:
     import yaml
@@ -66,64 +62,46 @@ except ImportError:
     yaml = None
 
 from core_control.carla_manager import CarlaManager, SpectatorConfig
+from collect_data import DataCollector
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TUNABLE PARAMETERS
+# TUNABLE PARAMETERS — giữ nguyên từ v3
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Số giây xe chạy bình thường (autopilot ON) trước khi drift tiếp.
-CRUISE_DURATION_S: float = 5.0
-
-# Thời gian bơm nhiễu steering. Quá ngắn → chưa lệch. Quá dài → văng.
-NOISE_DURATION_S: float = 1.5
-
-# Cường độ noise cộng vào steering (0.15–0.50).
-NOISE_INTENSITY: float = 0.30
-
-# Throttle thủ công trong pha drift (giữ xe di chuyển khi autopilot OFF).
-DRIFT_THROTTLE: float = 0.45
-
-# Thời gian ghi dữ liệu recovery (autopilot tự đánh lái gắt).
-RECOVERY_DURATION_S: float = 3.0
-
-# Tốc độ tối thiểu (km/h) để bắt đầu drift. Nếu thấp hơn → chờ thêm.
+CRUISE_DURATION_S: float      = 5.0
+NOISE_DURATION_S: float       = 1.5
+NOISE_INTENSITY: float        = 0.30
+DRIFT_THROTTLE: float         = 0.45
+RECOVERY_DURATION_S: float    = 3.0
 MIN_SPEED_TO_DRIFT_KMH: float = 8.0
+MIN_RECORD_SPEED_KMH: float   = 2.0
 
-# [FIX v3 - CRITICAL] Tốc độ tối thiểu để GHI frame trong RECOVERING.
-# Loại bỏ frames xe đứng yên húc tường (vốn chiếm 59.7% dataset cũ).
-MIN_RECORD_SPEED_KMH: float = 2.0
-
-# [FIX v3 - CRITICAL] Giảm từ 150 → 40 để phát hiện stuck nhanh hơn.
-# 30 FPS * ~1.3s = 40 ticks. Collision sensor sẽ bắt phần lớn va chạm
-# trước khi stuck counter đạt ngưỡng này.
 STUCK_SPEED_THRESHOLD_KMH: float = 1.0
-STUCK_MAX_TICKS: int = 40
+STUCK_MAX_TICKS: int             = 40
+RECOVERY_WARMUP_TICKS: int       = 5
+REVERSE_TICKS: int               = 30
+REVERSE_THROTTLE: float          = 0.4
+POST_COLLISION_FLAG_TICKS: int   = 30
 
-# [NEW v3 - MAJOR] Bỏ qua N tick đầu của RECOVERING để TM ổn định.
-# Tránh ghi các frame TM đang "khởi động" (steer 0→0.15→0.45...).
-RECOVERY_WARMUP_TICKS: int = 5
-
-# [NEW v3 - CRITICAL] Số tick lùi xe khi phát hiện va chạm qua collision sensor.
-# Thay thế teleport tức thì: xe lùi ra khỏi vật cản trước khi tiếp tục.
-REVERSE_TICKS: int = 30
-REVERSE_THROTTLE: float = 0.4  # throttle cho reverse (gear = reverse)
-
-# [NEW v3] Số tick sau va chạm để đánh dấu post_collision = 1 trong CSV.
-POST_COLLISION_FLAG_TICKS: int = 30
-
-# Camera & Output
-CAMERA_WIDTH: int = 640
-CAMERA_HEIGHT: int = 360
-CAMERA_FOV: float = 90.0
-JPEG_QUALITY: int = 95
-SAVE_WIDTH: int = 400
-SAVE_HEIGHT: int = 200
+# Camera config
+CAMERA_WIDTH: int   = 640
+CAMERA_HEIGHT: int  = 360
+CAMERA_FOV: float   = 90.0
+SAVE_WIDTH: int     = 400
+SAVE_HEIGHT: int    = 200
+JPEG_QUALITY: int   = 95
 SAVE_EVERY_N_FRAMES: int = 1
-TARGET_SPEED_KMH: float = 35.0
 
-# Số tick warmup để TM ổn định tốc độ trước khi bắt đầu loop.
-WARMUP_TICKS: int = 150
+# Camera offsets — phải khớp với collect_data.py
+CAM_X: float     =  1.5
+CAM_Z: float     =  2.2
+CAM_PITCH: float = -8.0
+CAM_LEFT_Y: float  = -1.2
+CAM_RIGHT_Y: float =  1.2
+
+TARGET_SPEED_KMH: float = 35.0
+WARMUP_TICKS: int       = 150
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -134,7 +112,7 @@ class Phase(enum.Enum):
     CRUISING   = "cruising"
     DRIFTING   = "drifting"
     RECOVERING = "recovering"
-    REVERSING  = "reversing"   # [NEW v3] lùi xe ra khỏi vật cản
+    REVERSING  = "reversing"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -154,12 +132,6 @@ def _cfg(config: dict, section: str, key: str, default: Any) -> Any:
     return value.get(key, default) if isinstance(value, dict) else default
 
 
-def _image_to_rgb(image: Any) -> np.ndarray:
-    raw = np.frombuffer(image.raw_data, dtype=np.uint8)
-    bgra = raw.reshape((image.height, image.width, 4))
-    return cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGB)
-
-
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
@@ -169,8 +141,7 @@ def _get_speed_kmh(ego: Any) -> float:
     return 3.6 * math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2)
 
 
-def _drain_queue(q: queue.Queue) -> None:
-    """Xả sạch queue không cần xử lý."""
+def _drain_queue(q: "queue.Queue[Any]") -> None:
     while not q.empty():
         try:
             q.get_nowait()
@@ -181,13 +152,10 @@ def _drain_queue(q: queue.Queue) -> None:
 def _respawn_to_nearest_waypoint(
     ego: Any, world: Any, target_speed_kmh: float, tm: Any, tm_port: int
 ) -> None:
-    """
-    [FALLBACK] Teleport xe về waypoint hợp lệ gần nhất.
-    Chỉ gọi khi collision sensor + reverse đều thất bại (stuck > STUCK_MAX_TICKS).
-    """
+    """Teleport fallback khi stuck > STUCK_MAX_TICKS."""
     try:
         current_loc = ego.get_transform().location
-        carla_map = world.get_map()
+        carla_map   = world.get_map()
         wp = carla_map.get_waypoint(
             current_loc, project_to_road=True, lane_type=carla.LaneType.Driving
         )
@@ -195,7 +163,7 @@ def _respawn_to_nearest_waypoint(
             logging.warning("Respawn: cannot find nearby waypoint, skipping.")
             return
 
-        safe_tf = wp.transform
+        safe_tf          = wp.transform
         safe_tf.location.z += 0.5
         ego.set_transform(safe_tf)
 
@@ -203,12 +171,12 @@ def _respawn_to_nearest_waypoint(
         ego.set_target_velocity(zero_vec)
         ego.set_target_angular_velocity(zero_vec)
 
-        reset_ctrl = carla.VehicleControl()
-        reset_ctrl.throttle = 0.0
-        reset_ctrl.brake = 0.0
-        reset_ctrl.hand_brake = False
-        reset_ctrl.manual_gear_shift = False
-        reset_ctrl.gear = 1
+        reset_ctrl                    = carla.VehicleControl()
+        reset_ctrl.throttle           = 0.0
+        reset_ctrl.brake              = 0.0
+        reset_ctrl.hand_brake         = False
+        reset_ctrl.manual_gear_shift  = False
+        reset_ctrl.gear               = 1
         ego.apply_control(reset_ctrl)
 
         logging.warning(
@@ -219,107 +187,15 @@ def _respawn_to_nearest_waypoint(
         logging.error("Respawn failed: %s", exc)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CSV
-# ═══════════════════════════════════════════════════════════════════════════
-
-# [v3] Thêm: noise_magnitude, phase, cycle_id, post_collision, correction_valid
-# recovery_flag giữ lại cho tương thích ngược (luôn = 1 vì chỉ ghi khi RECOVERING).
-CSV_FIELDNAMES = [
-    "frame_id", "timestamp", "image_filename",
-    "steering", "throttle", "brake", "speed_kmh",
-    "noise_direction", "noise_magnitude",
-    "x", "y", "z", "yaw",
-    "recovery_flag",       # deprecated: luôn = 1, giữ cho compat
-    "phase",               # [v3] giá trị Phase enum khi frame được ghi
-    "cycle_id",            # [v3] số thứ tự cycle (drift→recovery) hiện tại
-    "post_collision",      # [v3] 1 nếu trong POST_COLLISION_FLAG_TICKS sau va chạm
-    "correction_valid",    # [v3] 1 nếu steering đúng chiều recovery (ngược noise_direction)
-]
-
-
-class RecoveryCSVWriter:
-    def __init__(self, csv_path: Path) -> None:
-        self._path = csv_path
-        append = csv_path.exists()
-        if append:
-            self._validate_schema()
-        self._file = csv_path.open("a" if append else "w", newline="", encoding="utf-8")
-        self._writer = csv.DictWriter(self._file, fieldnames=CSV_FIELDNAMES)
-        if not append:
-            self._writer.writeheader()
-            self._file.flush()
-        self._rows_since_flush = 0
-        self.total_rows = 0
-
-    def _validate_schema(self) -> None:
-        with self._path.open("r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            existing = list(reader.fieldnames or [])
-        if existing != CSV_FIELDNAMES:
-            raise RuntimeError(
-                f"CSV schema mismatch.\n"
-                f"  Expected : {CSV_FIELDNAMES}\n"
-                f"  Got      : {existing}\n"
-                "Delete old CSV or use a fresh --out-dir."
-            )
-
-    def write(self, row: dict) -> None:
-        self._writer.writerow(row)
-        self._rows_since_flush += 1
-        self.total_rows += 1
-        if self._rows_since_flush >= 50:
-            self._file.flush()
-            self._rows_since_flush = 0
-
-    def close(self) -> None:
-        if self._file:
-            self._file.flush()
-            self._file.close()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ARG PARSER
-# ═══════════════════════════════════════════════════════════════════════════
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Collect recovery dataset via Intentional Drift in CARLA (v3)."
-    )
-    p.add_argument("--config",              type=Path,  default=Path("configs/carla_env.yaml"))
-    p.add_argument("--host",                            default=None)
-    p.add_argument("--port",                type=int,   default=None)
-    p.add_argument("--tm-port",             type=int,   default=None)
-    p.add_argument("--map",   dest="map_name",          default=None)
-    p.add_argument("--spawn-point",         type=int,   default=-1)
-    p.add_argument("--ticks",               type=int,   default=15000)
-    p.add_argument("--out-dir",                         default="data/recovery")
-    p.add_argument("--target-speed-kmh",    type=float, default=None)
-    p.add_argument("--noise-intensity",     type=float, default=None)
-    p.add_argument("--noise-duration",      type=float, default=None)
-    p.add_argument("--recovery-duration",   type=float, default=None)
-    p.add_argument("--cruise-duration",     type=float, default=None)
-    p.add_argument("--drift-throttle",      type=float, default=None)
-    p.add_argument("--seed",                type=int,   default=42)
-    p.add_argument("--npc-vehicle-count",   type=int,   default=0)
-    p.add_argument("--log-every",           type=int,   default=200)
-    return p.parse_args()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# AUTOPILOT HELPERS
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _enable_autopilot(ego: Any, tm: Any, tm_port: int, target_speed_kmh: float) -> None:
-    """Bật autopilot + cấu hình TM. Gọi mỗi lần chuyển sang CRUISING/RECOVERING."""
-
-    # Ép gear=1 (số D) để TM có thể đạp ga tiến lên.
-    ctrl = carla.VehicleControl()
-    ctrl.hand_brake = False
-    ctrl.manual_gear_shift = False
-    ctrl.gear = 1
-    ctrl.brake = 0.0
-    ctrl.throttle = 0.0
+def _enable_autopilot(
+    ego: Any, tm: Any, tm_port: int, target_speed_kmh: float
+) -> None:
+    ctrl                     = carla.VehicleControl()
+    ctrl.hand_brake          = False
+    ctrl.manual_gear_shift   = False
+    ctrl.gear                = 1
+    ctrl.brake               = 0.0
+    ctrl.throttle            = 0.0
     ego.apply_control(ctrl)
 
     actual_tm_port = tm.get_port() if tm is not None else tm_port
@@ -347,20 +223,70 @@ def _enable_autopilot(ego: Any, tm: Any, tm_port: int, target_speed_kmh: float) 
             pct = 100.0 * (speed_limit - target_speed_kmh) / speed_limit
             pct = max(-150.0, min(100.0, pct))
             tm.vehicle_percentage_speed_difference(ego, float(pct))
-            logging.debug(
-                "TM speed config: limit=%.0f target=%.0f pct=%.1f%%",
-                speed_limit, target_speed_kmh, pct,
-            )
         except Exception:
             pass
 
 
 def _disable_autopilot(ego: Any, tm_port: int) -> None:
-    """Tắt autopilot — chuyển sang manual control."""
     try:
         ego.set_autopilot(False, tm_port)
     except TypeError:
         ego.set_autopilot(False)
+
+
+def _get_route_command(ego: Any, world: Any) -> int:
+    """
+    Trả về route command đơn giản.
+    DataCollector sẽ override thông qua _resolve_sample_command
+    dựa trên trajectory thực tế khi ở junction.
+    """
+    try:
+        carla_map = world.get_map()
+        loc = ego.get_transform().location
+        wp  = carla_map.get_waypoint(loc, project_to_road=True)
+        if wp is not None and wp.is_junction:
+            return 3  # junction — DataCollector infer thực
+    except Exception:
+        pass
+    return 0  # lane follow
+
+
+def _is_junction(ego: Any, world: Any) -> bool:
+    try:
+        carla_map = world.get_map()
+        loc = ego.get_transform().location
+        wp  = carla_map.get_waypoint(loc, project_to_road=True)
+        return wp is not None and wp.is_junction
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ARG PARSER
+# ═══════════════════════════════════════════════════════════════════════════
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Collect recovery dataset via Intentional Drift in CARLA (v4)."
+    )
+    p.add_argument("--config",            type=Path,  default=Path("configs/carla_env.yaml"))
+    p.add_argument("--host",                          default=None)
+    p.add_argument("--port",              type=int,   default=None)
+    p.add_argument("--tm-port",           type=int,   default=None)
+    p.add_argument("--map", dest="map_name",          default=None)
+    p.add_argument("--spawn-point",       type=int,   default=-1)
+    p.add_argument("--ticks",             type=int,   default=15000)
+    p.add_argument("--out-dir",                       default="data/recovery")
+    p.add_argument("--target-speed-kmh",  type=float, default=None)
+    p.add_argument("--noise-intensity",   type=float, default=None)
+    p.add_argument("--noise-duration",    type=float, default=None)
+    p.add_argument("--recovery-duration", type=float, default=None)
+    p.add_argument("--cruise-duration",   type=float, default=None)
+    p.add_argument("--drift-throttle",    type=float, default=None)
+    p.add_argument("--seed",              type=int,   default=42)
+    p.add_argument("--npc-vehicle-count", type=int,   default=0)
+    p.add_argument("--log-every",         type=int,   default=200)
+    return p.parse_args()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -376,19 +302,19 @@ def main() -> int:
     )
     random.seed(args.seed)
 
-    noise_intensity    = args.noise_intensity    or NOISE_INTENSITY
-    noise_duration_s   = args.noise_duration     or NOISE_DURATION_S
-    recovery_duration_s = args.recovery_duration or RECOVERY_DURATION_S
-    cruise_duration_s  = args.cruise_duration    or CRUISE_DURATION_S
-    drift_throttle     = args.drift_throttle     or DRIFT_THROTTLE
+    noise_intensity     = args.noise_intensity    or NOISE_INTENSITY
+    noise_duration_s    = args.noise_duration     or NOISE_DURATION_S
+    recovery_duration_s = args.recovery_duration  or RECOVERY_DURATION_S
+    cruise_duration_s   = args.cruise_duration    or CRUISE_DURATION_S
+    drift_throttle      = args.drift_throttle     or DRIFT_THROTTLE
 
     config      = _load_config(args.config)
-    host        = args.host     or _cfg(config, "carla", "host",        "127.0.0.1")
-    port        = args.port     or int(_cfg(config, "carla", "port",    2000))
-    tm_port     = args.tm_port  or int(_cfg(config, "carla", "tm_port", 8000))
-    timeout     = float(_cfg(config, "carla", "timeout",       60.0))
-    fixed_delta = float(_cfg(config, "carla", "fixed_delta",   0.033333))
-    map_name    = args.map_name or _cfg(config, "carla", "map",         "Town03")
+    host        = args.host    or _cfg(config, "carla", "host",        "127.0.0.1")
+    port        = args.port    or int(_cfg(config, "carla", "port",    2000))
+    tm_port     = args.tm_port or int(_cfg(config, "carla", "tm_port", 8000))
+    timeout     = float(_cfg(config, "carla", "timeout",               60.0))
+    fixed_delta = float(_cfg(config, "carla", "fixed_delta",           0.033333))
+    map_name    = args.map_name or _cfg(config, "carla", "map",        "Town03")
     vehicle_filter = _cfg(config, "vehicle", "filter", "vehicle.tesla.model3")
     target_speed   = args.target_speed_kmh or TARGET_SPEED_KMH
 
@@ -397,36 +323,36 @@ def main() -> int:
     recovery_ticks = max(1, int(recovery_duration_s / fixed_delta))
 
     logging.info("=" * 65)
-    logging.info("  INTENTIONAL DRIFT v3 — Recovery Dataset Collector")
+    logging.info("  INTENTIONAL DRIFT v4 — Recovery Dataset Collector")
+    logging.info("  Output schema: IDENTICAL to collect_data.py (driving_log.csv)")
     logging.info("=" * 65)
     logging.info("  Map                : %s", map_name)
     logging.info("  Target speed       : %.0f km/h", target_speed)
     logging.info("  Noise intensity    : %.3f", noise_intensity)
     logging.info("  Drift throttle     : %.2f", drift_throttle)
     logging.info("  Min drift speed    : %.1f km/h", MIN_SPEED_TO_DRIFT_KMH)
-    logging.info("  Min record speed   : %.1f km/h [v3]", MIN_RECORD_SPEED_KMH)
+    logging.info("  Min record speed   : %.1f km/h", MIN_RECORD_SPEED_KMH)
     logging.info("  Cruise duration    : %.2fs (%d ticks)", cruise_duration_s,   cruise_ticks)
     logging.info("  Noise duration     : %.2fs (%d ticks)", noise_duration_s,    noise_ticks)
     logging.info("  Recovery duration  : %.2fs (%d ticks)", recovery_duration_s, recovery_ticks)
-    logging.info("  Recovery warmup    : %d ticks [v3]", RECOVERY_WARMUP_TICKS)
-    logging.info("  Stuck max ticks    : %d [v3]", STUCK_MAX_TICKS)
-    logging.info("  Reverse ticks      : %d [v3]", REVERSE_TICKS)
+    logging.info("  Recovery warmup    : %d ticks", RECOVERY_WARMUP_TICKS)
+    logging.info("  Stuck max ticks    : %d", STUCK_MAX_TICKS)
+    logging.info("  Reverse ticks      : %d", REVERSE_TICKS)
     logging.info("  Total ticks        : %d", args.ticks)
-    logging.info("  Warmup ticks       : %d", WARMUP_TICKS)
     logging.info("=" * 65)
 
-    out_dir    = Path(args.out_dir).resolve()
-    images_dir = out_dir / "images_center"
-    images_dir.mkdir(parents=True, exist_ok=True)
-    csv_path   = out_dir / "recovery_log.csv"
-    csv_writer = RecoveryCSVWriter(csv_path)
-    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
-
-    existing_max = 0
-    for p in images_dir.glob("*.jpg"):
-        if p.stem.isdigit():
-            existing_max = max(existing_max, int(p.stem))
-    next_img_idx = existing_max + 1
+    # ── DataCollector — dùng chung với collect_data.py ───────────────────
+    # save_every_n=1: ghi mọi frame khi RECOVERING
+    # DataCollector tự dense-sample khi is_recovering=True
+    collector = DataCollector(
+        output_dir=args.out_dir,
+        enabled=True,
+        jpeg_quality=JPEG_QUALITY,
+        save_every_n=SAVE_EVERY_N_FRAMES,
+        flush_every_n=50,
+        resize_width=SAVE_WIDTH,
+        resize_height=SAVE_HEIGHT,
+    )
 
     manager = CarlaManager(
         host=str(host), port=int(port), tm_port=int(tm_port),
@@ -439,14 +365,17 @@ def main() -> int:
         npc_enable_autopilot=True, seed=args.seed,
     )
 
-    frame_queue:     queue.Queue[Any] = queue.Queue(maxsize=30)
-    collision_queue: queue.Queue[Any] = queue.Queue(maxsize=10)
-    camera_sensor:    Optional[Any] = None
+    collision_queue: "queue.Queue[Any]" = queue.Queue(maxsize=10)
+
+    cam_center:       Optional[Any] = None
+    cam_left:         Optional[Any] = None
+    cam_right:        Optional[Any] = None
     collision_sensor: Optional[Any] = None
-    saved_count       = 0
-    cycle_count       = 0
-    skipped_low_speed = 0
-    collision_count   = 0   # tổng số va chạm được phát hiện
+
+    saved_count        = 0
+    cycle_count        = 0
+    skipped_low_speed  = 0
+    collision_count    = 0
 
     try:
         manager.start()
@@ -455,7 +384,6 @@ def main() -> int:
         tm    = manager.tm
         assert world is not None and ego is not None
 
-        # TM synchronous mode
         if tm is not None:
             try:
                 tm.set_synchronous_mode(True)
@@ -465,39 +393,63 @@ def main() -> int:
 
         bp_lib = world.get_blueprint_library()
 
-        # ── Camera sensor ─────────────────────────────────────────────────
-        cam_bp = bp_lib.find("sensor.camera.rgb")
-        cam_bp.set_attribute("image_size_x", str(CAMERA_WIDTH))
-        cam_bp.set_attribute("image_size_y", str(CAMERA_HEIGHT))
-        cam_bp.set_attribute("fov",          str(CAMERA_FOV))
-        if cam_bp.has_attribute("sensor_tick"):
-            cam_bp.set_attribute("sensor_tick", str(fixed_delta))
-        cam_transform  = carla.Transform(
-            carla.Location(x=1.5, z=2.2), carla.Rotation(pitch=-8.0),
+        def _make_cam_bp() -> Any:
+            bp = bp_lib.find("sensor.camera.rgb")
+            bp.set_attribute("image_size_x", str(CAMERA_WIDTH))
+            bp.set_attribute("image_size_y", str(CAMERA_HEIGHT))
+            bp.set_attribute("fov",          str(CAMERA_FOV))
+            if bp.has_attribute("sensor_tick"):
+                bp.set_attribute("sensor_tick", str(fixed_delta))
+            return bp
+
+        # ── 3 cameras — tương thích DataCollector ────────────────────────
+        cam_center = world.spawn_actor(
+            _make_cam_bp(),
+            carla.Transform(
+                carla.Location(x=CAM_X, y=0.0,        z=CAM_Z),
+                carla.Rotation(pitch=CAM_PITCH),
+            ),
+            attach_to=ego,
         )
-        camera_sensor  = world.spawn_actor(cam_bp, cam_transform, attach_to=ego)
-        camera_sensor.listen(
-            lambda img: collision_queue.put_nowait(img)   # re-use pattern
-            if False else                                  # (camera goes to frame_queue)
-            frame_queue.put_nowait(img)
-            if not frame_queue.full() else None
+        cam_left = world.spawn_actor(
+            _make_cam_bp(),
+            carla.Transform(
+                carla.Location(x=CAM_X, y=CAM_LEFT_Y, z=CAM_Z),
+                carla.Rotation(pitch=CAM_PITCH),
+            ),
+            attach_to=ego,
         )
-        # Correct listener:
-        camera_sensor.stop()
-        camera_sensor.listen(
-            lambda img: frame_queue.put_nowait(img) if not frame_queue.full() else None
+        cam_right = world.spawn_actor(
+            _make_cam_bp(),
+            carla.Transform(
+                carla.Location(x=CAM_X, y=CAM_RIGHT_Y, z=CAM_Z),
+                carla.Rotation(pitch=CAM_PITCH),
+            ),
+            attach_to=ego,
         )
 
-        # ── [NEW v3] Collision sensor ──────────────────────────────────────
-        # Phát hiện va chạm ngay lập tức → trigger REVERSING thay vì chờ stuck.
+        # DataCollector callback: resize + push vào sensor_queue nội bộ
+        cam_center.listen(collector.make_sensor_callback("center"))
+        cam_left.listen(collector.make_sensor_callback("left"))
+        cam_right.listen(collector.make_sensor_callback("right"))
+
+        # ── Collision sensor ──────────────────────────────────────────────
         collision_bp = bp_lib.find("sensor.other.collision")
         collision_sensor = world.spawn_actor(
             collision_bp, carla.Transform(), attach_to=ego
         )
         collision_sensor.listen(
-            lambda evt: collision_queue.put_nowait(evt) if not collision_queue.full() else None
+            lambda evt: collision_queue.put_nowait(evt)
+            if not collision_queue.full() else None
         )
-        logging.info("Collision sensor attached to ego vehicle.")
+        logging.info("Collision sensor attached.")
+
+        # ── Start DataCollector (tạo dirs + CSV) ─────────────────────────
+        collector.start()
+        logging.info(
+            "DataCollector started → %s/driving_log.csv",
+            Path(args.out_dir).resolve(),
+        )
 
         # ── Kickstart ─────────────────────────────────────────────────────
         kick_ctrl = carla.VehicleControl(
@@ -507,31 +459,27 @@ def main() -> int:
         ego.apply_control(kick_ctrl)
         for _ in range(10):
             world.tick()
-        kick_speed = _get_speed_kmh(ego)
-        logging.info("Kickstart done (10 ticks). Speed=%.1f km/h", kick_speed)
+        logging.info("Kickstart done. Speed=%.1f km/h", _get_speed_kmh(ego))
 
         _enable_autopilot(ego, tm, tm_port, target_speed)
-
         for _ in range(max(1, WARMUP_TICKS - 10)):
             world.tick()
-        warmup_speed = _get_speed_kmh(ego)
-        logging.info("Warmup done (%d ticks). Speed=%.1f km/h", WARMUP_TICKS, warmup_speed)
-        _drain_queue(frame_queue)
+        logging.info(
+            "Warmup done (%d ticks). Speed=%.1f km/h", WARMUP_TICKS, _get_speed_kmh(ego)
+        )
         _drain_queue(collision_queue)
 
         # ══════════════════════════════════════════════════════════════════
         # GAME LOOP
         # ══════════════════════════════════════════════════════════════════
-        phase               = Phase.CRUISING
-        phase_tick_counter  = 0
-        noise_direction     = 1.0
+        phase                  = Phase.CRUISING
+        phase_tick_counter     = 0
+        noise_direction        = 1.0
         recovery_frame_counter = 0
-        current_noise_dir   = 0
-        last_auto_steer     = 0.0
-        stuck_ticks         = 0
-        post_collision_counter = 0  # [v3] đếm ngược từ POST_COLLISION_FLAG_TICKS
-
-        # [v3] Lịch sử noise_direction để cân bằng left/right
+        current_noise_dir      = 0
+        last_auto_steer        = 0.0
+        stuck_ticks            = 0
+        post_collision_counter = 0
         noise_history: List[float] = []
 
         for tick_idx in range(1, args.ticks + 1):
@@ -540,9 +488,10 @@ def main() -> int:
 
             ego_transform = ego.get_transform()
             speed_kmh     = _get_speed_kmh(ego)
+            rot           = ego_transform.rotation
+            loc           = ego_transform.location
 
-            # ── [NEW v3] COLLISION DETECTION ──────────────────────────────
-            # Xử lý trước stuck detection để phản ứng ngay khi va chạm.
+            # ── Collision detection ───────────────────────────────────────
             collision_this_tick = False
             while not collision_queue.empty():
                 try:
@@ -555,26 +504,19 @@ def main() -> int:
                 collision_count += 1
                 post_collision_counter = POST_COLLISION_FLAG_TICKS
                 logging.warning(
-                    "tick=%d: collision #%d detected (phase=%s, speed=%.1f) → REVERSING",
+                    "tick=%d: collision #%d (phase=%s, speed=%.1f) → REVERSING",
                     tick_idx, collision_count, phase.value, speed_kmh,
                 )
-                # Đảm bảo autopilot OFF trước khi manual reverse
                 if phase in (Phase.CRUISING, Phase.RECOVERING):
                     _disable_autopilot(ego, tm_port)
-                # phase DRIFTING: autopilot đã off sẵn
                 phase              = Phase.REVERSING
                 phase_tick_counter = 0
                 stuck_ticks        = 0
-                _drain_queue(frame_queue)
 
-            # Đếm ngược post_collision flag
             if post_collision_counter > 0:
                 post_collision_counter -= 1
 
-            # ── STUCK DETECTION ───────────────────────────────────────────
-            # [v3] STUCK_MAX_TICKS = 40 (giảm từ 150).
-            # Collision sensor đã bắt phần lớn va chạm → stuck chỉ còn là
-            # fallback cho trường hợp reverse vẫn không thoát được.
+            # ── Stuck detection ───────────────────────────────────────────
             if speed_kmh < STUCK_SPEED_THRESHOLD_KMH:
                 stuck_ticks += 1
             else:
@@ -595,15 +537,13 @@ def main() -> int:
                 phase              = Phase.CRUISING
                 phase_tick_counter = 0
                 stuck_ticks        = 0
-                _drain_queue(frame_queue)
                 _drain_queue(collision_queue)
                 continue
 
             # ══════════════════════════════════════════════════════════════
-            # PHASE: CRUISING
+            # PHASE: CRUISING — không ghi
             # ══════════════════════════════════════════════════════════════
             if phase == Phase.CRUISING:
-                _drain_queue(frame_queue)
                 last_auto_steer = float(ego.get_control().steer)
 
                 if phase_tick_counter >= cruise_ticks:
@@ -612,14 +552,12 @@ def main() -> int:
                         phase_tick_counter = max(0, cruise_ticks - 30)
                         continue
 
-                    # [v3] BALANCED noise direction:
-                    # Đếm left/right trong lịch sử để đảm bảo ~50/50.
                     left_so_far  = sum(1 for d in noise_history if d < 0)
                     right_so_far = len(noise_history) - left_so_far
                     if left_so_far < right_so_far:
-                        noise_direction = -1.0          # cần thêm left
+                        noise_direction = -1.0
                     elif right_so_far < left_so_far:
-                        noise_direction =  1.0          # cần thêm right
+                        noise_direction =  1.0
                     else:
                         noise_direction = -1.0 if random.random() < 0.5 else 1.0
                     noise_history.append(noise_direction)
@@ -630,19 +568,17 @@ def main() -> int:
                     current_noise_dir  = int(noise_direction)
                     cycle_count       += 1
                     logging.debug(
-                        "Cycle #%d: → DRIFTING (%s) speed=%.1f | L=%d R=%d",
+                        "Cycle #%d: → DRIFTING (%s) speed=%.1f",
                         cycle_count,
                         "LEFT" if noise_direction < 0 else "RIGHT",
-                        speed_kmh, left_so_far, right_so_far,
+                        speed_kmh,
                     )
 
             # ══════════════════════════════════════════════════════════════
-            # PHASE: DRIFTING
+            # PHASE: DRIFTING — không ghi, bơm noise steering
             # ══════════════════════════════════════════════════════════════
             elif phase == Phase.DRIFTING:
-                _drain_queue(frame_queue)
-
-                noisy_control         = carla.VehicleControl()
+                noisy_control          = carla.VehicleControl()
                 noisy_control.throttle = float(drift_throttle)
                 noisy_control.brake    = 0.0
                 noisy_control.steer    = _clamp(
@@ -657,109 +593,77 @@ def main() -> int:
                     phase                  = Phase.RECOVERING
                     phase_tick_counter     = 0
                     recovery_frame_counter = 0
-                    _drain_queue(frame_queue)
                     logging.debug("Cycle #%d: → RECOVERING", cycle_count)
 
             # ══════════════════════════════════════════════════════════════
-            # PHASE: RECOVERING
+            # PHASE: RECOVERING — GHI qua DataCollector
             # ══════════════════════════════════════════════════════════════
             elif phase == Phase.RECOVERING:
-                auto_control = ego.get_control()
-
-                latest_image = None
-                while not frame_queue.empty():
-                    try:
-                        latest_image = frame_queue.get_nowait()
-                    except queue.Empty:
-                        break
-
+                auto_control           = ego.get_control()
                 recovery_frame_counter += 1
 
-                # [FIX v3 - MAJOR] Bỏ qua N tick đầu để TM ổn định.
-                # [FIX v3 - CRITICAL] Chỉ ghi khi xe đang thực sự di chuyển.
+                # Bỏ qua N tick đầu (TM ổn định) + frame khi xe không di chuyển
                 should_record = (
-                    latest_image is not None
-                    and recovery_frame_counter > RECOVERY_WARMUP_TICKS
+                    recovery_frame_counter > RECOVERY_WARMUP_TICKS
                     and speed_kmh >= MIN_RECORD_SPEED_KMH
-                    and recovery_frame_counter % SAVE_EVERY_N_FRAMES == 0
                 )
 
                 if should_record:
-                    rgb = _image_to_rgb(latest_image)
-                    rgb_resized = cv2.resize(
-                        rgb, (SAVE_WIDTH, SAVE_HEIGHT), interpolation=cv2.INTER_AREA,
+                    # Timestamp từ world snapshot (đồng bộ với camera)
+                    ts        = float(world.get_snapshot().timestamp.elapsed_seconds)
+                    route_cmd = _get_route_command(ego, world)
+                    junction  = _is_junction(ego, world)
+
+                    # add_vehicle_state: đẩy state vào DataCollector
+                    # DataCollector tự ghép với ảnh camera qua sensor_queue
+                    # is_recovering=True → CSV sẽ có recovery_flag=1
+                    # DataCollector cũng dense-sample khi is_recovering=True
+                    collector.add_vehicle_state(
+                        frame_id=tick_idx,
+                        timestamp=ts,
+                        steer=float(auto_control.steer),
+                        throttle=float(auto_control.throttle),
+                        brake=float(auto_control.brake),
+                        speed_kmh=speed_kmh,
+                        x=float(loc.x),
+                        y=float(loc.y),
+                        z=float(loc.z),
+                        has_crash=False,      # không ghi crash frames
+                        is_recovering=True,   # → recovery_flag=1 trong CSV
+                        is_junction=junction,
+                        command=route_cmd,
+                        pitch=float(rot.pitch),
+                        roll=float(rot.roll),
+                        yaw=float(rot.yaw),
                     )
-                    bgr = cv2.cvtColor(rgb_resized, cv2.COLOR_RGB2BGR)
-
-                    img_id       = f"{next_img_idx:08d}"
-                    img_filename = f"{img_id}.jpg"
-                    cv2.imwrite(str(images_dir / img_filename), bgr, encode_params)
-                    next_img_idx += 1
-
-                    loc = ego_transform.location
-                    rot = ego_transform.rotation
-
-                    # [v3] correction_valid: steer đúng chiều recovery?
-                    # noise_direction=-1 (đẩy trái) → cần steer phải (+)
-                    # noise_direction=+1 (đẩy phải) → cần steer trái (-)
-                    # Hợp lệ khi sign(steer) ngược với noise_direction.
-                    steer_val = float(auto_control.steer)
-                    correction_valid = (
-                        1 if (steer_val * current_noise_dir < -0.05) else 0
-                    )
-
-                    csv_writer.write({
-                        "frame_id":         int(latest_image.frame),
-                        "timestamp":        f"{latest_image.timestamp:.6f}",
-                        "image_filename":   img_filename,
-                        "steering":         round(steer_val, 5),
-                        "throttle":         round(float(auto_control.throttle), 4),
-                        "brake":            round(float(auto_control.brake), 4),
-                        "speed_kmh":        round(speed_kmh, 2),
-                        "noise_direction":  current_noise_dir,
-                        "noise_magnitude":  round(noise_intensity, 4),   # [v3]
-                        "x":               round(float(loc.x), 4),
-                        "y":               round(float(loc.y), 4),
-                        "z":               round(float(loc.z), 4),
-                        "yaw":             round(float(rot.yaw), 4),
-                        "recovery_flag":   1,
-                        "phase":           Phase.RECOVERING.value,        # [v3]
-                        "cycle_id":        cycle_count,                   # [v3]
-                        "post_collision":  1 if post_collision_counter > 0 else 0,  # [v3]
-                        "correction_valid": correction_valid,             # [v3]
-                    })
                     saved_count += 1
 
                 if phase_tick_counter >= recovery_ticks:
                     phase              = Phase.CRUISING
                     phase_tick_counter = 0
                     logging.debug(
-                        "Cycle #%d: → CRUISING (saved %d total)", cycle_count, saved_count,
+                        "Cycle #%d: → CRUISING (fed ~%d state frames)",
+                        cycle_count, saved_count,
                     )
 
             # ══════════════════════════════════════════════════════════════
-            # PHASE: REVERSING  [NEW v3]
+            # PHASE: REVERSING — không ghi, lùi xe ra khỏi vật cản
             # ══════════════════════════════════════════════════════════════
             elif phase == Phase.REVERSING:
-                _drain_queue(frame_queue)
-
-                # Lùi xe ra khỏi vật cản: throttle với gear reverse.
-                reverse_ctrl              = carla.VehicleControl()
-                reverse_ctrl.throttle     = REVERSE_THROTTLE
-                reverse_ctrl.brake        = 0.0
-                reverse_ctrl.steer        = 0.0
-                reverse_ctrl.reverse      = True
-                reverse_ctrl.hand_brake   = False
-                reverse_ctrl.manual_gear_shift = False
+                reverse_ctrl                      = carla.VehicleControl()
+                reverse_ctrl.throttle             = REVERSE_THROTTLE
+                reverse_ctrl.brake                = 0.0
+                reverse_ctrl.steer                = 0.0
+                reverse_ctrl.reverse              = True
+                reverse_ctrl.hand_brake           = False
+                reverse_ctrl.manual_gear_shift    = False
                 ego.apply_control(reverse_ctrl)
 
                 if phase_tick_counter >= REVERSE_TICKS:
-                    # Kết thúc reverse → bật autopilot → về CRUISING
                     _enable_autopilot(ego, tm, tm_port, target_speed)
                     phase              = Phase.CRUISING
                     phase_tick_counter = 0
                     stuck_ticks        = 0
-                    _drain_queue(frame_queue)
                     _drain_queue(collision_queue)
                     logging.info(
                         "tick=%d: REVERSING done → CRUISING (total collisions: %d)",
@@ -773,53 +677,47 @@ def main() -> int:
                     if noise_history else 0.0
                 )
                 logging.info(
-                    "tick=%d/%d | phase=%-10s | cycle=#%d | saved=%d | "
+                    "tick=%d/%d | phase=%-10s | cycle=#%d | "
                     "speed=%.1f km/h | collisions=%d | noise L/R=%.0f%%/%.0f%%",
                     tick_idx, args.ticks, phase.value, cycle_count,
-                    saved_count, speed_kmh, collision_count,
-                    left_pct, 100.0 - left_pct,
+                    speed_kmh, collision_count, left_pct, 100.0 - left_pct,
                 )
+
+        # ── Flush + finalize ──────────────────────────────────────────────
+        # collector.close() xử lý nốt các target frames còn trong queue
+        # và tính waypoint GT cho chúng
+        collector.close()
 
         logging.info("=" * 65)
         logging.info("  COLLECTION COMPLETE")
         logging.info("  Total ticks      : %d", args.ticks)
         logging.info("  Drift cycles     : %d", cycle_count)
-        logging.info("  Recovery samples : %d", saved_count)
+        logging.info("  State frames fed : %d (actual CSV rows có thể ít hơn do WP filter)", saved_count)
         logging.info("  Skipped (slow)   : %d", skipped_low_speed)
         logging.info("  Collisions caught: %d", collision_count)
-        if noise_history:
-            left_final  = sum(1 for d in noise_history if d < 0)
-            right_final = len(noise_history) - left_final
-            logging.info(
-                "  Noise direction  : LEFT=%d (%.1f%%)  RIGHT=%d (%.1f%%)",
-                left_final,  100.0 * left_final  / len(noise_history),
-                right_final, 100.0 * right_final / len(noise_history),
-            )
-        logging.info("  CSV path         : %s", csv_path)
-        logging.info("  Images dir       : %s", images_dir)
+        logging.info("  CSV              : %s", Path(args.out_dir).resolve() / "driving_log.csv")
+        logging.info("  Images center    : %s", Path(args.out_dir).resolve() / "images_center")
+        logging.info("  Images left      : %s", Path(args.out_dir).resolve() / "images_left")
+        logging.info("  Images right     : %s", Path(args.out_dir).resolve() / "images_right")
         logging.info("=" * 65)
         return 0
 
     except KeyboardInterrupt:
         logging.warning("Interrupted by user.")
+        collector.close()
         return 1
+
     finally:
-        csv_writer.close()
-        if camera_sensor is not None:
-            try:
-                camera_sensor.stop()
-                camera_sensor.destroy()
-            except RuntimeError:
-                pass
-        if collision_sensor is not None:
-            try:
-                collision_sensor.stop()
-                collision_sensor.destroy()
-            except RuntimeError:
-                pass
+        for sensor in (cam_center, cam_left, cam_right, collision_sensor):
+            if sensor is not None:
+                try:
+                    sensor.stop()
+                    sensor.destroy()
+                except RuntimeError:
+                    pass
         manager.cleanup()
         logging.info(
-            "Cleanup done. %d frames in %d cycles. %d collisions handled.",
+            "Cleanup done. %d state frames in %d cycles. %d collisions handled.",
             saved_count, cycle_count, collision_count,
         )
 
