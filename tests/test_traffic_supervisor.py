@@ -45,12 +45,12 @@ class TrafficSupervisorRedLightTests(unittest.TestCase):
         )
 
         self.assertGreater(brake, 0.0)
-        self.assertLessEqual(brake, 0.2)
+        self.assertLessEqual(brake, 0.45)
         debug = supervisor.get_debug_info()
         self.assertEqual(debug["selected_target_type"], "stop_line_crawl")
         self.assertEqual(debug["stop_line_crawl_mode"], "active")
 
-    def test_green_light_keeps_stop_line_crawl_instead_of_disabling_it(self):
+    def test_green_light_releases_stop_line_crawl(self):
         supervisor = TrafficSupervisor({})
 
         brake = supervisor.compute(
@@ -60,11 +60,27 @@ class TrafficSupervisorRedLightTests(unittest.TestCase):
             dt=0.1,
         )
 
-        self.assertGreater(brake, 0.0)
-        self.assertLessEqual(brake, 0.2)
+        self.assertEqual(brake, 0.0)
         debug = supervisor.get_debug_info()
         self.assertTrue(debug["green_release_active"])
-        self.assertEqual(debug["selected_target_type"], "stop_line_crawl")
+        self.assertEqual(debug["selected_target_type"], "none")
+        self.assertEqual(debug["stop_line_crawl_mode"], "disabled_by_green")
+
+    def test_red_light_approach_brakes_even_when_already_slow(self):
+        supervisor = TrafficSupervisor({})
+
+        brake = supervisor.compute(
+            detections=[red_light(), stop_line(10.0)],
+            current_speed=12.0 / 3.6,
+            image_shape=IMAGE_SHAPE,
+            dt=0.1,
+        )
+
+        self.assertGreater(brake, 0.0)
+        debug = supervisor.get_debug_info()
+        self.assertEqual(debug["selected_target_type"], "stop_line")
+        self.assertGreater(debug["red_stopline_approach_brake"], 0.0)
+        self.assertNotEqual(debug["stop_line_crawl_mode"], "below_target_speed")
 
     def test_red_light_hard_stops_at_tracked_seven_meter_gate(self):
         supervisor = TrafficSupervisor({})
@@ -75,7 +91,8 @@ class TrafficSupervisorRedLightTests(unittest.TestCase):
             image_shape=IMAGE_SHAPE,
             dt=0.1,
         )
-        self.assertLessEqual(first_brake, 0.2)
+        self.assertGreater(first_brake, 0.0)
+        self.assertLess(first_brake, 1.0)
 
         second_brake = supervisor.compute(
             detections=[red_light()],
@@ -127,6 +144,29 @@ class TrafficSupervisorRedLightTests(unittest.TestCase):
         debug = supervisor.get_debug_info()
         self.assertFalse(debug["red_hard_stop_locked"])
         self.assertEqual(debug["selected_target_type"], "none")
+
+    def test_red_light_near_stop_line_overrides_stale_green_immunity(self):
+        supervisor = TrafficSupervisor({})
+        supervisor.compute(
+            detections=[green_light(), stop_line(16.0)],
+            current_speed=20.0 / 3.6,
+            image_shape=IMAGE_SHAPE,
+            dt=0.1,
+        )
+        self.assertGreater(supervisor.get_debug_info()["green_immunity_counter"], 0)
+
+        brake = supervisor.compute(
+            detections=[red_light(), stop_line(12.0)],
+            current_speed=20.0 / 3.6,
+            image_shape=IMAGE_SHAPE,
+            dt=0.1,
+        )
+
+        self.assertGreater(brake, 0.0)
+        debug = supervisor.get_debug_info()
+        self.assertTrue(debug["red_green_immunity_overridden"])
+        self.assertFalse(debug["red_suppressed_by_green_immunity"])
+        self.assertEqual(debug["selected_target_type"], "stop_line")
 
 
 if __name__ == "__main__":
