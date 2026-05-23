@@ -21,14 +21,18 @@ class MultiAgentTrajectoryDataset(Dataset):
         self.manifest_path = Path(manifest_path) if manifest_path is not None else self.root_dir / "manifest.csv"
 
         if sample_files is not None:
-            self.sample_paths = [
-                path if Path(path).is_absolute() else self.root_dir / Path(path)
-                for path in sample_files
-            ]
+            # Normalize path separators immediately when sample_files is provided
+            self.sample_paths = []
+            for path in sample_files:
+                # Convert to string, replace backslashes, then convert to Path
+                clean_path = str(path).replace('\\', '/')
+                p = Path(clean_path)
+                self.sample_paths.append(p if p.is_absolute() else self.root_dir / p)
         else:
             self.sample_paths = self._read_manifest(self.manifest_path)
 
-        self.sample_paths = [Path(path).resolve() for path in self.sample_paths]
+        # Final normalization: resolve and ensure forward slashes
+        self.sample_paths = [Path(str(path).replace('\\', '/')) for path in self.sample_paths]
         if not self.sample_paths:
             raise RuntimeError(f"No multi-agent .pt samples found under: {self.root_dir}")
 
@@ -44,6 +48,8 @@ class MultiAgentTrajectoryDataset(Dataset):
             for row in reader:
                 sample_file = str(row.get("sample_file") or "").strip()
                 if sample_file:
+                    # Normalize path separators for cross-platform compatibility
+                    sample_file = sample_file.replace('\\', '/')
                     rows.append(path.parent / sample_file)
         return rows
 
@@ -51,7 +57,9 @@ class MultiAgentTrajectoryDataset(Dataset):
         return len(self.sample_paths)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor | str | int | float]:
-        sample_path = self.sample_paths[int(index)]
+        # Force string conversion and normalize path separators for cross-platform compatibility
+        clean_path_str = str(self.sample_paths[int(index)]).replace('\\', '/')
+        sample_path = Path(clean_path_str)
         sample = torch.load(sample_path, map_location="cpu", weights_only=True)
         
         # Load and detect format
@@ -117,16 +125,62 @@ def split_sample_paths(
     train_ratio: float = 0.8,
     seed: int = 42,
 ) -> tuple[List[Path], List[Path]]:
-    import random
+    """Split sample paths into train / val sets.
 
-    paths = [Path(path) for path in sample_paths]
+    BUG FIX (data leakage): the previous implementation did a plain random
+    shuffle over *all* windows, then split by index.  Because adjacent windows
+    share up to (history_steps - 1 + future_steps - 1) frames when stride = 1,
+    they are nearly identical sequences.  A random 80/20 split therefore places
+    highly correlated windows on both sides of the boundary, causing ~95%
+    feature overlap between train and val → inflated val metrics, unreliable
+    early-stopping.
+
+    Fix: group windows by their *run* (the parent directory, which corresponds
+    to one continuous CARLA recording).  Shuffle runs (not individual windows),
+    then assign whole runs to train or val.  Windows within a run are ordered
+    by sample index so temporal ordering is preserved inside each run.
+
+    If a path doesn't sit inside a recognisable run directory (flat layout),
+    we fall back to a deterministic time-ordered split: the first train_ratio
+    fraction goes to train, the rest to val — no shuffling.
+    """
+    import random
+    from collections import defaultdict
+
+    paths = [Path(p) for p in sample_paths]
+    if not paths:
+        return [], []
+
+    # Group by parent directory (= run directory in the per-town subdir layout
+    # produced by build_all_datasets.ps1: .../Town01/sample_000123.pt).
+    run_groups: dict[Path, List[Path]] = defaultdict(list)
+    for p in paths:
+        run_groups[p.parent].append(p)
+
+    # Sort windows within each run by filename to preserve temporal order.
+    for run in run_groups:
+        run_groups[run].sort(key=lambda p: p.name)
+
+    runs = sorted(run_groups.keys())  # deterministic order before shuffle
+
+    if len(runs) == 1:
+        # Single run — time-ordered split (no shuffle) to avoid leakage.
+        ordered = run_groups[runs[0]]
+        if len(ordered) <= 1:
+            return ordered, []
+        split_idx = min(max(1, int(round(train_ratio * len(ordered)))), len(ordered) - 1)
+        return ordered[:split_idx], ordered[split_idx:]
+
+    # Multiple runs — shuffle at the run level.
     rng = random.Random(int(seed))
-    rng.shuffle(paths)
-    if len(paths) <= 1:
-        return paths, []
-    split_idx = int(round(float(train_ratio) * len(paths)))
-    split_idx = min(max(1, split_idx), len(paths) - 1)
-    return paths[:split_idx], paths[split_idx:]
+    rng.shuffle(runs)
+
+    split_idx = min(max(1, int(round(train_ratio * len(runs)))), len(runs) - 1)
+    train_runs, val_runs = runs[:split_idx], runs[split_idx:]
+
+    train_paths = [p for r in train_runs for p in run_groups[r]]
+    val_paths   = [p for r in val_runs   for p in run_groups[r]]
+    return train_paths, val_paths
 
 
 def _pad_tensor(target: torch.Tensor, source: torch.Tensor, slices: tuple[slice, ...]) -> None:

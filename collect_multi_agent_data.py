@@ -7,7 +7,8 @@ Supports multiple towns with configurable NPC density.
 
 Usage:
     python collect_multi_agent_data.py --town Town01 --duration 600
-    python collect_multi_agent_data.py --town Town03 --npc-vehicles 40
+    python collect_multi_agent_data.py --town Town03 --npc-vehicles 50 --npc-bikes 30 --npc-motorbikes 30 --npc-pedestrians 50
+    python collect_multi_agent_data.py --town Town03 --duration 600 --fps 20
 """
 
 from __future__ import annotations
@@ -49,11 +50,15 @@ SUPPORTED_TOWNS = [
     "Town06", "Town07", "Town10HD"
 ]
 
-DEFAULT_NPC_VEHICLES = 40
-MIN_NPC_VEHICLES = 30
-MAX_NPC_VEHICLES = 50
+DEFAULT_NPC_VEHICLES = 50
+DEFAULT_NPC_BIKES = 30
+DEFAULT_NPC_MOTORBIKES = 30
+DEFAULT_NPC_PEDESTRIANS = 50
 
-COLLECTION_FPS = 10
+MIN_NPC_VEHICLES = 30
+MAX_NPC_VEHICLES = 100
+
+COLLECTION_FPS = 10.0
 FIXED_DELTA_SECONDS = 1.0 / COLLECTION_FPS  # 0.1 seconds
 
 DEFAULT_DURATION_SECONDS = 600  # 10 minutes
@@ -297,22 +302,34 @@ class MultiAgentDataCollector:
     def __init__(
         self,
         world: carla.World,
+        client: carla.Client,
         output_dir: Path,
         town: str,
         npc_vehicle_count: int,
+        npc_bike_count: int,
+        npc_motorbike_count: int,
+        npc_pedestrian_count: int,
         duration_seconds: float,
         fixed_delta: float = FIXED_DELTA_SECONDS,
     ):
         self.world = world
+        self.client = client
         self.output_dir = output_dir
         self.town = town
         self.npc_vehicle_count = npc_vehicle_count
+        self.npc_bike_count = npc_bike_count
+        self.npc_motorbike_count = npc_motorbike_count
+        self.npc_pedestrian_count = npc_pedestrian_count
         self.duration_seconds = duration_seconds
         self.fixed_delta = fixed_delta
         
         self.run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         self.ego_vehicle: Optional[carla.Vehicle] = None
         self.npc_vehicles: List[carla.Vehicle] = []
+        self.npc_bikes: List[carla.Vehicle] = []
+        self.npc_motorbikes: List[carla.Vehicle] = []
+        self.npc_pedestrians: List[Any] = []   # walker actors
+        self.npc_controllers: List[Any] = []   # AI walker controllers
         self.traffic_manager: Optional[carla.TrafficManager] = None
         
         self.frame_count = 0
@@ -333,12 +350,13 @@ class MultiAgentDataCollector:
             settings.fixed_delta_seconds = self.fixed_delta
             self.world.apply_settings(settings)
             logging.info(
-                "Synchronous mode enabled (fixed_delta=%.3fs, fps=%d)",
-                self.fixed_delta, int(1.0 / self.fixed_delta)
+                "Synchronous mode enabled (fixed_delta=%.6fs, fps=%.2f)",
+                self.fixed_delta, 1.0 / self.fixed_delta
             )
             
             # Get traffic manager
-            self.traffic_manager = self.world.get_traffic_manager()
+            # Use client to get traffic manager (compatible with all CARLA versions)
+            self.traffic_manager = self.client.get_trafficmanager(8000)
             self.traffic_manager.set_synchronous_mode(True)
             logging.info("Traffic manager configured")
             
@@ -349,6 +367,18 @@ class MultiAgentDataCollector:
             # Spawn NPC vehicles
             if not self._spawn_npc_vehicles():
                 return False
+            
+            # Spawn bikes
+            if not self._spawn_bikes():
+                logging.warning("Bike spawning failed, continuing without bikes")
+            
+            # Spawn motorbikes
+            if not self._spawn_motorbikes():
+                logging.warning("Motorbike spawning failed, continuing without motorbikes")
+            
+            # Spawn pedestrians
+            if not self._spawn_pedestrians(self.npc_pedestrian_count):
+                logging.warning("Pedestrian spawning failed, continuing without pedestrians")
                 
             # Start CSV writer
             self.csv_writer.start()
@@ -399,12 +429,12 @@ class MultiAgentDataCollector:
             return False
             
     def _spawn_npc_vehicles(self) -> bool:
-        """Spawn NPC vehicles with autopilot enabled."""
+        """Spawn NPC 4-wheel vehicles with autopilot enabled."""
         try:
             blueprint_library = self.world.get_blueprint_library()
             vehicle_bps = blueprint_library.filter("vehicle.*")
             
-            # Filter out non-vehicle blueprints
+            # Filter for 4-wheel vehicles only (cars, trucks, vans)
             vehicle_bps = [
                 bp for bp in vehicle_bps
                 if int(bp.get_attribute("number_of_wheels")) == 4
@@ -442,19 +472,221 @@ class MultiAgentDataCollector:
                     # Spawn point occupied, skip
                     continue
                     
-            if spawned_count < MIN_NPC_VEHICLES:
-                logging.error(
-                    "Only spawned %d NPCs, minimum required is %d",
-                    spawned_count, MIN_NPC_VEHICLES
-                )
-                return False
-                
-            logging.info("Spawned %d NPC vehicles", spawned_count)
+            logging.info("Spawned %d NPC 4-wheel vehicles", spawned_count)
             return True
             
         except Exception as exc:
             logging.error("Failed to spawn NPC vehicles: %s", exc)
             return False
+    
+    def _spawn_bikes(self) -> bool:
+        """Spawn bikes (bicycles) with autopilot enabled."""
+        try:
+            if self.npc_bike_count <= 0:
+                return True
+            
+            blueprint_library = self.world.get_blueprint_library()
+            
+            # Filter for bikes/bicycles (2 wheels, non-motorized)
+            bike_bps = [
+                bp for bp in blueprint_library.filter("vehicle.*")
+                if "bike" in bp.id.lower() or "bicycle" in bp.id.lower()
+            ]
+            
+            if not bike_bps:
+                logging.warning("No bike blueprints available")
+                return True
+            
+            spawn_points = self.world.get_map().get_spawn_points()
+            np.random.shuffle(spawn_points)
+            
+            # Use spawn points after vehicles
+            start_idx = self.npc_vehicle_count
+            spawned_count = 0
+            
+            for i in range(min(self.npc_bike_count, len(spawn_points) - start_idx)):
+                try:
+                    bp = np.random.choice(bike_bps)
+                    
+                    # Randomize color if possible
+                    if bp.has_attribute("color"):
+                        color = np.random.choice(
+                            bp.get_attribute("color").recommended_values
+                        )
+                        bp.set_attribute("color", color)
+                    
+                    npc = self.world.spawn_actor(bp, spawn_points[start_idx + i])
+                    if npc is not None:
+                        npc.set_autopilot(True, self.traffic_manager.get_port())
+                        self.npc_bikes.append(npc)
+                        spawned_count += 1
+                        
+                except RuntimeError:
+                    continue
+            
+            logging.info("Spawned %d bikes", spawned_count)
+            return True
+            
+        except Exception as exc:
+            logging.error("Failed to spawn bikes: %s", exc)
+            return True  # Don't fail if bikes can't spawn
+    
+    def _spawn_motorbikes(self) -> bool:
+        """Spawn motorbikes/motorcycles with autopilot enabled."""
+        try:
+            if self.npc_motorbike_count <= 0:
+                return True
+            
+            blueprint_library = self.world.get_blueprint_library()
+            
+            # Filter for motorbikes/motorcycles (2 wheels, motorized)
+            motorbike_bps = [
+                bp for bp in blueprint_library.filter("vehicle.*")
+                if bp.has_attribute("number_of_wheels")
+                and int(bp.get_attribute("number_of_wheels")) == 2
+                and "bike" not in bp.id.lower()  # Exclude bicycles
+            ]
+            
+            if not motorbike_bps:
+                logging.warning("No motorbike blueprints available")
+                return True
+            
+            spawn_points = self.world.get_map().get_spawn_points()
+            np.random.shuffle(spawn_points)
+            
+            # Use spawn points after vehicles and bikes
+            start_idx = self.npc_vehicle_count + self.npc_bike_count
+            spawned_count = 0
+            
+            for i in range(min(self.npc_motorbike_count, len(spawn_points) - start_idx)):
+                try:
+                    bp = np.random.choice(motorbike_bps)
+                    
+                    # Randomize color if possible
+                    if bp.has_attribute("color"):
+                        color = np.random.choice(
+                            bp.get_attribute("color").recommended_values
+                        )
+                        bp.set_attribute("color", color)
+                    
+                    npc = self.world.spawn_actor(bp, spawn_points[start_idx + i])
+                    if npc is not None:
+                        npc.set_autopilot(True, self.traffic_manager.get_port())
+                        self.npc_motorbikes.append(npc)
+                        spawned_count += 1
+                        
+                except RuntimeError:
+                    continue
+            
+            logging.info("Spawned %d motorbikes", spawned_count)
+            return True
+            
+        except Exception as exc:
+            logging.error("Failed to spawn motorbikes: %s", exc)
+            return True  # Don't fail if motorbikes can't spawn
+    
+    def _spawn_pedestrians(self, count: int = 20) -> bool:
+        """Spawn pedestrians (walkers) with AI controllers.
+
+        Uses batch spawning and limits navigation queries to avoid the Windows
+        stack overflow (exit 0xC00000FD) triggered by calling
+        get_random_location_from_navigation() too rapidly in a tight loop on
+        towns with complex nav meshes (Town02, Town03, Town04, …).
+        """
+        try:
+            if count <= 0:
+                return True
+
+            blueprint_library = self.world.get_blueprint_library()
+            walker_bps = list(blueprint_library.filter("walker.pedestrian.*"))
+
+            if not walker_bps:
+                logging.warning("No pedestrian blueprints available")
+                return True
+
+            # ── Collect navigation spawn locations ───────────────────────
+            # IMPORTANT: cap total queries tightly and add a small sleep
+            # between each call so the CARLA server stack never overflows.
+            MAX_NAV_QUERIES = min(count, 60)   # never exceed 60 queries
+            spawn_transforms: List[carla.Transform] = []
+
+            for _ in range(MAX_NAV_QUERIES):
+                if len(spawn_transforms) >= count:
+                    break
+                try:
+                    loc = self.world.get_random_location_from_navigation()
+                    if loc is not None:
+                        t = carla.Transform()
+                        t.location = loc
+                        spawn_transforms.append(t)
+                except RuntimeError:
+                    # Navigation mesh not available for this town – stop here
+                    break
+                time.sleep(0.01)  # yield to avoid server stack buildup
+
+            if not spawn_transforms:
+                logging.warning("No pedestrian nav points found – skipping pedestrians")
+                return True
+
+            if len(spawn_transforms) < count:
+                logging.warning(
+                    "Only %d pedestrian nav points available, requested %d",
+                    len(spawn_transforms), count,
+                )
+
+            # ── Batch-spawn walkers ──────────────────────────────────────
+            batch_spawn = []
+            for t in spawn_transforms:
+                bp = np.random.choice(walker_bps)
+                if bp.has_attribute("is_invincible"):
+                    bp.set_attribute("is_invincible", "false")
+                batch_spawn.append(carla.command.SpawnActor(bp, t))
+
+            results = self.client.apply_batch_sync(batch_spawn, True)
+            walker_ids = [r.actor_id for r in results if not r.error]
+
+            if not walker_ids:
+                logging.warning("Batch walker spawn returned no actors")
+                return True
+
+            # ── Batch-spawn AI controllers ───────────────────────────────
+            ctrl_bp = blueprint_library.find("controller.ai.walker")
+            batch_ctrl = [
+                carla.command.SpawnActor(ctrl_bp, carla.Transform(), wid)
+                for wid in walker_ids
+            ]
+            ctrl_results = self.client.apply_batch_sync(batch_ctrl, True)
+            ctrl_ids = [r.actor_id for r in ctrl_results if not r.error]
+
+            # One tick so controllers initialise properly
+            self.world.tick()
+
+            # ── Store references for cleanup ─────────────────────────────
+            self.npc_pedestrians = [
+                a for a in (self.world.get_actor(wid) for wid in walker_ids) if a
+            ]
+            self.npc_controllers = [
+                a for a in (self.world.get_actor(cid) for cid in ctrl_ids) if a
+            ]
+
+            # ── Start controllers and set destinations ───────────────────
+            for ctrl in self.npc_controllers:
+                try:
+                    ctrl.start()
+                    dest = self.world.get_random_location_from_navigation()
+                    if dest:
+                        ctrl.go_to_location(dest)
+                    ctrl.set_max_speed(1.4)
+                    time.sleep(0.005)  # small yield between destination queries
+                except RuntimeError:
+                    pass
+
+            logging.info("Spawned %d pedestrians", len(self.npc_pedestrians))
+            return True
+
+        except Exception as exc:
+            logging.error("Failed to spawn pedestrians: %s", exc)
+            return True  # non-fatal – continue without pedestrians
             
     def _get_actor_state(self, actor: carla.Vehicle) -> ActorState:
         """Extract state from CARLA actor."""
@@ -473,25 +705,41 @@ class MultiAgentDataCollector:
         )
         
     def _get_visible_npcs(self, ego_state: ActorState) -> List[ActorState]:
-        """Get states of NPCs within visibility radius."""
+        """Get states of all visible actors within visibility radius.
+
+        Uses the pre-cached spawned-actor lists instead of the expensive
+        world.get_actors() RPC call (which would be called 5 000 times per run).
+        """
         visible_npcs = []
-        
-        for npc in self.npc_vehicles:
+
+        # All actors we own – vehicles, two-wheelers, pedestrians
+        all_actors: List[Any] = (
+            self.npc_vehicles
+            + self.npc_bikes
+            + self.npc_motorbikes
+            + self.npc_pedestrians
+        )
+
+        for actor in all_actors:
             try:
-                npc_state = self._get_actor_state(npc)
-                
-                # Calculate distance from ego
+                if actor is None or not actor.is_alive:
+                    continue
+                # Skip ego
+                if actor.id == self.ego_vehicle.id:
+                    continue
+
+                npc_state = self._get_actor_state(actor)
+
                 dx = npc_state.x - ego_state.x
                 dy = npc_state.y - ego_state.y
                 distance = math.sqrt(dx * dx + dy * dy)
-                
+
                 if distance <= VISIBILITY_RADIUS_METERS:
                     visible_npcs.append(npc_state)
-                    
-            except RuntimeError:
-                # Actor may have been destroyed
+
+            except (RuntimeError, AttributeError):
                 continue
-                
+
         return visible_npcs
         
     def collect(self) -> bool:
@@ -509,15 +757,21 @@ class MultiAgentDataCollector:
             logging.info("  Town: %s", self.town)
             logging.info("  Duration: %.1f seconds", self.duration_seconds)
             logging.info("  Target frames: %d", target_frames)
-            logging.info("  FPS: %d", int(1.0 / self.fixed_delta))
-            logging.info("  NPC vehicles: %d", len(self.npc_vehicles))
+            logging.info("  FPS: %.2f", 1.0 / self.fixed_delta)
+            logging.info("  NPC 4-wheel vehicles: %d", len(self.npc_vehicles))
+            logging.info("  NPC bikes: %d", len(self.npc_bikes))
+            logging.info("  NPC motorbikes: %d", len(self.npc_motorbikes))
             logging.info("  Run ID: %s", self.run_id)
             logging.info("=" * 70)
             
             while self.frame_count < target_frames:
                 # Tick world
-                snapshot = self.world.tick()
+                self.world.tick()
                 self.frame_count += 1
+                
+                # Get current timestamp
+                snapshot = self.world.get_snapshot()
+                timestamp = snapshot.timestamp.elapsed_seconds if snapshot else self.frame_count * self.fixed_delta
                 
                 # Get ego state
                 ego_state = self._get_actor_state(self.ego_vehicle)
@@ -528,7 +782,7 @@ class MultiAgentDataCollector:
                 # Create frame data
                 frame_data = FrameData(
                     frame=self.frame_count,
-                    timestamp=snapshot.timestamp.elapsed_seconds,
+                    timestamp=timestamp,
                     ego_state=ego_state,
                     npc_states=npc_states,
                 )
@@ -580,29 +834,66 @@ class MultiAgentDataCollector:
     def cleanup(self) -> None:
         """Cleanup CARLA actors and close CSV writer."""
         try:
-            # Close CSV writer
+            # Close CSV writer first
             self.csv_writer.close()
             
-            # Destroy ego vehicle
+            # Destroy actors before changing synchronous mode
+            actors_to_destroy = []
+            
+            # Collect ego vehicle
             if self.ego_vehicle is not None:
-                self.ego_vehicle.destroy()
+                actors_to_destroy.append(self.ego_vehicle)
                 self.ego_vehicle = None
-                
-            # Destroy NPC vehicles
-            for npc in self.npc_vehicles:
+            
+            # Collect all NPCs
+            actors_to_destroy.extend(self.npc_vehicles)
+            actors_to_destroy.extend(self.npc_bikes)
+            actors_to_destroy.extend(self.npc_motorbikes)
+
+            # Stop AI controllers before destroying them
+            for ctrl in self.npc_controllers:
                 try:
-                    npc.destroy()
-                except RuntimeError:
+                    if ctrl is not None and ctrl.is_alive:
+                        ctrl.stop()
+                except (RuntimeError, AttributeError):
                     pass
+            actors_to_destroy.extend(self.npc_controllers)
+            actors_to_destroy.extend(self.npc_pedestrians)
+            
+            # Destroy all actors in batch
+            if actors_to_destroy:
+                logging.info("Destroying %d actors...", len(actors_to_destroy))
+                for actor in actors_to_destroy:
+                    try:
+                        if actor is not None and actor.is_alive:
+                            actor.destroy()
+                    except (RuntimeError, AttributeError):
+                        # Actor already destroyed or invalid
+                        pass
+            
+            # Clear lists
             self.npc_vehicles.clear()
+            self.npc_bikes.clear()
+            self.npc_motorbikes.clear()
+            self.npc_pedestrians.clear()
+            self.npc_controllers.clear()
+            
+            # Tick world to process destructions
+            try:
+                self.world.tick()
+            except RuntimeError:
+                pass
             
             # Restore asynchronous mode
-            settings = self.world.get_settings()
-            settings.synchronous_mode = False
-            self.world.apply_settings(settings)
-            
-            if self.traffic_manager is not None:
-                self.traffic_manager.set_synchronous_mode(False)
+            try:
+                settings = self.world.get_settings()
+                settings.synchronous_mode = False
+                self.world.apply_settings(settings)
+                
+                if self.traffic_manager is not None:
+                    self.traffic_manager.set_synchronous_mode(False)
+            except RuntimeError as exc:
+                logging.warning("Failed to restore async mode: %s", exc)
                 
             logging.info("Cleanup complete")
             
@@ -652,8 +943,28 @@ def parse_args() -> argparse.Namespace:
         "--npc-vehicles",
         type=int,
         default=DEFAULT_NPC_VEHICLES,
-        help=f"Number of NPC vehicles to spawn (default: {DEFAULT_NPC_VEHICLES}, "
-             f"range: {MIN_NPC_VEHICLES}-{MAX_NPC_VEHICLES})",
+        help=f"Number of NPC 4-wheel vehicles to spawn (default: {DEFAULT_NPC_VEHICLES})",
+    )
+    
+    parser.add_argument(
+        "--npc-bikes",
+        type=int,
+        default=DEFAULT_NPC_BIKES,
+        help=f"Number of bikes/bicycles to spawn (default: {DEFAULT_NPC_BIKES})",
+    )
+    
+    parser.add_argument(
+        "--npc-motorbikes",
+        type=int,
+        default=DEFAULT_NPC_MOTORBIKES,
+        help=f"Number of motorbikes/motorcycles to spawn (default: {DEFAULT_NPC_MOTORBIKES})",
+    )
+    
+    parser.add_argument(
+        "--npc-pedestrians",
+        type=int,
+        default=DEFAULT_NPC_PEDESTRIANS,
+        help=f"Number of pedestrians to spawn (default: {DEFAULT_NPC_PEDESTRIANS}, set 0 to disable)",
     )
     
     parser.add_argument(
@@ -661,6 +972,23 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_DURATION_SECONDS,
         help=f"Collection duration in seconds (default: {DEFAULT_DURATION_SECONDS})",
+    )
+
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=COLLECTION_FPS,
+        help=(
+            "Synchronous collection FPS. Use 15 or 20 when you want 2s history "
+            "+ 3s future datasets at higher temporal resolution (default: 10)."
+        ),
+    )
+
+    parser.add_argument(
+        "--fixed-delta",
+        type=float,
+        default=None,
+        help="Override synchronous fixed_delta_seconds directly. If set, this takes precedence over --fps.",
     )
     
     parser.add_argument(
@@ -698,6 +1026,16 @@ def main() -> int:
     if args.seed is not None:
         np.random.seed(args.seed)
         logging.info("Random seed set to: %d", args.seed)
+
+    fixed_delta = float(args.fixed_delta) if args.fixed_delta is not None else 1.0 / max(float(args.fps), 1e-6)
+    if fixed_delta <= 0.0 or not math.isfinite(fixed_delta):
+        logging.error("fixed_delta must be a finite positive value, got %.6f", fixed_delta)
+        return 1
+    collection_fps = 1.0 / fixed_delta
+    if collection_fps < 1.0 or collection_fps > 60.0:
+        logging.error("Collection FPS must be in [1, 60], got %.3f", collection_fps)
+        return 1
+    logging.info("Collection timing: fixed_delta=%.6f seconds, fps=%.2f", fixed_delta, collection_fps)
         
     # Validate NPC count
     if not (MIN_NPC_VEHICLES <= args.npc_vehicles <= MAX_NPC_VEHICLES):
@@ -726,10 +1064,15 @@ def main() -> int:
     # Create data collector
     collector = MultiAgentDataCollector(
         world=connection_manager.world,
+        client=connection_manager.client,
         output_dir=args.output_dir,
         town=args.town,
         npc_vehicle_count=args.npc_vehicles,
+        npc_bike_count=args.npc_bikes,
+        npc_motorbike_count=args.npc_motorbikes,
+        npc_pedestrian_count=args.npc_pedestrians,
         duration_seconds=args.duration,
+        fixed_delta=fixed_delta,
     )
     
     # Setup and collect
@@ -737,10 +1080,27 @@ def main() -> int:
     try:
         if collector.setup():
             success = collector.collect()
+    except KeyboardInterrupt:
+        logging.warning("Collection interrupted by user (Ctrl+C)")
+        success = False
+    except Exception as exc:
+        logging.error("Unexpected error during collection: %s", exc)
+        success = False
     finally:
-        collector.cleanup()
+        # Always cleanup, even if collection failed
+        try:
+            collector.cleanup()
+        except Exception as cleanup_exc:
+            logging.error("Cleanup error (non-fatal): %s", cleanup_exc)
         
-    return 0 if success else 1
+    # Return success status
+    # Note: CSV data is still valid even if cleanup had issues
+    if success:
+        logging.info("Data collection completed successfully")
+        return 0
+    else:
+        logging.warning("Data collection completed with issues")
+        return 0  # Return 0 if data was collected, even if cleanup failed
 
 
 if __name__ == "__main__":

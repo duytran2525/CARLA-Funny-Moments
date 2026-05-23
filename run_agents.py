@@ -2172,35 +2172,6 @@ class LaneFollowAgent(BaseAgent):
 
         cv2.putText(annotated_frame, status_text, (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
-        lock_zone = debug_info.get("locked_zone")
-        if lock_zone:
-            lock_text = (
-                f"LOCK={lock_zone} | immunity={debug_info.get('green_immunity_counter', 0)}"
-            )
-        else:
-            lock_text = "LOCK=None"
-        cv2.putText(
-            annotated_frame,
-            lock_text,
-            (10, 58),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 0),
-            2,
-        )
-        turn_text = (
-            f"TARGET={debug_info.get('decision_reason', 'none')} | "
-            f"OBS={debug_info.get('obstacle_reason', 'none')}"
-        )
-        cv2.putText(
-            annotated_frame,
-            turn_text,
-            (10, 84),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (200, 255, 200),
-            2,
-        )
 
         if step_idx % 20 == 0 and detections:
             logging.info(
@@ -2486,6 +2457,11 @@ class CILAgent(BaseAgent):
         self._hud_ema_fps: Optional[float] = None
         self._hud_last_tick_time: Optional[float] = None
         self._route_overlay_bounds: Optional[tuple[float, float, float, float]] = None
+
+        # 1-second command delay buffer: hold command N frames before feeding to model
+        # N is computed in setup() from fixed_delta; default 20 frames ≈ 1 s at 20 FPS
+        self._command_delay_buffer: deque = deque()
+        self._command_delay_n_frames: int = max(1, round(1.0 / max(1e-3, float(config.fixed_delta))))
         # Speed control (PID)
         self._speed_controller = SpeedPIDController(
             target_speed_kmh=config.target_speed_kmh,
@@ -4943,6 +4919,15 @@ class CILAgent(BaseAgent):
             step_idx=step_idx,
         )
 
+        # ── 1-second command delay: push current command, consume the one from
+        # ~1 s ago so the CIL model receives the command slightly later than
+        # the oracle fires it (avoids premature steering before the junction).
+        self._command_delay_buffer.append(command)
+        if len(self._command_delay_buffer) > self._command_delay_n_frames:
+            command = self._command_delay_buffer.popleft()
+        else:
+            command = self._command_delay_buffer[0]  # still warming up → use oldest
+
         stage_times["nav"] = time.perf_counter() - nav_t0
 
         model_t0 = time.perf_counter()
@@ -6761,63 +6746,6 @@ class YoloDetectAgent(BaseAgent):
                     cv2.FONT_HERSHEY_SIMPLEX,
                     1,
                     status_color,
-                    2,
-                )
-
-                lock_zone = sup_debug.get("locked_zone", debug_info.get("locked_zone"))
-                if lock_zone:
-                    lock_text = (
-                        f"LOCK={lock_zone} | immunity="
-                        f"{sup_debug.get('green_immunity_counter', debug_info.get('green_immunity_counter', 0))}"
-                    )
-                else:
-                    lock_text = "LOCK=None"
-
-                cv2.putText(
-                    annotated_frame,
-                    lock_text,
-                    (10, 58),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 0),
-                    2,
-                )
-
-                turn_text = (
-                    f"TARGET={supervisor_reason} | "
-                    f"OBS={sup_debug.get('obstacle_reason', debug_info.get('obstacle_reason', 'none'))}"
-                )
-                cv2.putText(
-                    annotated_frame,
-                    turn_text,
-                    (10, 84),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (200, 255, 200),
-                    2,
-                )
-
-                demo_text = f"{steer_text} | FPS={hud_fps:.1f} | SPEED={speed_text}"
-                cv2.putText(
-                    annotated_frame,
-                    demo_text,
-                    (10, 110),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.60,
-                    (40, 220, 255),
-                    2,
-                )
-
-                control_text = (
-                    f"THR={display_throttle:.2f} | BRK={display_brake:.2f} | DETS={len(detections)}"
-                )
-                cv2.putText(
-                    annotated_frame,
-                    control_text,
-                    (10, 136),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (220, 220, 220),
                     2,
                 )
 

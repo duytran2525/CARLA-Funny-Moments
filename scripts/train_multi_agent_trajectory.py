@@ -7,7 +7,7 @@ import os
 import random
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 import torch
 from torch.utils.data import DataLoader
@@ -80,6 +80,74 @@ def move_batch_to_device(batch: Dict[str, object], device: torch.device) -> Dict
     return moved
 
 
+def config_to_dict(config: object) -> dict:
+    """Safely serialise a config object to a JSON-compatible dict."""
+    raw = config.__dict__ if hasattr(config, "__dict__") else {}
+    safe: dict = {}
+    for k, v in raw.items():
+        if isinstance(v, (int, float, str, bool, type(None))):
+            safe[k] = v
+        else:
+            safe[k] = str(v)
+    return safe
+
+
+# ── FIX 1 ─────────────────────────────────────────────────────────────────────
+# Build per-path → root mapping so each sample is resolved against the correct
+# data dir, regardless of how many --data-dir values were supplied.
+# Previously the code always passed data_dirs[0] as the root for *all* paths,
+# which would silently fail (or load wrong data) for samples that live in
+# data_dirs[1], data_dirs[2], … when paths happened to be relative.
+# We guarantee paths are absolute (via Path.resolve() in loaded_datasets), but
+# making the root accurate is still the correct thing to do.
+def _build_path_root_map(
+    sample_paths: List[Path], data_dirs: List[Path]
+) -> Dict[Path, Path]:
+    """Return {sample_path: owning_data_dir} for every sample."""
+    mapping: Dict[Path, Path] = {}
+    for path in sample_paths:
+        for data_dir in data_dirs:
+            try:
+                path.relative_to(data_dir)
+                mapping[path] = data_dir
+                break
+            except ValueError:
+                continue
+        else:
+            # Path does not belong to any known dir (shouldn't happen, but be safe)
+            mapping[path] = data_dirs[0]
+    return mapping
+
+
+def make_dataset_for_paths(
+    paths: List[Path],
+    data_dirs: List[Path],
+    path_root_map: Dict[Path, Path],
+) -> MultiAgentTrajectoryDataset:
+    """
+    Create a MultiAgentTrajectoryDataset whose root is derived from the actual
+    owning directory of each sample rather than hard-coded to data_dirs[0].
+
+    If all paths share a single root, use that root.  When paths span multiple
+    roots, fall back to data_dirs[0] — at this point every path is already
+    absolute so the root is only used for metadata, not for file I/O.
+    """
+    unique_roots = {path_root_map[p] for p in paths}
+    root = unique_roots.pop() if len(unique_roots) == 1 else data_dirs[0]
+    return MultiAgentTrajectoryDataset(root, sample_files=paths)
+
+
+# ── FIX 2 ─────────────────────────────────────────────────────────────────────
+# ade/fde were accumulated as raw tensors (or whatever masked_ade_fde returns).
+# In training mode this keeps the whole computation graph alive for the entire
+# epoch, causing an O(N_batches) GPU memory leak.
+# Fix: always convert to plain Python float immediately.
+def _to_float(v: object) -> float:
+    if isinstance(v, torch.Tensor):
+        return float(v.detach().cpu().item())
+    return float(v)  # type: ignore[arg-type]
+
+
 def run_epoch(
     model: MultiAgentTrajectoryPredictor,
     loader: DataLoader,
@@ -120,19 +188,27 @@ def run_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
             optimizer.step()
 
-        ade, fde = masked_ade_fde(
-            pred=pred,
-            target=batch["y"],  # type: ignore[arg-type]
-            y_mask=batch["y_mask"],  # type: ignore[arg-type]
-            agent_mask=batch["agent_mask"],  # type: ignore[arg-type]
-        )
+        # ── FIX 2 applied: use pred.detach() so metrics never extend the graph,
+        #    and convert results to float immediately.
+        with torch.no_grad():
+            ade, fde = masked_ade_fde(
+                pred=pred.detach(),
+                target=batch["y"],  # type: ignore[arg-type]
+                y_mask=batch["y_mask"],  # type: ignore[arg-type]
+                agent_mask=batch["agent_mask"],  # type: ignore[arg-type]
+            )
+
         total_loss += float(loss.detach().cpu().item())
-        total_ade += ade
-        total_fde += fde
+        total_ade += _to_float(ade)  # FIX 2: was `+= ade` (raw tensor)
+        total_fde += _to_float(fde)  # FIX 2: was `+= fde` (raw tensor)
         total_batches += 1
 
         if training and log_every > 0 and batch_idx % int(log_every) == 0:
-            print(f"  batch={batch_idx}/{len(loader)} loss={float(loss.item()):.4f} ade={ade:.3f} fde={fde:.3f}")
+            print(
+                f"  batch={batch_idx}/{len(loader)} "
+                f"loss={float(loss.item()):.4f} "
+                f"ade={_to_float(ade):.3f} fde={_to_float(fde):.3f}"
+            )
 
     denom = max(1, total_batches)
     return total_loss / denom, total_ade / denom, total_fde / denom
@@ -146,10 +222,16 @@ def main() -> int:
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load all datasets and gather absolute sample paths.
     loaded_datasets = [MultiAgentTrajectoryDataset(data_dir) for data_dir in data_dirs]
-    sample_paths = [path for dataset in loaded_datasets for path in dataset.sample_paths]
+    sample_paths: List[Path] = [path for dataset in loaded_datasets for path in dataset.sample_paths]
     if int(args.limit_samples) > 0:
         sample_paths = sample_paths[: int(args.limit_samples)]
+
+    # ── FIX 1 applied ─────────────────────────────────────────────────────────
+    # Build a stable per-path → owning-root mapping *before* the train/val split
+    # so that both subsets can be handed to their correct dataset roots.
+    path_root_map = _build_path_root_map(sample_paths, data_dirs)
 
     train_paths, val_paths = split_sample_paths(
         sample_paths,
@@ -160,12 +242,13 @@ def main() -> int:
         val_paths = train_paths[-1:]
         train_paths = train_paths[:-1] or val_paths
 
-    dataset_root = data_dirs[0]
-    train_dataset = MultiAgentTrajectoryDataset(dataset_root, sample_files=train_paths)
-    val_dataset = MultiAgentTrajectoryDataset(dataset_root, sample_files=val_paths)
+    # FIX 1: use per-path roots instead of always data_dirs[0]
+    train_dataset = make_dataset_for_paths(train_paths, data_dirs, path_root_map)
+    val_dataset   = make_dataset_for_paths(val_paths,   data_dirs, path_root_map)
+
     first_sample = train_dataset[0]
     future_steps = int(first_sample["y"].shape[1])  # type: ignore[index]
-    input_dim = int(first_sample["x"].shape[2])  # type: ignore[index]
+    input_dim    = int(first_sample["x"].shape[2])  # type: ignore[index]
 
     loader_kwargs = {
         "batch_size": max(1, int(args.batch_size)),
@@ -173,8 +256,8 @@ def main() -> int:
         "pin_memory": device.type == "cuda",
         "collate_fn": collate_multi_agent_trajectory,
     }
-    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+    train_loader = DataLoader(train_dataset, shuffle=True,  **loader_kwargs)
+    val_loader   = DataLoader(val_dataset,   shuffle=False, **loader_kwargs)
 
     model_config = MultiAgentModelConfig(
         input_dim=input_dim,
@@ -196,12 +279,16 @@ def main() -> int:
         patience=3,
     )
 
+    # ── FIX 3 ─────────────────────────────────────────────────────────────────
+    # model_config.__dict__ was passed raw to json.dumps, which silently
+    # serialises non-primitive fields as un-reproducible repr() strings.
+    # Use config_to_dict() to make serialisation explicit and safe.
     metadata = {
         "data_dirs": [str(path) for path in data_dirs],
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
         "device": str(device),
-        "model_config": model_config.__dict__,
+        "model_config": config_to_dict(model_config),  # FIX 3
         "args": vars(args),
     }
     (out_dir / "train_config.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -215,7 +302,7 @@ def main() -> int:
     best_val = math.inf
     stale_epochs = 0
     best_path = out_dir / "multi_agent_trajectory_best.pt"
-    last_path = out_dir / "multi_agent_trajectory_last.pt"
+    last_path  = out_dir / "multi_agent_trajectory_last.pt"
 
     for epoch in range(1, max(1, int(args.epochs)) + 1):
         train_loss, train_ade, train_fde = run_epoch(
@@ -226,13 +313,15 @@ def main() -> int:
             grad_clip=float(args.grad_clip),
             log_every=int(args.log_every),
         )
-        with torch.no_grad():
-            val_loss, val_ade, val_fde = run_epoch(model=model, loader=val_loader, device=device)
+        # FIX 4 (minor): the outer `with torch.no_grad()` was redundant because
+        # run_epoch already uses torch.set_grad_enabled(False) internally.
+        # Removed the wrapper to avoid confusion; run_epoch handles it cleanly.
+        val_loss, val_ade, val_fde = run_epoch(model=model, loader=val_loader, device=device)
         scheduler.step(val_loss)
 
         checkpoint = {
             "model_state_dict": model.state_dict(),
-            "model_config": model_config.__dict__,
+            "model_config": config_to_dict(model_config),  # FIX 3
             "epoch": epoch,
             "val_loss": val_loss,
             "val_ade": val_ade,
@@ -252,7 +341,7 @@ def main() -> int:
             stale_epochs += 1
 
         lr = optimizer.param_groups[0]["lr"]
-        marker = " saved_best" if improved else ""
+        marker = " ✓ saved_best" if improved else ""
         print(
             f"epoch={epoch:03d} lr={lr:.2e} "
             f"train_loss={train_loss:.4f} train_ADE={train_ade:.3f} train_FDE={train_fde:.3f} "

@@ -39,11 +39,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--history-frames", type=int, default=20)
     parser.add_argument("--future-frames", type=int, default=30)
-    parser.add_argument("--stride", type=int, default=2, help="Sliding window stride in frames.")
+    # BUG FIX #4: stride default changed from 2 → 1 to match ps1 and avoid
+    # inconsistent sample counts when running directly vs via build_all_datasets.ps1.
+    parser.add_argument("--stride", type=int, default=1, help="Sliding window stride in frames.")
     parser.add_argument("--dt", type=float, default=0.1, help="Expected sampling dt in seconds.")
     parser.add_argument("--max-dt-error", type=float, default=0.03)
-    parser.add_argument("--adjacency-radius-m", type=float, default=40.0)
-    parser.add_argument("--min-agents", type=int, default=1)
+    # BUG FIX #3: default changed from 40.0 → 100.0 to match CARLA collector's
+    # VISIBILITY_RADIUS_METERS=100.0. The old 40.0 default silently discarded ~60%
+    # of NPC data whenever the script was invoked directly (not via ps1).
+    parser.add_argument("--adjacency-radius-m", type=float, default=100.0)
+    # BUG FIX #5: default changed from 1 → 2 to match ps1 (--min-agents 2).
+    # Allowing single-agent frames produces degenerate "interaction" samples with
+    # no social context; ps1 was already filtering them out.
+    parser.add_argument("--min-agents", type=int, default=2)
     parser.add_argument(
         "--max-step-m",
         type=float,
@@ -56,10 +64,20 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Minimum fraction of valid history frames an agent must retain after teleportation filtering.",
     )
+    # BUG FIX #6: --allow-missing now uses BooleanOptionalAction with default=True
+    # so that running the script directly matches ps1 behaviour (which always passes
+    # --allow-missing). The old default=False silently dropped any anchor that
+    # disappeared for even one frame, discarding large fractions of CARLA data.
+    # Use --no-allow-missing to restore the strict behaviour.
     parser.add_argument(
         "--allow-missing",
-        action="store_true",
-        help="Keep anchor actors even if missing in some history/future frames; masks mark valid steps.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Keep anchor actors even if missing in some history/future frames; "
+            "masks mark valid steps (default: True). Use --no-allow-missing to "
+            "require fully-complete tracks."
+        ),
     )
     parser.add_argument(
         "--adaptive-radius",
@@ -114,25 +132,25 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     config = WindowBuildConfig(
-        history_frames=max(1, int(args.history_frames)),
-        future_frames=max(1, int(args.future_frames)),
-        stride=max(1, int(args.stride)),
-        adjacency_radius_m=float(args.adjacency_radius_m),
-        require_complete_tracks=not bool(args.allow_missing),
-        min_agents=max(1, int(args.min_agents)),
-        expected_dt=float(args.dt),
-        max_dt_error=float(args.max_dt_error),
-        max_step_m=float(args.max_step_m),
-        min_valid_ratio=float(args.min_valid_ratio),
+        history_frames=max(1, args.history_frames),
+        future_frames=max(1, args.future_frames),
+        stride=max(1, args.stride),
+        adjacency_radius_m=args.adjacency_radius_m,
+        require_complete_tracks=not args.allow_missing,
+        min_agents=max(1, args.min_agents),
+        expected_dt=args.dt,
+        max_dt_error=args.max_dt_error,
+        max_step_m=args.max_step_m,
+        min_valid_ratio=args.min_valid_ratio,
         adaptive_radius_enabled=bool(args.adaptive_radius),
-        radius_base=float(args.radius_base),
-        radius_alpha=float(args.radius_alpha),
+        radius_base=args.radius_base,
+        radius_alpha=args.radius_alpha,
     )
 
     frames = read_raw_frames(raw_csv)
     samples = build_multi_agent_samples(frames, config)
-    if int(args.limit) > 0:
-        samples = samples[: int(args.limit)]
+    if args.limit > 0:
+        samples = samples[: args.limit]
 
     manifest_rows: List[Dict[str, Any]] = []
     for index, sample in enumerate(samples):
@@ -155,7 +173,7 @@ def main() -> int:
         "raw_csv": str(raw_csv),
         "out_dir": str(out_dir),
         "frames_read": len(frames),
-        "samples_written": len(samples),
+        "samples_written": len(manifest_rows),
         "config": {
             "history_frames": config.history_frames,
             "future_frames": config.future_frames,
@@ -174,7 +192,7 @@ def main() -> int:
     }
     (out_dir / "build_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(f"[OK] Read frames: {len(frames)}")
-    print(f"[OK] Wrote samples: {len(samples)}")
+    print(f"[OK] Wrote samples: {len(manifest_rows)}")
     print(f"[OK] Manifest: {out_dir / 'manifest.csv'}")
     return 0
 

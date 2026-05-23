@@ -4,8 +4,11 @@
 $ErrorActionPreference = "Stop"
 
 $TOWNS = @("Town01", "Town02", "Town03", "Town04", "Town05", "Town06", "Town07", "Town10HD")
-$DURATION = 600  # 10 minutes per town
-$NPC_VEHICLES = 40
+$DURATION = 500  # 500 seconds = 5000 frames @ 10 FPS
+$NPC_VEHICLES = 60
+$NPC_BIKES = 40
+$NPC_MOTORBIKES = 40
+$NPC_PEDESTRIANS = 40
 $OUTPUT_DIR = "data/multi_agent"
 
 Write-Host "=" * 70
@@ -13,7 +16,10 @@ Write-Host "Multi-Agent Data Collection - All Towns"
 Write-Host "=" * 70
 Write-Host "Towns: $($TOWNS -join ', ')"
 Write-Host "Duration per town: $DURATION seconds"
-Write-Host "NPC vehicles: $NPC_VEHICLES"
+Write-Host "NPC 4-wheel vehicles: $NPC_VEHICLES"
+Write-Host "NPC bikes: $NPC_BIKES"
+Write-Host "NPC motorbikes: $NPC_MOTORBIKES"
+Write-Host "NPC pedestrians: $NPC_PEDESTRIANS"
 Write-Host "Output directory: $OUTPUT_DIR"
 Write-Host "=" * 70
 Write-Host ""
@@ -33,16 +39,34 @@ foreach ($town in $TOWNS) {
             --town $town `
             --duration $DURATION `
             --npc-vehicles $NPC_VEHICLES `
-            --output-dir $OUTPUT_DIR
+            --npc-bikes $NPC_BIKES `
+            --npc-motorbikes $NPC_MOTORBIKES `
+            --npc-pedestrians $NPC_PEDESTRIANS `
+            --output-dir $OUTPUT_DIR `
+            --seed 42
         
-        if ($LASTEXITCODE -eq 0) {
+        $exitCode = $LASTEXITCODE
+        
+        # Check if CSV file was created (data collection succeeded)
+        $csvPattern = "$OUTPUT_DIR\raw\${town}_*.csv"
+        $csvFiles = Get-ChildItem $csvPattern -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        
+        if ($csvFiles -and $csvFiles.Length -gt 1000) {
+            $completed++
+            Write-Host ""
+            Write-Host "[SUCCESS] $town data collection completed (CSV: $($csvFiles.Length) bytes)" -ForegroundColor Green
+        } elseif ($exitCode -eq 0) {
             $completed++
             Write-Host ""
             Write-Host "[SUCCESS] $town data collection completed" -ForegroundColor Green
         } else {
             $failed++
             Write-Host ""
-            Write-Host "[FAILED] $town data collection failed with exit code $LASTEXITCODE" -ForegroundColor Red
+            Write-Host "[WARNING] $town completed with exit code $exitCode" -ForegroundColor Yellow
+            # Check if CSV exists anyway
+            if ($csvFiles -and $csvFiles.Length -gt 1000) {
+                Write-Host "[INFO] But CSV file exists, data may be valid" -ForegroundColor Cyan
+            }
         }
     }
     catch {

@@ -80,6 +80,47 @@ class GATLayerTests(unittest.TestCase):
         self.assertFalse(torch.allclose(output[0, 0], torch.zeros(hidden_dim)))
         self.assertFalse(torch.allclose(output[0, 1], torch.zeros(hidden_dim)))
         self.assertFalse(torch.allclose(output[0, 2], torch.zeros(hidden_dim)))
+
+    def test_gat_layer_does_not_leak_nan_from_masked_agents(self) -> None:
+        """NaNs in padded agents must not contaminate valid agents."""
+        batch_size, max_agents, hidden_dim = 1, 4, 64
+        num_heads = 4
+
+        gat = GATLayer(hidden_dim=hidden_dim, num_heads=num_heads, concat_heads=True)
+
+        h = torch.randn(batch_size, max_agents, hidden_dim)
+        h[0, 3] = float("nan")
+        adj = torch.zeros(batch_size, max_agents, max_agents)
+        adj[0, :3, :3] = 1.0
+        agent_mask = torch.tensor([[True, True, True, False]], dtype=torch.bool)
+
+        output = gat(h, adj, agent_mask)
+
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertTrue(torch.allclose(output[0, 3], torch.zeros(hidden_dim)))
+
+    def test_gat_layer_half_precision_with_padded_agents_is_finite(self) -> None:
+        """GAT masking should be safe under AMP-like float16 inputs."""
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for reliable float16 Linear coverage")
+
+        device = torch.device("cuda")
+        batch_size, max_agents, hidden_dim = 2, 5, 64
+        num_heads = 4
+
+        gat = GATLayer(hidden_dim=hidden_dim, num_heads=num_heads, concat_heads=True).to(device).half()
+
+        h = torch.randn(batch_size, max_agents, hidden_dim, device=device).half()
+        adj = torch.zeros(batch_size, max_agents, max_agents, device=device).half()
+        adj[:, :3, :3] = 1.0
+        agent_mask = torch.zeros(batch_size, max_agents, dtype=torch.bool, device=device)
+        agent_mask[:, :3] = True
+
+        output = gat(h, adj, agent_mask)
+
+        self.assertEqual(output.dtype, torch.float16)
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertTrue(torch.allclose(output[:, 3:], torch.zeros_like(output[:, 3:])))
     
     def test_gat_layer_no_neighbors_self_attention_only(self) -> None:
         """Agent with no neighbors (adj all zeros except diagonal) should use self-attention."""

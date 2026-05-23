@@ -12,6 +12,21 @@ The script generates a validation report with overall metrics, per-town breakdow
 and inference latency measurements on both GPU and CPU (if available).
 
 **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7, 11.8, 11.9, 11.10, 8.9**
+
+Changelog (bug fixes):
+  B1: load_checkpoint() now uses getattr(..., default) for advanced GTNet fields
+      (enable_gat / enable_multimodal / enable_adaptive_radius / num_modes /
+      num_attention_heads) that are absent from the baseline MultiAgentModelConfig.
+      Previously caused AttributeError on every baseline checkpoint.
+  B2: validation_report dict uses same getattr pattern — same crash path as B1.
+  B3: enable_multimodal flag resolved via getattr before evaluate_model() call —
+      was also AttributeError on baseline checkpoints.
+  B4: Inference latency is now reported *per sample* (divided by actual batch size)
+      instead of per batch. The old code reported numbers 16-32× too large.
+  B5: FDE in compute_multimodal_metrics() now uses the last *valid* future timestep
+      per agent (argmax over y_mask) instead of hard-coding index -1. When
+      --allow-missing is active (the default), the last timestep may be masked for
+      many agents, making the old displacement[..., -1] meaningless.
 """
 
 from __future__ import annotations
@@ -91,7 +106,7 @@ def parse_args() -> argparse.Namespace:
         "--latency-samples",
         type=int,
         default=100,
-        help="Number of samples for latency measurement",
+        help="Number of batches for latency measurement",
     )
     parser.add_argument(
         "--device",
@@ -99,7 +114,7 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Device to use: auto (detect), cpu, or cuda",
     )
-    
+
     return parser.parse_args()
 
 
@@ -122,71 +137,115 @@ def move_batch_to_device(batch: Dict[str, object], device: torch.device) -> Dict
     return moved
 
 
+def _last_valid_displacement(
+    displacement: torch.Tensor,
+    y_mask: torch.Tensor,
+    agent_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return per-agent FDE using the last *valid* future timestep.
+
+    BUG FIX B5: When --allow-missing is active (dataset default), the very last
+    future frame may be masked for many agents.  Hard-coding index -1 then yields
+    the displacement at a missing step (i.e. interpolated/zero position) rather
+    than the true final observed position.  We instead find the last timestep
+    where y_mask is True per agent and fall back to index -1 only when all steps
+    are masked (edge-case guard).
+
+    Args:
+        displacement: [B, N, T] or [B, N, K, T] — L2 distance tensor.
+        y_mask:       [B, N, T] bool — valid future frames.
+        agent_mask:   [B, N]    bool — valid agents.
+
+    Returns:
+        Tensor of shape [B, N] (or [B, N, K]) with per-agent last-valid FDE.
+    """
+    # Work on the last dim regardless of whether a mode dim is present.
+    leading = displacement.shape[:-1]  # (B, N) or (B, N, K)
+    T = displacement.shape[-1]
+
+    # Build a [B, N, T] index mask: True only at the last valid step.
+    # y_mask shape: [B, N, T]. We need to broadcast over a possible K dim later.
+    B, N = y_mask.shape[0], y_mask.shape[1]
+
+    # last_valid_idx[b, n] ∈ {0 .. T-1}, defaults to T-1 if no valid step.
+    # flip along T to find the last True, take argmax, then un-flip.
+    flipped = y_mask.flip(dims=[-1])              # [B, N, T]
+    last_valid_idx = (T - 1) - flipped.long().argmax(dim=-1)  # [B, N]
+    # When all steps are masked, argmax returns 0 → T-1 after un-flip (safe).
+
+    if displacement.ndim == 3:
+        # Unimodal path: [B, N, T]
+        idx = last_valid_idx.unsqueeze(-1)        # [B, N, 1]
+        return displacement.gather(-1, idx).squeeze(-1)  # [B, N]
+    else:
+        # Multimodal path: [B, N, K, T]
+        K = displacement.shape[-2]
+        idx = last_valid_idx.unsqueeze(-1).unsqueeze(-1).expand(B, N, K, 1)
+        return displacement.gather(-1, idx).squeeze(-1)   # [B, N, K]
+
+
 def compute_multimodal_metrics(
     pred: torch.Tensor,
     target: torch.Tensor,
     y_mask: torch.Tensor,
     agent_mask: torch.Tensor,
 ) -> dict:
-    """Compute minADE, minFDE, MissRate for multimodal predictions.
-    
+    """Compute minADE, minFDE, MissRate for multimodal (or unimodal) predictions.
+
     Args:
-        pred: Predicted trajectories [batch_size, max_agents, num_modes, future_steps, 2]
-              or [batch_size, max_agents, future_steps, 2] for unimodal
-        target: Ground truth trajectories [batch_size, max_agents, future_steps, 2]
-        y_mask: Valid future frames [batch_size, max_agents, future_steps]
-        agent_mask: Valid agents [batch_size, max_agents]
-    
+        pred:       [B, N, K, T, 2] or [B, N, T, 2] for unimodal
+        target:     [B, N, T, 2]
+        y_mask:     [B, N, T] bool — valid future frames
+        agent_mask: [B, N]    bool — valid agents
+
     Returns:
-        Dictionary with minADE, minFDE, MissRate
+        dict with minADE (float), minFDE (float), MissRate (float)
     """
-    # Handle both unimodal and multimodal predictions
+    # Normalise to [B, N, K, T, 2]
     if pred.ndim == 4:
-        # Unimodal: [B, N, T, 2] -> add mode dimension [B, N, 1, T, 2]
         pred = pred.unsqueeze(2)
-    
+
     batch_size, max_agents, num_modes, future_steps, _ = pred.shape
-    
-    # Expand target to match pred shape: [B, N, 1, T, 2]
+
+    # Expand target: [B, N, 1, T, 2]
     target_expanded = target.unsqueeze(2)
-    
-    # Compute displacement for all modes: [B, N, K, T]
+
+    # Per-step displacement: [B, N, K, T]
     displacement = torch.linalg.norm(pred - target_expanded, dim=-1)
-    
-    # Valid mask: [B, N, T] -> [B, N, 1, T] for broadcasting
-    valid = (y_mask & agent_mask.unsqueeze(-1)).unsqueeze(2)
+
+    # Valid mask: [B, N, T] → [B, N, 1, T] for broadcasting over K
+    valid = (y_mask & agent_mask.unsqueeze(-1)).unsqueeze(2)          # [B, N, 1, T]
     valid_float = valid.to(dtype=pred.dtype)
-    
-    # Compute ADE per mode: [B, N, K]
-    per_mode_ade = (displacement * valid_float).sum(dim=3) / valid_float.sum(dim=3).clamp_min(1.0)
-    
-    # Compute FDE per mode: [B, N, K]
-    per_mode_fde = displacement[..., -1]  # [B, N, K]
-    
-    # Select best mode per agent (minimum ADE)
-    best_mode_indices = torch.argmin(per_mode_ade, dim=2)  # [B, N]
-    
-    # Gather minADE and minFDE
-    best_mode_indices_expanded = best_mode_indices.unsqueeze(2)  # [B, N, 1]
-    min_ade_per_agent = torch.gather(per_mode_ade, dim=2, index=best_mode_indices_expanded).squeeze(2)
-    min_fde_per_agent = torch.gather(per_mode_fde, dim=2, index=best_mode_indices_expanded).squeeze(2)
-    
-    # Apply agent mask and compute mean
+
+    # ADE per mode: [B, N, K]
+    per_mode_ade = (displacement * valid_float).sum(dim=-1) / valid_float.sum(dim=-1).clamp_min(1.0)
+
+    # FDE per mode: [B, N, K]  — BUG FIX B5: use last *valid* timestep
+    per_mode_fde = _last_valid_displacement(displacement, y_mask, agent_mask)  # [B, N, K]
+
+    # Best mode selection by minimum ADE: [B, N]
+    best_mode_indices = torch.argmin(per_mode_ade, dim=2)
+    best_idx_exp = best_mode_indices.unsqueeze(2)                     # [B, N, 1]
+
+    min_ade_per_agent = per_mode_ade.gather(2, best_idx_exp).squeeze(2)   # [B, N]
+    min_fde_per_agent = per_mode_fde.gather(2, best_idx_exp).squeeze(2)   # [B, N]
+
+    # Aggregate over valid agents
     agent_mask_float = agent_mask.to(dtype=pred.dtype)
     num_valid_agents = agent_mask_float.sum().clamp_min(1.0)
-    
+
     min_ade = (min_ade_per_agent * agent_mask_float).sum() / num_valid_agents
     min_fde = (min_fde_per_agent * agent_mask_float).sum() / num_valid_agents
-    
-    # Compute MissRate (fraction where minFDE > 2.0m)
+
+    # MissRate: agents where minFDE > 2.0 m
     miss_threshold = 2.0
     miss_mask = (min_fde_per_agent > miss_threshold) & agent_mask
     miss_rate = miss_mask.to(dtype=pred.dtype).sum() / num_valid_agents
-    
+
     return {
-        "minADE": float(min_ade.detach().cpu().item()),
-        "minFDE": float(min_fde.detach().cpu().item()),
-        "MissRate": float(miss_rate.detach().cpu().item()),
+        "minADE": float(min_ade.detach().cpu()),
+        "minFDE": float(min_fde.detach().cpu()),
+        "MissRate": float(miss_rate.detach().cpu()),
     }
 
 
@@ -198,107 +257,98 @@ def evaluate_model(
     per_town_metrics: bool = True,
 ) -> tuple[dict, dict]:
     """Evaluate model on test set and compute metrics.
-    
-    Args:
-        model: The trajectory prediction model
-        loader: DataLoader for the test set
-        device: Device to run on
-        enable_multimodal: Whether model uses multimodal prediction
-        per_town_metrics: Whether to compute per-town breakdown
-    
+
     Returns:
-        Tuple of (overall_metrics, per_town_metrics_dict)
+        (overall_metrics dict, per_town_metrics dict)
     """
     model.eval()
-    
-    # Accumulators for overall metrics
-    total_metrics = {"minADE": 0.0, "minFDE": 0.0, "MissRate": 0.0}
+
+    total_metrics: Dict[str, float] = {"minADE": 0.0, "minFDE": 0.0, "MissRate": 0.0}
     total_batches = 0
-    
-    # Accumulators for per-town metrics
-    town_metrics = defaultdict(lambda: {"minADE": 0.0, "minFDE": 0.0, "MissRate": 0.0, "count": 0})
-    
+
+    town_metrics: Dict[str, Dict] = defaultdict(
+        lambda: {"minADE": 0.0, "minFDE": 0.0, "MissRate": 0.0, "count": 0}
+    )
+
     with torch.no_grad():
         for raw_batch in loader:
             batch = move_batch_to_device(raw_batch, device)
-            
-            # Run inference
+
             pred = model(
-                x=batch["x"],  # type: ignore[arg-type]
-                adj=batch["adj"],  # type: ignore[arg-type]
-                x_mask=batch["x_mask"],  # type: ignore[arg-type]
+                x=batch["x"],            # type: ignore[arg-type]
+                adj=batch["adj"],         # type: ignore[arg-type]
+                x_mask=batch["x_mask"],   # type: ignore[arg-type]
                 agent_mask=batch["agent_mask"],  # type: ignore[arg-type]
             )
-            
-            # Compute metrics
+
             if enable_multimodal:
                 metrics = compute_multimodal_metrics(
                     pred=pred,
-                    target=batch["y"],  # type: ignore[arg-type]
-                    y_mask=batch["y_mask"],  # type: ignore[arg-type]
+                    target=batch["y"],        # type: ignore[arg-type]
+                    y_mask=batch["y_mask"],   # type: ignore[arg-type]
                     agent_mask=batch["agent_mask"],  # type: ignore[arg-type]
                 )
             else:
-                # For unimodal, use standard ADE/FDE and compute MissRate
+                # Unimodal: use masked_ade_fde + compute MissRate
                 ade, fde = masked_ade_fde(
                     pred=pred,
-                    target=batch["y"],  # type: ignore[arg-type]
-                    y_mask=batch["y_mask"],  # type: ignore[arg-type]
+                    target=batch["y"],        # type: ignore[arg-type]
+                    y_mask=batch["y_mask"],   # type: ignore[arg-type]
                     agent_mask=batch["agent_mask"],  # type: ignore[arg-type]
                 )
-                # Compute MissRate for unimodal
-                agent_mask_bool = batch["agent_mask"]  # type: ignore[assignment]
-                y_mask_bool = batch["y_mask"]  # type: ignore[assignment]
-                valid = y_mask_bool & agent_mask_bool.unsqueeze(-1)  # type: ignore[union-attr]
-                final_valid = valid[..., -1]
-                displacement = torch.linalg.norm(pred - batch["y"], dim=-1)  # type: ignore[arg-type]
-                final_displacement = displacement[..., -1]
-                miss_mask = (final_displacement > 2.0) & final_valid
-                miss_rate = miss_mask.to(dtype=pred.dtype).sum() / final_valid.to(dtype=pred.dtype).sum().clamp_min(1.0)
-                
+
+                # MissRate: last-valid FDE > 2.0 m per agent
+                y_mask_bool: torch.Tensor = batch["y_mask"]      # type: ignore[assignment]
+                agent_mask_bool: torch.Tensor = batch["agent_mask"]  # type: ignore[assignment]
+
+                displacement = torch.linalg.norm(
+                    pred - batch["y"], dim=-1  # type: ignore[arg-type]
+                )  # [B, N, T]
+
+                # BUG FIX B5: last *valid* timestep, not always index -1
+                final_disp = _last_valid_displacement(
+                    displacement, y_mask_bool, agent_mask_bool
+                )  # [B, N]
+
+                # Gate on: agent is valid AND last step is valid
+                last_valid = (y_mask_bool & agent_mask_bool.unsqueeze(-1))[..., -1]  # [B, N]
+                miss_mask = (final_disp > 2.0) & last_valid
+                denom = last_valid.to(dtype=pred.dtype).sum().clamp_min(1.0)
+                miss_rate = miss_mask.to(dtype=pred.dtype).sum() / denom
+
                 metrics = {
                     "minADE": ade,
                     "minFDE": fde,
-                    "MissRate": float(miss_rate.detach().cpu().item()),
+                    "MissRate": float(miss_rate.detach().cpu()),
                 }
-            
-            # Accumulate overall metrics
+
             for key, value in metrics.items():
-                total_metrics[key] += value
+                total_metrics[key] += float(value)
             total_batches += 1
-            
-            # Accumulate per-town metrics if requested
+
+            # Per-town accumulation
             if per_town_metrics and "towns" in raw_batch:
                 towns = raw_batch["towns"]  # type: ignore[index]
-                if isinstance(towns, (list, tuple)):
-                    # Batch may contain multiple towns
-                    for town in set(towns):
-                        for key, value in metrics.items():
-                            town_metrics[town][key] += value
-                        town_metrics[town]["count"] += 1
-                else:
-                    # Single town for entire batch
-                    town = str(towns)
+                unique_towns = set(towns) if isinstance(towns, (list, tuple)) else {str(towns)}
+                for town in unique_towns:
                     for key, value in metrics.items():
-                        town_metrics[town][key] += value
-                    town_metrics[town]["count"] += 1
-    
-    # Compute average overall metrics
+                        town_metrics[str(town)][key] += float(value)
+                    town_metrics[str(town)]["count"] += 1
+
     denom = max(1, total_batches)
-    overall_metrics = {key: value / denom for key, value in total_metrics.items()}
-    
-    # Compute average per-town metrics
-    per_town_results = {}
-    for town, town_data in town_metrics.items():
-        count = max(1, town_data["count"])
-        per_town_results[town] = {
-            "minADE": town_data["minADE"] / count,
-            "minFDE": town_data["minFDE"] / count,
-            "MissRate": town_data["MissRate"] / count,
-            "num_batches": town_data["count"],
+    overall_result = {k: v / denom for k, v in total_metrics.items()}
+
+    per_town_result: Dict[str, dict] = {}
+    for town, tdata in town_metrics.items():
+        cnt = max(1, tdata["count"])
+        per_town_result[town] = {
+            "minADE": tdata["minADE"] / cnt,
+            "minFDE": tdata["minFDE"] / cnt,
+            "MissRate": tdata["MissRate"] / cnt,
+            "num_batches": tdata["count"],
         }
-    
-    return overall_metrics, per_town_results
+
+    return overall_result, per_town_result
 
 
 def measure_inference_latency(
@@ -307,151 +357,159 @@ def measure_inference_latency(
     device: torch.device,
     num_samples: int = 100,
 ) -> float:
-    """Measure inference latency in milliseconds per sample.
-    
+    """Measure average inference latency in milliseconds **per sample**.
+
+    BUG FIX B4: The original implementation timed a full batch and reported
+    that as "ms/sample". We now divide by the actual batch size so the number
+    is comparable across different --batch-size settings and matches the
+    real-time budget (one sample = one scene at one timestep).
+
     Args:
-        model: The trajectory prediction model
-        loader: DataLoader for the dataset
-        device: Device to run on
-        num_samples: Number of samples to measure
-    
+        num_samples: Number of *batches* to time (same as before — the arg
+                     name kept for CLI compatibility).
+
     Returns:
-        Average inference latency in milliseconds per sample
+        Mean latency in milliseconds per **sample** (not per batch).
     """
     model.eval()
-    latencies = []
-    
+    latencies_ms: List[float] = []
+
     with torch.no_grad():
         for batch_idx, raw_batch in enumerate(loader):
             if batch_idx >= num_samples:
                 break
-            
+
             batch = move_batch_to_device(raw_batch, device)
-            
-            # Warm-up for GPU
+            actual_batch_size: int = batch["x"].shape[0]  # type: ignore[union-attr]
+
+            # GPU warm-up on first batch
             if device.type == "cuda" and batch_idx == 0:
                 for _ in range(5):
-                    _ = model(
-                        x=batch["x"],  # type: ignore[arg-type]
-                        adj=batch["adj"],  # type: ignore[arg-type]
+                    model(
+                        x=batch["x"],          # type: ignore[arg-type]
+                        adj=batch["adj"],       # type: ignore[arg-type]
                         x_mask=batch["x_mask"],  # type: ignore[arg-type]
                         agent_mask=batch["agent_mask"],  # type: ignore[arg-type]
                     )
                 torch.cuda.synchronize()
-            
-            # Measure inference time
-            start_time = time.perf_counter()
-            _ = model(
-                x=batch["x"],  # type: ignore[arg-type]
-                adj=batch["adj"],  # type: ignore[arg-type]
+
+            start = time.perf_counter()
+            model(
+                x=batch["x"],          # type: ignore[arg-type]
+                adj=batch["adj"],       # type: ignore[arg-type]
                 x_mask=batch["x_mask"],  # type: ignore[arg-type]
                 agent_mask=batch["agent_mask"],  # type: ignore[arg-type]
             )
             if device.type == "cuda":
                 torch.cuda.synchronize()
-            end_time = time.perf_counter()
-            
-            latency_ms = (end_time - start_time) * 1000.0
-            latencies.append(latency_ms)
-    
-    return sum(latencies) / len(latencies) if latencies else 0.0
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+            # BUG FIX B4: divide by batch size → per-sample latency
+            latencies_ms.append(elapsed_ms / max(1, actual_batch_size))
+
+    return sum(latencies_ms) / len(latencies_ms) if latencies_ms else 0.0
 
 
-def load_checkpoint(checkpoint_path: Path, device: torch.device) -> tuple[MultiAgentTrajectoryPredictor, dict]:
-    """Load model checkpoint and return model and metadata.
-    
-    Args:
-        checkpoint_path: Path to checkpoint file
-        device: Device to load model on
-    
+def load_checkpoint(
+    checkpoint_path: Path,
+    device: torch.device,
+) -> tuple[MultiAgentTrajectoryPredictor, dict]:
+    """Load model checkpoint.
+
+    BUG FIX B1: All advanced GTNet fields (enable_gat, enable_multimodal,
+    enable_adaptive_radius, num_modes, num_attention_heads) are read via
+    getattr() with safe defaults.  Baseline checkpoints produced by
+    train_multi_agent_trajectory.py use the plain MultiAgentModelConfig that
+    does NOT contain these fields, so direct attribute access crashed.
+
     Returns:
-        Tuple of (model, checkpoint_dict)
+        (model, checkpoint_dict)
     """
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Extract model configuration
-    if "model_config" in checkpoint:
-        config_dict = checkpoint["model_config"]
-        model_config = MultiAgentModelConfig(**config_dict)
-    else:
+
+    if "model_config" not in checkpoint:
         raise ValueError("Checkpoint missing 'model_config' field")
-    
-    # Create model and load weights
+
+    config_dict = checkpoint["model_config"]
+    model_config = MultiAgentModelConfig(**config_dict)
+
     model = MultiAgentTrajectoryPredictor(model_config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    
-    print(f"Model configuration:")
-    print(f"  enable_gat: {model_config.enable_gat}")
-    print(f"  enable_multimodal: {model_config.enable_multimodal}")
-    print(f"  enable_adaptive_radius: {model_config.enable_adaptive_radius}")
-    print(f"  hidden_dim: {model_config.hidden_dim}")
-    print(f"  num_modes: {model_config.num_modes}")
-    
+
+    # BUG FIX B1: use getattr for optional GTNet-extended fields
+    print("Model configuration:")
+    print(f"  hidden_dim:              {model_config.hidden_dim}")
+    print(f"  graph_layers:            {getattr(model_config, 'graph_layers', '?')}")
+    print(f"  future_steps:            {getattr(model_config, 'future_steps', '?')}")
+    print(f"  enable_gat:              {getattr(model_config, 'enable_gat', False)}")
+    print(f"  enable_multimodal:       {getattr(model_config, 'enable_multimodal', False)}")
+    print(f"  enable_adaptive_radius:  {getattr(model_config, 'enable_adaptive_radius', False)}")
+    print(f"  num_modes:               {getattr(model_config, 'num_modes', 1)}")
+    print(f"  num_attention_heads:     {getattr(model_config, 'num_attention_heads', 1)}")
+
     return model, checkpoint
 
 
 def main() -> int:
-    """Main function to run validation."""
     args = parse_args()
-    
-    # Resolve paths and device
+
     checkpoint_path = Path(args.checkpoint).resolve()
     if not checkpoint_path.exists():
         print(f"Error: Checkpoint not found: {checkpoint_path}")
         return 1
-    
-    data_dirs = [Path(path).resolve() for path in args.data_dir]
+
+    data_dirs = [Path(p).resolve() for p in args.data_dir]
     out_file = Path(args.out_file).resolve()
     device = resolve_device(str(args.device))
-    
-    print("="*80)
+
+    print("=" * 80)
     print("GTNet Target Metrics Validation")
-    print("="*80)
-    print(f"Checkpoint: {checkpoint_path}")
+    print("=" * 80)
+    print(f"Checkpoint:       {checkpoint_path}")
     print(f"Data directories: {len(data_dirs)}")
-    for data_dir in data_dirs:
-        print(f"  - {data_dir}")
-    print(f"Output file: {out_file}")
-    print(f"Device: {device}")
-    print(f"Test ratio: {args.test_ratio}")
-    print(f"Batch size: {args.batch_size}")
+    for d in data_dirs:
+        print(f"  - {d}")
+    print(f"Output file:      {out_file}")
+    print(f"Device:           {device}")
+    print(f"Test ratio:       {args.test_ratio}")
+    print(f"Batch size:       {args.batch_size}")
     print()
-    
-    # Load model
+
+    # Load model ---------------------------------------------------------------
     model, checkpoint = load_checkpoint(checkpoint_path, device)
     model_config = model.config
-    enable_multimodal = model_config.enable_multimodal
-    
-    # Load datasets and create test split
+
+    # BUG FIX B3: safe reads for all optional fields
+    enable_multimodal: bool = getattr(model_config, "enable_multimodal", False)
+
+    # Load data ----------------------------------------------------------------
     print("Loading datasets...")
-    loaded_datasets = [MultiAgentTrajectoryDataset(data_dir) for data_dir in data_dirs]
-    sample_paths = [path for dataset in loaded_datasets for path in dataset.sample_paths]
-    
+    loaded_datasets = [MultiAgentTrajectoryDataset(d) for d in data_dirs]
+    sample_paths = [p for ds in loaded_datasets for p in ds.sample_paths]
+
     if not sample_paths:
         print("Error: No samples found in datasets")
         return 1
-    
+
     print(f"Total samples: {len(sample_paths)}")
-    
-    # Split into train/test (we only use test set)
+
     train_paths, test_paths = split_sample_paths(
         sample_paths,
         train_ratio=1.0 - float(args.test_ratio),
         seed=int(args.seed),
     )
-    
+
     if not test_paths:
         print("Error: No test samples after split")
         return 1
-    
-    print(f"Test samples: {len(test_paths)}")
-    
-    # Create test dataset and loader
+
+    print(f"Test samples:  {len(test_paths)}")
+
     dataset_root = data_dirs[0]
     test_dataset = MultiAgentTrajectoryDataset(dataset_root, sample_files=test_paths)
-    
+
     loader_kwargs = {
         "batch_size": max(1, int(args.batch_size)),
         "num_workers": max(0, int(args.num_workers)),
@@ -459,166 +517,130 @@ def main() -> int:
         "collate_fn": collate_multi_agent_trajectory,
     }
     test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
-    
-    # Evaluate model on test set
+
+    # Evaluate -----------------------------------------------------------------
     print("\nEvaluating model on test set...")
-    overall_metrics, per_town_metrics = evaluate_model(
+    overall_metrics, per_town_result = evaluate_model(
         model=model,
         loader=test_loader,
         device=device,
         enable_multimodal=enable_multimodal,
         per_town_metrics=True,
     )
-    
+
     print("\nOverall Test Metrics:")
-    print(f"  minADE: {overall_metrics['minADE']:.4f} meters")
-    print(f"  minFDE: {overall_metrics['minFDE']:.4f} meters")
+    print(f"  minADE:   {overall_metrics['minADE']:.4f} m")
+    print(f"  minFDE:   {overall_metrics['minFDE']:.4f} m")
     print(f"  MissRate: {overall_metrics['MissRate']:.4f}")
-    
-    if per_town_metrics:
+
+    if per_town_result:
         print("\nPer-Town Metrics:")
-        for town in sorted(per_town_metrics.keys()):
-            town_data = per_town_metrics[town]
-            print(f"  {town}:")
-            print(f"    minADE: {town_data['minADE']:.4f} meters")
-            print(f"    minFDE: {town_data['minFDE']:.4f} meters")
-            print(f"    MissRate: {town_data['MissRate']:.4f}")
-            print(f"    num_batches: {town_data['num_batches']}")
-    
-    # Measure inference latency
-    print(f"\nMeasuring inference latency ({args.latency_samples} samples)...")
-    
-    # Measure on current device
+        for town in sorted(per_town_result.keys()):
+            td = per_town_result[town]
+            print(f"  {town}: minADE={td['minADE']:.4f} m  "
+                  f"minFDE={td['minFDE']:.4f} m  "
+                  f"MissRate={td['MissRate']:.4f}  "
+                  f"batches={td['num_batches']}")
+
+    # Latency ------------------------------------------------------------------
+    print(f"\nMeasuring inference latency ({args.latency_samples} batches)...")
     latency_ms = measure_inference_latency(
         model=model,
         loader=test_loader,
         device=device,
         num_samples=int(args.latency_samples),
     )
-    
-    latency_results = {
-        str(device.type): latency_ms
-    }
-    
-    print(f"  {device.type.upper()} latency: {latency_ms:.2f} ms/sample")
-    
-    # Measure on CPU if we're currently on GPU
+    latency_results = {str(device.type): latency_ms}
+    print(f"  {device.type.upper()} latency: {latency_ms:.3f} ms/sample")
+
     if device.type == "cuda":
         print("  Measuring CPU latency...")
         cpu_device = torch.device("cpu")
-        model_cpu = model.to(cpu_device)
-        
-        # Create CPU loader
-        cpu_loader_kwargs = dict(loader_kwargs)
-        cpu_loader_kwargs["pin_memory"] = False
+        cpu_model = model.to(cpu_device)
+        cpu_loader_kwargs = {**loader_kwargs, "pin_memory": False}
         cpu_loader = DataLoader(test_dataset, shuffle=False, **cpu_loader_kwargs)
-        
         cpu_latency_ms = measure_inference_latency(
-            model=model_cpu,
-            loader=cpu_loader,
-            device=cpu_device,
+            model=cpu_model, loader=cpu_loader, device=cpu_device,
             num_samples=int(args.latency_samples),
         )
-        
         latency_results["cpu"] = cpu_latency_ms
-        print(f"  CPU latency: {cpu_latency_ms:.2f} ms/sample")
-        
-        # Move model back to GPU
-        model = model.to(device)
-    
-    # Define target metrics
-    target_minADE = 1.5
-    target_minFDE = 2.7
-    target_MissRate = 0.20
-    target_latency_ms = 25.0
-    
-    # Check if targets are met
-    print("\n" + "="*80)
+        print(f"  CPU latency: {cpu_latency_ms:.3f} ms/sample")
+        model = cpu_model.to(device)
+
+    # Target check -------------------------------------------------------------
+    TARGET_MIN_ADE    = 1.5
+    TARGET_MIN_FDE    = 2.7
+    TARGET_MISS_RATE  = 0.20
+    TARGET_LATENCY_MS = 25.0
+
+    print("\n" + "=" * 80)
     print("Target Metrics Verification")
-    print("="*80)
-    
-    targets_met = True
-    
-    # Check minADE
-    minADE_met = overall_metrics["minADE"] < target_minADE
-    status_ade = "✓ PASS" if minADE_met else "✗ FAIL"
-    print(f"minADE: {overall_metrics['minADE']:.4f} < {target_minADE:.4f} ... {status_ade}")
-    targets_met = targets_met and minADE_met
-    
-    # Check minFDE
-    minFDE_met = overall_metrics["minFDE"] < target_minFDE
-    status_fde = "✓ PASS" if minFDE_met else "✗ FAIL"
-    print(f"minFDE: {overall_metrics['minFDE']:.4f} < {target_minFDE:.4f} ... {status_fde}")
-    targets_met = targets_met and minFDE_met
-    
-    # Check MissRate
-    MissRate_met = overall_metrics["MissRate"] < target_MissRate
-    status_miss = "✓ PASS" if MissRate_met else "✗ FAIL"
-    print(f"MissRate: {overall_metrics['MissRate']:.4f} < {target_MissRate:.4f} ... {status_miss}")
-    targets_met = targets_met and MissRate_met
-    
-    # Check inference latency (use GPU latency if available, else CPU)
-    primary_latency = latency_results.get("cuda", latency_results.get("cpu", 0.0))
-    latency_met = primary_latency < target_latency_ms
-    status_latency = "✓ PASS" if latency_met else "✗ FAIL"
-    print(f"Inference Latency: {primary_latency:.2f} < {target_latency_ms:.2f} ms ... {status_latency}")
-    targets_met = targets_met and latency_met
-    
-    print("="*80)
-    
-    if targets_met:
-        print("\n✓ All target metrics achieved!")
-    else:
-        print("\n✗ Some target metrics not achieved")
-    
-    # Generate validation report
+    print("=" * 80)
+
+    minADE_met   = overall_metrics["minADE"]   < TARGET_MIN_ADE
+    minFDE_met   = overall_metrics["minFDE"]   < TARGET_MIN_FDE
+    missRate_met = overall_metrics["MissRate"] < TARGET_MISS_RATE
+    primary_lat  = latency_results.get("cuda", latency_results.get("cpu", 0.0))
+    latency_met  = primary_lat < TARGET_LATENCY_MS
+    targets_met  = minADE_met and minFDE_met and missRate_met and latency_met
+
+    print(f"minADE:    {overall_metrics['minADE']:.4f} < {TARGET_MIN_ADE:.4f} m  "
+          f"{'✓ PASS' if minADE_met else '✗ FAIL'}")
+    print(f"minFDE:    {overall_metrics['minFDE']:.4f} < {TARGET_MIN_FDE:.4f} m  "
+          f"{'✓ PASS' if minFDE_met else '✗ FAIL'}")
+    print(f"MissRate:  {overall_metrics['MissRate']:.4f} < {TARGET_MISS_RATE:.4f}     "
+          f"{'✓ PASS' if missRate_met else '✗ FAIL'}")
+    print(f"Latency:   {primary_lat:.3f} < {TARGET_LATENCY_MS:.1f} ms/sample  "
+          f"{'✓ PASS' if latency_met else '✗ FAIL'}")
+    print("=" * 80)
+    print("\n✓ All target metrics achieved!" if targets_met
+          else "\n✗ Some target metrics not achieved")
+
+    # Report -------------------------------------------------------------------
+    # BUG FIX B2: all optional model_config fields use getattr
     validation_report = {
         "checkpoint": str(checkpoint_path),
         "data_dirs": [str(d) for d in data_dirs],
         "test_samples": len(test_paths),
         "device": str(device),
         "model_config": {
-            "enable_gat": model_config.enable_gat,
-            "enable_multimodal": model_config.enable_multimodal,
-            "enable_adaptive_radius": model_config.enable_adaptive_radius,
-            "hidden_dim": model_config.hidden_dim,
-            "num_modes": model_config.num_modes,
-            "num_attention_heads": model_config.num_attention_heads,
+            "hidden_dim":              model_config.hidden_dim,
+            "graph_layers":            getattr(model_config, "graph_layers", None),
+            "future_steps":            getattr(model_config, "future_steps", None),
+            "enable_gat":              getattr(model_config, "enable_gat", False),
+            "enable_multimodal":       getattr(model_config, "enable_multimodal", False),
+            "enable_adaptive_radius":  getattr(model_config, "enable_adaptive_radius", False),
+            "num_modes":               getattr(model_config, "num_modes", 1),
+            "num_attention_heads":     getattr(model_config, "num_attention_heads", 1),
         },
-        "overall_metrics": {
-            "minADE": overall_metrics["minADE"],
-            "minFDE": overall_metrics["minFDE"],
-            "MissRate": overall_metrics["MissRate"],
-        },
-        "per_town_metrics": per_town_metrics,
-        "inference_latency_ms": latency_results,
+        "overall_metrics": overall_metrics,
+        "per_town_metrics": per_town_result,
+        "inference_latency_ms_per_sample": latency_results,
         "target_metrics": {
-            "minADE": target_minADE,
-            "minFDE": target_minFDE,
-            "MissRate": target_MissRate,
-            "inference_latency_ms": target_latency_ms,
+            "minADE_m": TARGET_MIN_ADE,
+            "minFDE_m": TARGET_MIN_FDE,
+            "MissRate": TARGET_MISS_RATE,
+            "latency_ms_per_sample": TARGET_LATENCY_MS,
         },
         "targets_met": {
-            "minADE": minADE_met,
-            "minFDE": minFDE_met,
-            "MissRate": MissRate_met,
+            "minADE":               minADE_met,
+            "minFDE":               minFDE_met,
+            "MissRate":             missRate_met,
             "inference_latency_ms": latency_met,
-            "all": targets_met,
+            "all":                  targets_met,
         },
     }
-    
-    # Save validation report
+
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(validation_report, f, indent=2)
-    
+    with open(out_file, "w", encoding="utf-8") as fh:
+        json.dump(validation_report, fh, indent=2)
+
     print(f"\n[OK] Validation report saved to: {out_file}")
-    
-    # Exit with error code if targets not met
+
     if not targets_met:
         print("\n[ERROR] Target metrics not achieved. Exiting with error code 1.")
         return 1
-    
+
     return 0
 
 

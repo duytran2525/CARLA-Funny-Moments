@@ -4,7 +4,9 @@
   tm_port: 8000
   timeout: 60.0
   sync: true
-  fixed_delta: 0.033333
+  # 20 FPS CARLA runtime. GTNet below still samples history at expected_dt=0.1
+  # so the current 10 Hz checkpoint sees the same 2s history distribution.
+  fixed_delta: 0.05
   no_rendering: false
 
   map: "Town03"
@@ -34,7 +36,7 @@ weather:
   preset: "ClearNoon"
 
 cil:
-  target_speed_kmh: 50
+  target_speed_kmh: 30
   max_throttle: 0.8
   max_brake: 0.80
   steer_smoothing: 0.85
@@ -66,7 +68,7 @@ yolo:
   # - agent=yolo_detect: bật/tắt màn hình debug YOLO.
   # - agent=cil_yolo: bật/tắt cửa sổ "CARLA CIL + YOLO" lúc khởi động; khi đang chạy bấm phím 'y' để bật/tắt lại.
   # false = không mở cửa sổ, tiết kiệm FPS (CLI: --no-yolo-visualize).
-  debug_window: true
+  debug_window: false
   # Khi debug_window=true:
   # true  = vẽ box, HUD, corridor như giao diện debug cũ.
   # false = chỉ hiện raw camera feed.
@@ -74,34 +76,53 @@ yolo:
   # Chỉ ẩn 2 vùng ROI đèn đỏ trên màn hình debug; logic dừng đèn đỏ vẫn giữ nguyên.
   show_red_light_rois: false
 
+gtnet:
+  # GTNet dùng như safety supervisor cho cil/cil_yolo.
+  # Model này không thay CIL waypoint model; nó dự đoán quỹ đạo NPC và chỉ override phanh.
+  enabled: true
+  # BUG FIX: gtnet_full_best.pt được train ở 20fps (dt=0.05) với history=40, future=60.
+  # Phải dùng expected_dt=0.05 và history_frames=40 để khớp với training data.
+  model_path: "models/gtnet_full_best.pt"
+  history_frames: 40
+  expected_dt: 0.05
+  # gtnet_full_best.pt được train với adaptive-radius dataset.
+  # Dùng "checkpoint" để tự động dùng adaptive adjacency từ checkpoint config.
+  adjacency_mode: "checkpoint"
+  fixed_adjacency_radius_m: 100.0
+  max_actor_distance_m: 100.0
+  # 20 FPS runtime, expected_dt=0.05 => stride=1, infer every 2 ticks.
+  inference_every_n_ticks: 2
+  # Vẽ quỹ đạo threat trong CARLA world debug; bật khi cần kiểm tra trực quan.
+  draw_debug: true
+
 traffic_spawn:
   # Giảm vehicle_count / pedestrian_count nếu FPS CARLA thấp (thường là bottleneck lớn hơn OpenCV).
-  vehicle_count: 15
-  bike_count: 5
-  motorbike_count: 5
-  pedestrian_count: 5
+  vehicle_count: 30
+  bike_count: 20
+  motorbike_count: 20
+  pedestrian_count: 20
   npc_enable_autopilot: true
 
 recording:
   enabled: false
   output_path: "outputs/2min_2.mp4"
-  fps: 30.0
+  fps: 20.0
   duration_sec: 600
   codec: "mp4v"
 
 runtime:
   ticks: 0
-  tick_interval: 0.033333
-  fps_log_interval_ticks: 30
+  tick_interval: 0.05
+  fps_log_interval_ticks: 20
   cil_enable_hud: false
   cil_enable_route_map: false
   # --- OpenCV khi agent=cil_yolo (hai cửa sổ độc lập) ---
   # 1) YOLO: bật/tắt lúc start qua yolo.debug_window; khi chạy bấm 'y' (xem comment ở khối yolo:).
   # 2) Route map: cửa sổ "CIL Route Map", tách khỏi vẽ route trong world (cil_enable_route_map).
   #    Bật/tắt lúc start: cil_opencv_route_map. Khi chạy: phím 'r'.
-  cil_opencv_route_map: false
+  cil_opencv_route_map: true
   # Vẽ waypoint dự đoán trong world (debug CARLA). Tắt để bớt RPC debug → FPS ổn định hơn.
-  cil_world_waypoint_debug: false
+  cil_world_waypoint_debug: true
   cil_enable_telemetry_csv: false
   cil_profile_tick_timing: false
   cil_profile_log_interval_ticks: 60
