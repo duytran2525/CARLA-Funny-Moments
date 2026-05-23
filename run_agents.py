@@ -82,6 +82,13 @@ except Exception as exc:
     TrafficSupervisor = None
 
 try:
+    from core_control.gtnet_supervisor import GTNetSupervisor, GTNetSupervisorConfig
+except Exception as exc:
+    logging.warning("Failed to import GTNetSupervisor: %s", exc)
+    GTNetSupervisor = None
+    GTNetSupervisorConfig = None
+
+try:
     from core_control.pure_pursuit import PurePursuitController
 except Exception as exc:
     logging.warning("Failed to import PurePursuitController: %s", exc)
@@ -782,6 +789,15 @@ class RunConfig:
     yolo_inference_imgsz: int
     yolo_tracker_config: str
     yolo_secondary_tracker_config: str
+    gtnet_enabled: bool
+    gtnet_model_path: str
+    gtnet_inference_every_n_ticks: int
+    gtnet_draw_debug: bool
+    gtnet_history_frames: int
+    gtnet_expected_dt: float
+    gtnet_adjacency_mode: str
+    gtnet_fixed_adjacency_radius_m: float
+    gtnet_max_actor_distance_m: float
     cil_command_prep_time_s: float
     cil_command_trigger_min_m: float
     cil_command_trigger_max_m: float
@@ -2405,6 +2421,8 @@ class CILAgent(BaseAgent):
         self._cached_yolo_emergency = False
         self._cached_yolo_debug_info: Dict[str, Any] = {}
         self._cached_yolo_annotated_frame = None
+        self._gtnet_supervisor = None
+        self._last_gtnet_debug_info: Dict[str, Any] = {}
         self._yolo_window_name = "CARLA CIL + YOLO"
         self._collector: Optional[DataCollector] = None
         self._data_cameras = []
@@ -2503,6 +2521,7 @@ class CILAgent(BaseAgent):
         self._camera.listen(self._on_camera_frame)
         if self._cil_yolo_enabled:
             self._init_cil_yolo_fusion()
+        self._init_gtnet_supervisor()
         self._init_navigation_agent(world, vehicle)
         self._command_oracle.reset()
 
@@ -2566,6 +2585,8 @@ class CILAgent(BaseAgent):
                 "steer",
                 "throttle",
                 "brake",
+                "gtnet_brake",
+                "gtnet_reason",
             ]
         )
         self._telemetry_fp.flush()
@@ -2623,10 +2644,65 @@ class CILAgent(BaseAgent):
             bool(self.config.yolo_draw_overlay),
         )
 
+    def _init_gtnet_supervisor(self) -> None:
+        self._gtnet_supervisor = None
+        self._last_gtnet_debug_info = {}
+        if GTNetSupervisor is None or GTNetSupervisorConfig is None:
+            logging.warning("GTNet supervisor unavailable; CIL/CIL+YOLO will run without trajectory prediction.")
+            return
+        if torch is None or np is None:
+            logging.warning("GTNet supervisor requires torch and numpy; disabled.")
+            return
+
+        model_path = Path(self.config.gtnet_model_path)
+        if not model_path.is_absolute():
+            model_path = Path(__file__).resolve().parent / model_path
+        if not model_path.exists():
+            logging.warning("GTNet model file not found: %s. GTNet supervisor disabled.", model_path)
+            return
+
+        try:
+            cfg = GTNetSupervisorConfig(
+                model_path=str(model_path),
+                enabled=True,
+                inference_every_n_ticks=max(1, int(self.config.gtnet_inference_every_n_ticks)),
+                history_frames=max(1, int(self.config.gtnet_history_frames)),
+                expected_dt=float(self.config.gtnet_expected_dt),
+                fixed_delta=float(self.config.fixed_delta),
+                max_actor_distance_m=float(self.config.gtnet_max_actor_distance_m),
+                adjacency_mode=str(self.config.gtnet_adjacency_mode),
+                fixed_adjacency_radius_m=float(self.config.gtnet_fixed_adjacency_radius_m),
+                draw_debug=bool(self.config.gtnet_draw_debug),
+            )
+            # Always load the model and log it — the user can verify the
+            # checkpoint is valid and see its metadata regardless of enabled flag.
+            loaded_supervisor = GTNetSupervisor(cfg, device=self.config.model_device)
+        except Exception as exc:
+            self._gtnet_supervisor = None
+            logging.warning("Failed to initialize GTNet supervisor: %s", exc)
+            return
+
+        if bool(self.config.gtnet_enabled):
+            # enabled=true in YAML (or --enable-gtnet CLI) → supervisor is ACTIVE.
+            self._gtnet_supervisor = loaded_supervisor
+            logging.info(
+                "GTNet supervisor ACTIVE: model=%s enabled=true "
+                "(will override braking when trajectory conflicts are detected)",
+                model_path,
+            )
+        else:
+            # enabled=false in YAML → model loaded (log visible) but supervisor
+            # does NOT override vehicle control.  Flip to true in config to activate.
+            self._gtnet_supervisor = None
+            logging.info(
+                "GTNet supervisor LOADED but INACTIVE: model=%s enabled=false in config. "
+                "Set gtnet.enabled=true in carla_env.yaml to activate.",
+                model_path,
+            )
+
     def _annotate_cil_yolo_frame(
         self,
         frame_bgr: Any,
-        detections: list[Dict[str, Any]],
         debug_info: Dict[str, Any],
         sup_debug: Dict[str, Any],
         speed_kmh: float,
@@ -3512,6 +3588,36 @@ class CILAgent(BaseAgent):
         self._route_planner.update_route_history(location)
         self._route_history_xy = list(self._route_planner.route_history_xy)
 
+    def _collect_route_draw_locations(self, fallback_route_locations: list[Any]) -> list[Any]:
+        """Return the full S->D route for visualization, falling back to planner-local points."""
+        draw_locations: list[Any] = []
+
+        if self._reference_route_plan:
+            draw_locations = self._route_planner.collect_reference_route_locations(
+                self._reference_route_plan,
+                max_points=4096,
+                anchor_location=None,
+            )
+
+        if not draw_locations:
+            draw_locations = list(fallback_route_locations or [])
+
+        if draw_locations:
+            if (
+                self._route_start_location is not None
+                and self._xy_distance(draw_locations[0], self._route_start_location) > 0.75
+            ):
+                draw_locations.insert(0, self._route_start_location)
+            if (
+                self._route_destination_location is not None
+                and self._xy_distance(draw_locations[-1], self._route_destination_location) > 0.75
+            ):
+                draw_locations.append(self._route_destination_location)
+        elif self._route_start_location is not None and self._route_destination_location is not None:
+            draw_locations = [self._route_start_location, self._route_destination_location]
+
+        return draw_locations
+
     @staticmethod
     def _overlay_xy(value: Optional[Any]) -> Optional[tuple[float, float]]:
         if value is None:
@@ -4213,29 +4319,27 @@ class CILAgent(BaseAgent):
     ) -> float:
         if np is None:
             return float(min_speed)
-        if waypoints_2d is None or len(waypoints_2d) < 5:
+        if waypoints_2d is None or len(waypoints_2d) < 3:
             return float(min_speed)
 
-        p1 = waypoints_2d[0]
-        p2 = waypoints_2d[2]
-        p3 = waypoints_2d[4]
+        # Measure max turning angle across consecutive segments
+        n = len(waypoints_2d)
+        max_angle_deg = 0.0
+        for i in range(n - 2):
+            v1 = waypoints_2d[i + 1] - waypoints_2d[i]
+            v2 = waypoints_2d[i + 2] - waypoints_2d[i + 1]
+            n1 = float(np.linalg.norm(v1))
+            n2 = float(np.linalg.norm(v2))
+            if n1 < 1e-4 or n2 < 1e-4:
+                continue
+            cos_theta = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
+            angle = float(np.degrees(np.arccos(cos_theta)))
+            max_angle_deg = max(max_angle_deg, angle)
 
-        v1 = p2 - p1
-        v2 = p3 - p2
-
-        norm_v1 = float(np.linalg.norm(v1))
-        norm_v2 = float(np.linalg.norm(v2))
-
-        if norm_v1 < 1e-4 or norm_v2 < 1e-4:
-            return float(min_speed)
-
-        cos_theta = float(np.clip(np.dot(v1, v2) / (norm_v1 * norm_v2), -1.0, 1.0))
-        angle_deg = float(np.degrees(np.arccos(cos_theta)))
-
-        if angle_deg > 35.0:
+        if max_angle_deg > 25.0:
             target_speed = float(min_speed)
         else:
-            speed_drop = (angle_deg / 35.0) * (float(max_speed) - float(min_speed))
+            speed_drop = (max_angle_deg / 25.0) * (float(max_speed) - float(min_speed))
             target_speed = float(max_speed) - float(speed_drop)
 
         return float(np.clip(target_speed, float(min_speed), float(max_speed)))
@@ -4417,7 +4521,7 @@ class CILAgent(BaseAgent):
             dy = float(loc.y - origin.y)
             ego_x = cos_yaw * dx + sin_yaw * dy
             ego_y = -sin_yaw * dx + cos_yaw * dy
-            if ego_x <= 0.5:
+            if ego_x <= 0.0:
                 continue
             ego_points.append((ego_x, ego_y))
             if len(ego_points) >= max_points:
@@ -4832,6 +4936,7 @@ class CILAgent(BaseAgent):
                 self._nav_agent,
                 anchor_location=vehicle_location,
             )
+        route_draw_locations = self._collect_route_draw_locations(route_locations)
 
         command, command_debug = self._update_distance_based_command(
             speed_kmh=speed_kmh,
@@ -4842,11 +4947,25 @@ class CILAgent(BaseAgent):
 
         model_t0 = time.perf_counter()
         frame_triplet = self._read_latest_triplet() or [frame, frame, frame]
-        pred_waypoints, mean_uncertainty = self._predict_cil_waypoints(frame_triplet, speed_kmh, command)
+        model_waypoints, mean_uncertainty = self._predict_cil_waypoints(frame_triplet, speed_kmh, command)
         stage_times["model"] = time.perf_counter() - model_t0
 
         control_t0 = time.perf_counter()
-        pred_waypoints = self._constrain_waypoints_to_lane(pred_waypoints, vehicle, command)
+
+        # ── Compute CARLA route waypoints for control ──
+        # Use 15 points for dense curve representation (critical for roundabouts)
+        # route_locations was already collected above
+        carla_waypoints = self._route_locations_to_ego_waypoints(
+            vehicle, route_locations, max_points=15,
+        )
+        if carla_waypoints is None or (np is not None and carla_waypoints.shape[0] < 2):
+            # Fallback: not enough CARLA route points → use model waypoints
+            carla_waypoints = model_waypoints
+
+        # CARLA route waypoints are already on valid road — no lane constraint
+        # needed (constraining can snap roundabout points to wrong lane)
+        pred_waypoints = carla_waypoints
+
         # NOTE: Huber-only model has no valid uncertainty head → disable VETO
         ai_is_confused = float(mean_uncertainty) > 1e9
 
@@ -4912,23 +5031,50 @@ class CILAgent(BaseAgent):
                 control.throttle = 0.0
                 control.brake = float(clamp(max(float(control.brake), supervisor_brake, emergency_floor), 0.0, 1.0))
                 control.hand_brake = bool(hold_hand_brake)
+        gtnet_debug_info: Dict[str, Any] = {}
+        if self._gtnet_supervisor is not None and self.session is not None and self.session.world is not None:
+            try:
+                gtnet_debug_info = self._gtnet_supervisor.update(
+                    world=self.session.world,
+                    ego_vehicle=vehicle,
+                    step_idx=int(step_idx),
+                    speed_kmh=float(speed_kmh),
+                    vehicle_steer=float(control.steer),
+                )
+                self._last_gtnet_debug_info = dict(gtnet_debug_info)
+                gtnet_brake = float(gtnet_debug_info.get("brake", 0.0))
+                gtnet_throttle_floor = float(gtnet_debug_info.get("throttle_floor", 0.0))
+                if gtnet_brake > float(control.brake):
+                    # Front threat detected — brake and zero throttle
+                    control.throttle = 0.0
+                    control.brake = float(clamp(gtnet_brake, 0.0, 1.0))
+                    control.hand_brake = False
+                elif gtnet_throttle_floor > 0.0 and float(control.throttle) < gtnet_throttle_floor:
+                    # Rear threat approaching — maintain minimum speed to keep
+                    # safe separation (don't slow down when vehicle behind is
+                    # closing in, as that increases rear-end collision risk).
+                    control.throttle = float(clamp(gtnet_throttle_floor, 0.0, 1.0))
+            except Exception as exc:
+                logging.warning("GTNet supervisor update failed: %s", exc)
+                gtnet_debug_info = {}
         vehicle.apply_control(control)
         vehicle_location = vehicle.get_location()
         rotation = vehicle.get_transform().rotation
         self._update_route_history(vehicle_location)
 
-        # ── Debug: draw predicted waypoints in CARLA world ──
+        # ── Debug: draw MODEL-predicted waypoints in CARLA world ──
+        # (Vehicle follows CARLA route waypoints; debug draws model predictions for comparison)
         if self.config.cil_world_waypoint_debug and step_idx % 3 == 0 and np is not None:
             _yaw_r = math.radians(float(rotation.yaw))
             _cos_y, _sin_y = math.cos(_yaw_r), math.sin(_yaw_r)
             _z_draw = float(vehicle_location.z) + 0.5
             _high_unc = float(mean_uncertainty) > 50.0
-            _wp_color = carla.Color(255, 0, 0) if _high_unc else carla.Color(0, 255, 0)
+            _wp_color = carla.Color(255, 0, 0) if _high_unc else carla.Color(0, 200, 255)
             _line_color = carla.Color(255, 200, 0)
             _prev_w = None
-            for _wi in range(pred_waypoints.shape[0]):
-                _ex = float(pred_waypoints[_wi, 0])
-                _ey = float(pred_waypoints[_wi, 1])
+            for _wi in range(model_waypoints.shape[0]):
+                _ex = float(model_waypoints[_wi, 0])
+                _ey = float(model_waypoints[_wi, 1])
                 _wx = float(vehicle_location.x) + _cos_y * _ex - _sin_y * _ey
                 _wy = float(vehicle_location.y) + _sin_y * _ex + _cos_y * _ey
                 _wloc = carla.Location(x=_wx, y=_wy, z=_z_draw)
@@ -4936,6 +5082,7 @@ class CILAgent(BaseAgent):
                 if _prev_w is not None:
                     self.session.world.debug.draw_line(_prev_w, _wloc, thickness=0.06, color=_line_color, life_time=0.15)
                 _prev_w = _wloc
+
 
         destination_distance_m = self._distance_to_destination(vehicle_location)
         if destination_distance_m is not None and destination_distance_m <= self._arrival_distance_m:
@@ -4970,7 +5117,7 @@ class CILAgent(BaseAgent):
         self._draw_hud_on_screen(
             step_idx, speed_kmh, adaptive_target_kmh,
             control.steer, control.throttle, control.brake,
-            command, hud_fps, destination_distance_m, route_locations,
+            command, hud_fps, destination_distance_m, route_draw_locations,
         )
 
         # ── Separate OpenCV route-map window + cil_yolo OpenCV hotkeys (single waitKey) ──
@@ -4987,13 +5134,8 @@ class CILAgent(BaseAgent):
             if route_due:
                 vehicle_location = vehicle.get_location()
                 heading_yaw = float(vehicle.get_transform().rotation.yaw)
-                full_route_locs = [
-                    entry["location"]
-                    for entry in self._reference_route_plan
-                    if entry.get("location") is not None
-                ] if self._reference_route_plan else route_locations
                 self._route_map.show(
-                    route_points=full_route_locs,
+                    route_points=route_draw_locations,
                     current_location=vehicle_location,
                     start_location=self._route_start_location,
                     destination_location=self._route_destination_location,
@@ -5016,7 +5158,7 @@ class CILAgent(BaseAgent):
         
         if step_idx % 20 == 0:
             logging.info(
-                "cil tick=%d speed=%.1f km/h target=%.1f cmd=%d phase=%s next=%d src=%s reset=%s s_from_start=%.1f d_turn=%.1f d_junc=%.1f trigger=%.1f steer=%.3f source=%.3f unc=%.3f veto=%s throttle=%.2f brake=%.2f yolo=%s yolo_brake=%.2f yolo_reason=%s",
+                "cil tick=%d speed=%.1f km/h target=%.1f cmd=%d phase=%s next=%d src=%s reset=%s s_from_start=%.1f d_turn=%.1f d_junc=%.1f trigger=%.1f steer=%.3f source=%.3f unc=%.3f veto=%s throttle=%.2f brake=%.2f yolo=%s yolo_brake=%.2f yolo_reason=%s gtnet=%s gtnet_brake=%.2f gtnet_reason=%s",
                 step_idx,
                 speed_kmh,
                 adaptive_target_kmh,
@@ -5038,6 +5180,9 @@ class CILAgent(BaseAgent):
                 str(bool(self._cil_yolo_enabled and self._yolo_detector is not None)),
                 float(yolo_debug_info.get("supervisor_brake", 0.0)),
                 str(yolo_debug_info.get("decision_reason", "none")),
+                str(bool(self._gtnet_supervisor is not None)),
+                float(gtnet_debug_info.get("brake", 0.0)),
+                str(gtnet_debug_info.get("reason", "none")),
             )
 
         if self._telemetry_writer is not None:
@@ -5059,6 +5204,8 @@ class CILAgent(BaseAgent):
                     f"{float(control.steer):.4f}",
                     f"{float(control.throttle):.4f}",
                     f"{float(control.brake):.4f}",
+                    f"{float(gtnet_debug_info.get('brake', 0.0)):.4f}",
+                    str(gtnet_debug_info.get("reason", "none")),
                 ]
             )
             if step_idx % 20 == 0 and self._telemetry_fp is not None:
@@ -5137,6 +5284,8 @@ class CILAgent(BaseAgent):
         self._cached_yolo_emergency = False
         self._cached_yolo_debug_info = {}
         self._cached_yolo_annotated_frame = None
+        self._gtnet_supervisor = None
+        self._last_gtnet_debug_info = {}
         if self._cil_yolo_enabled and cv2 is not None:
             try:
                 cv2.destroyWindow(self._yolo_window_name)
@@ -6923,6 +7072,73 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--gtnet-model-path",
+        default=None,
+        help="Path to GTNet trajectory checkpoint used as an extra CIL/CIL+YOLO safety supervisor.",
+    )
+    parser.add_argument(
+        "--enable-gtnet",
+        dest="gtnet_enabled",
+        action="store_true",
+        default=None,
+        help="Enable GTNet trajectory supervisor.",
+    )
+    parser.add_argument(
+        "--disable-gtnet",
+        dest="gtnet_enabled",
+        action="store_false",
+        help="Disable GTNet trajectory supervisor.",
+    )
+    parser.add_argument(
+        "--gtnet-every-n-ticks",
+        type=int,
+        default=None,
+        help="Run GTNet trajectory inference every N ticks and reuse cached risk in between.",
+    )
+    parser.add_argument(
+        "--gtnet-history-frames",
+        type=int,
+        default=None,
+        help="Number of history frames expected by GTNet.",
+    )
+    parser.add_argument(
+        "--gtnet-expected-dt",
+        type=float,
+        default=None,
+        help="Seconds between sampled GTNet history frames.",
+    )
+    parser.add_argument(
+        "--gtnet-adjacency-mode",
+        choices=["fixed", "adaptive", "checkpoint"],
+        default=None,
+        help="Runtime adjacency used by GTNet. Use fixed for checkpoints trained on fixed-radius datasets.",
+    )
+    parser.add_argument(
+        "--gtnet-fixed-adj-radius",
+        type=float,
+        default=None,
+        help="Fixed graph radius in metres when --gtnet-adjacency-mode=fixed.",
+    )
+    parser.add_argument(
+        "--gtnet-max-actor-distance",
+        type=float,
+        default=None,
+        help="Maximum live actor distance considered by GTNet.",
+    )
+    parser.add_argument(
+        "--gtnet-draw-debug",
+        dest="gtnet_draw_debug",
+        action="store_true",
+        default=None,
+        help="Draw GTNet threat trajectories in the CARLA world debug view.",
+    )
+    parser.add_argument(
+        "--no-gtnet-draw-debug",
+        dest="gtnet_draw_debug",
+        action="store_false",
+        help="Disable GTNet world debug trajectory drawing.",
+    )
+    parser.add_argument(
         "--yolo-visualize",
         dest="yolo_visualize",
         action="store_true",
@@ -7356,6 +7572,54 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     if yolo_secondary_tracker_config == yolo_tracker_config:
         yolo_secondary_tracker_config = ""
 
+    gtnet_enabled = _to_bool(
+        args.gtnet_enabled,
+        _to_bool(_cfg_get(env_cfg, "gtnet", "enabled", False), False),
+    )
+    gtnet_model_path = str(
+        pick(args.gtnet_model_path, "gtnet", "model_path", "models/ablation_111_best.pt")
+    )
+    gtnet_inference_every_n_ticks = max(
+        1,
+        int(
+            pick(
+                args.gtnet_every_n_ticks,
+                "gtnet",
+                "inference_every_n_ticks",
+                3,
+            )
+        ),
+    )
+    gtnet_history_frames = max(
+        1,
+        int(pick(args.gtnet_history_frames, "gtnet", "history_frames", 20)),
+    )
+    gtnet_expected_dt = max(
+        1e-3,
+        float(pick(args.gtnet_expected_dt, "gtnet", "expected_dt", 0.1)),
+    )
+    gtnet_adjacency_mode = str(
+        pick(args.gtnet_adjacency_mode, "gtnet", "adjacency_mode", "fixed")
+    ).strip().lower().replace("-", "_")
+    if gtnet_adjacency_mode not in {"fixed", "adaptive", "checkpoint"}:
+        logging.warning(
+            "Unsupported gtnet.adjacency_mode=%s. Falling back to 'fixed'.",
+            gtnet_adjacency_mode,
+        )
+        gtnet_adjacency_mode = "fixed"
+    gtnet_fixed_adjacency_radius_m = max(
+        1.0,
+        float(pick(args.gtnet_fixed_adj_radius, "gtnet", "fixed_adjacency_radius_m", 100.0)),
+    )
+    gtnet_max_actor_distance_m = max(
+        1.0,
+        float(pick(args.gtnet_max_actor_distance, "gtnet", "max_actor_distance_m", 100.0)),
+    )
+    gtnet_draw_debug = _to_bool(
+        args.gtnet_draw_debug,
+        _to_bool(_cfg_get(env_cfg, "gtnet", "draw_debug", False), False),
+    )
+
     weather_preset = str(_cfg_get(env_cfg, "weather", "preset", "ClearNoon"))
     yaml_random_weather = _to_bool(_cfg_get(env_cfg, "weather", "random", False), False)
     if yaml_random_weather and not _to_bool(args.no_random_weather, False):
@@ -7478,6 +7742,15 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         yolo_inference_imgsz=int(yolo_inference_imgsz),
         yolo_tracker_config=yolo_tracker_config,
         yolo_secondary_tracker_config=yolo_secondary_tracker_config,
+        gtnet_enabled=bool(gtnet_enabled),
+        gtnet_model_path=str(gtnet_model_path),
+        gtnet_inference_every_n_ticks=int(gtnet_inference_every_n_ticks),
+        gtnet_draw_debug=bool(gtnet_draw_debug),
+        gtnet_history_frames=int(gtnet_history_frames),
+        gtnet_expected_dt=float(gtnet_expected_dt),
+        gtnet_adjacency_mode=str(gtnet_adjacency_mode),
+        gtnet_fixed_adjacency_radius_m=float(gtnet_fixed_adjacency_radius_m),
+        gtnet_max_actor_distance_m=float(gtnet_max_actor_distance_m),
         cil_command_prep_time_s=cil_command_prep_time_s,
         cil_command_trigger_min_m=cil_command_trigger_min_m,
         cil_command_trigger_max_m=cil_command_trigger_max_m,
