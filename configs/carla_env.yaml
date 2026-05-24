@@ -94,10 +94,10 @@ gtnet:
   draw_debug: true
 
 traffic_spawn:
-  vehicle_count: 30
-  bike_count: 20
-  motorbike_count: 20
-  pedestrian_count: 20
+  vehicle_count: 0
+  bike_count: 0
+  motorbike_count: 0
+  pedestrian_count: 0
   npc_enable_autopilot: true
 
 recording:
