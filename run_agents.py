@@ -4475,12 +4475,21 @@ class CILAgent(BaseAgent):
             n_points = int(waypoints.shape[0])
             idx_mid = min(2, n_points - 1)
             idx_far = min(4, n_points - 1)
-            a2 = lane_projected[idx_mid]
-            a4 = lane_projected[idx_far]
-
+            
             # Inertia anchor (keep near-term steering stable)
             forward_hint = max(2.0, float(waypoints[1, 0]) if n_points > 1 else 2.0)
             inertia_x = float(np.clip(forward_hint, 2.0, 8.0))
+
+            # --- THÊM LOGIC XỬ LÝ LÚC RẼ ---
+            a2_idx = idx_mid
+            # Nếu command là 1 (Left) hoặc 2 (Right), ép đường cong ôm sát lề ngã tư hơn
+            if int(command) in (1, 2):  
+                inertia_x = max(1.5, inertia_x * 0.6)  # Giảm quán tính để xe chịu bẻ lái sớm
+                a2_idx = max(1, idx_mid - 1)           # Kéo điểm C2 gần lại
+                
+            a2 = lane_projected[a2_idx]
+            a4 = lane_projected[idx_far]
+            # -------------------------------
 
             c0 = np.array([0.0, 0.0], dtype=np.float32)
             c1 = np.array([inertia_x, 0.0], dtype=np.float32)
@@ -5192,7 +5201,7 @@ class CILAgent(BaseAgent):
         
         if step_idx % 20 == 0:
             logging.info(
-                "cil tick=%d speed=%.1f km/h target=%.1f cmd=%d phase=%s next=%d src=%s reset=%s s_from_start=%.1f d_turn=%.1f d_junc=%.1f trigger=%.1f steer=%.3f source=%.3f unc=%.3f veto=%s throttle=%.2f brake=%.2f yolo=%s yolo_brake=%.2f yolo_reason=%s gtnet=%s gtnet_brake=%.2f gtnet_reason=%s",
+                "cil tick=%d speed=%.1f km/h target=%.1f cmd=%d phase=%s next=%d src=%s reset=%s s_from_start=%.1f d_turn=%.1f d_junc=%.1f trigger=%.1f pass_delta=%.2f rise=%d best_turn=%.2f steer=%.3f source=%.3f unc=%.3f veto=%s throttle=%.2f brake=%.2f yolo=%s yolo_brake=%.2f yolo_reason=%s gtnet=%s gtnet_brake=%.2f gtnet_reason=%s",
                 step_idx,
                 speed_kmh,
                 adaptive_target_kmh,
@@ -5205,6 +5214,9 @@ class CILAgent(BaseAgent):
                 float(command_debug.get("distance_to_turn_m", float("inf"))),
                 float(command_debug.get("distance_to_junction_m", float("inf"))),
                 float(command_debug.get("trigger_distance_m", 0.0)),
+                float(command_debug.get("passed_turn_delta_m", 0.0)),
+                int(command_debug.get("turn_distance_rising_frames", 0)),
+                float(command_debug.get("best_armed_distance_to_turn_m", float("inf"))),
                 control.steer,
                 steering_source,
                 float(mean_uncertainty),

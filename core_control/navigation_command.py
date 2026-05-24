@@ -11,12 +11,12 @@ COMMAND_TURN_ARM_MAX_M = 12.0
 COMMAND_STRAIGHT_ARM_MAX_M = 16.0
 COMMAND_NEAR_JUNCTION_HOLD_M = 10.0
 COMMAND_PROGRESS_EPS_M = 0.35
-COMMAND_PASSED_TURN_RESET_MIN_M = 2.5
+COMMAND_PASSED_TURN_RESET_MIN_M = 0.8
 COMMAND_PASSED_TURN_RESET_MAX_M = 8.0
 COMMAND_PASSED_TURN_RESET_BASE_M = 2.3
 COMMAND_PASSED_TURN_RESET_SPEED_GAIN = 0.055
-COMMAND_PASSED_TURN_LEFT_MULT = 0.30
-COMMAND_PASSED_TURN_RIGHT_MULT = 0.30
+COMMAND_PASSED_TURN_LEFT_MULT = 1.20
+COMMAND_PASSED_TURN_RIGHT_MULT = 1.00
 COMMAND_PASSED_TURN_STRAIGHT_MULT = 1.10
 COMMAND_PASSED_TURN_RISING_EPS_M = 0.20
 COMMAND_PASSED_TURN_RISING_FRAMES = 3
@@ -585,6 +585,11 @@ class NavigationCommandOracle:
         distance_to_junction_m = self._distance_to_next_junction_m()
         trigger_distance_m = self._command_trigger_distance_m(speed_kmh)
         arm_distance_m = self._command_arm_distance_m(speed_kmh, upcoming_command)
+        passed_turn_delta_m = self._passed_turn_reset_delta_m(
+            speed_kmh=speed_kmh,
+            active_command=self._active_navigation_command,
+            arm_distance_m=arm_distance_m,
+        )
         if not math.isfinite(distance_to_upcoming_turn_m):
             distance_to_upcoming_turn_m = float("inf")
         command_distance_m = distance_to_upcoming_turn_m
@@ -666,11 +671,7 @@ class NavigationCommandOracle:
                     and self._armed_best_distance_to_turn_m <= max(3.0, 0.6 * arm_distance_m)
                     and command_distance_m
                     >= self._armed_best_distance_to_turn_m
-                    + self._passed_turn_reset_delta_m(
-                        speed_kmh=speed_kmh,
-                        active_command=self._active_navigation_command,
-                        arm_distance_m=arm_distance_m,
-                    )
+                    + passed_turn_delta_m
                 ):
                     reset_reason = "passed_turn"
                     self.reset()
@@ -690,6 +691,9 @@ class NavigationCommandOracle:
             "distance_to_junction_m": float(distance_to_junction_m),
             "trigger_distance_m": float(trigger_distance_m),
             "arm_distance_m": float(arm_distance_m),
+            "passed_turn_delta_m": float(passed_turn_delta_m),
+            "turn_distance_rising_frames": int(self._turn_distance_rising_frames),
+            "best_armed_distance_to_turn_m": float(self._armed_best_distance_to_turn_m),
             "latch_frames": int(self._command_latch_frames),
             "armed_no_progress_frames": int(self._armed_no_progress_frames),
             "best_armed_distance_to_junction_m": float(self._armed_best_distance_to_junction_m),
