@@ -82,6 +82,9 @@ class WindowBuildConfig:
     max_dt_error: float = 0.03
     max_step_m: float = 6.0
     min_valid_ratio: float = 0.5
+    adaptive_radius_enabled: bool = False
+    radius_base: float = 20.0
+    radius_alpha: float = 0.5
 
 
 def write_raw_header(csv_path: Path) -> None:
@@ -247,6 +250,95 @@ def _select_actor_ids(
     return complete_ids
 
 
+def compute_adaptive_radius(
+    velocities: Any,
+    r_base: float = 20.0,
+    alpha: float = 0.5,
+) -> Any:
+    """Compute per-agent interaction radius based on velocity magnitude.
+    
+    Formula: r(i) = r_base + alpha * ||v_i||
+    
+    Args:
+        velocities: Agent velocities in m/s with shape (num_agents, 2) containing (vx, vy)
+        r_base: Base radius in meters (default 20.0)
+        alpha: Velocity scaling factor (default 0.5)
+    
+    Returns:
+        Per-agent radius in meters as numpy array with shape (num_agents,)
+    
+    Requirements: 3.1, 3.2, 3.10
+    """
+    if np is None:
+        raise RuntimeError("numpy is required for compute_adaptive_radius.")
+    
+    # Extract velocity magnitude from input velocities array
+    # velocities shape: (num_agents, 2) where columns are (vx, vy)
+    speed = np.linalg.norm(velocities, axis=-1)  # shape: (num_agents,)
+    
+    # Apply formula: r(i) = r_base + alpha * ||v_i||
+    radius = float(r_base) + float(alpha) * speed
+    
+    return radius
+
+
+def build_adaptive_adjacency(
+    positions: Any,
+    velocities: Any,
+    r_base: float = 20.0,
+    alpha: float = 0.5,
+) -> Any:
+    """Build adjacency matrix with adaptive radius based on agent velocities.
+    
+    Algorithm:
+    1. Compute per-agent radius: r[i] = r_base + alpha * ||v[i]||
+    2. Compute pairwise distances: d[i,j] = ||pos[i] - pos[j]||
+    3. Connect if within radius: adj[i,j] = 1 if d[i,j] <= min(r[i], r[j]) else 0
+    4. Ensure symmetry: adj[i,j] = adj[j,i]
+    
+    Args:
+        positions: Agent positions in global (world) coordinates with shape (num_agents, 2)
+                  stored as float64 for precise distance computation
+        velocities: Agent velocities in m/s with shape (num_agents, 2) containing (vx, vy)
+        r_base: Base radius in meters (default 20.0)
+        alpha: Velocity scaling factor (default 0.5)
+    
+    Returns:
+        Symmetric adjacency matrix with shape (num_agents, num_agents) as float32
+    
+    Requirements: 3.5, 3.6, 3.7
+    """
+    if np is None:
+        raise RuntimeError("numpy is required for build_adaptive_adjacency.")
+    
+    n_agents = int(positions.shape[0])
+    
+    # Initialize adjacency matrix with self-connections (diagonal = 1)
+    adjacency = np.eye(n_agents, dtype=np.float32)
+    
+    # Compute per-agent radius using adaptive radius function
+    radii = compute_adaptive_radius(velocities, r_base=r_base, alpha=alpha)
+    
+    # Compute pairwise distances and build adjacency matrix
+    # Use float64 precision for distance computation to avoid numerical errors
+    for i in range(n_agents):
+        for j in range(i + 1, n_agents):
+            # Compute pairwise distance in global coordinates using float64 precision
+            dx = float(positions[i, 0]) - float(positions[j, 0])
+            dy = float(positions[i, 1]) - float(positions[j, 1])
+            distance = math.hypot(dx, dy)
+            
+            # Connect agents i and j if distance(i,j) <= min(r(i), r(j))
+            # Using min ensures symmetric adjacency matrix
+            threshold = min(float(radii[i]), float(radii[j]))
+            
+            if distance <= threshold:
+                adjacency[i, j] = 1.0
+                adjacency[j, i] = 1.0
+    
+    return adjacency
+
+
 def _build_adjacency(positions: Any, adjacency_radius_m: float) -> Any:
     """Build a symmetric adjacency matrix from pairwise 2-D distances.
 
@@ -345,6 +437,8 @@ def build_window_sample(
     # computation.  The ego-centric anchor_positions above are only used if
     # needed downstream; adjacency is computed from global_positions.
     global_positions = np.zeros((n_agents, 2), dtype=np.float64)
+    # Store velocities for adaptive radius computation
+    velocities = np.zeros((n_agents, 2), dtype=np.float32)
 
     for agent_idx, actor_id in enumerate(actor_ids):
         anchor_actor = anchor.actors.get(actor_id)
@@ -355,6 +449,10 @@ def build_window_sample(
             )
             global_positions[agent_idx] = np.asarray(
                 [anchor_actor.x, anchor_actor.y], dtype=np.float64,
+            )
+            # Extract velocity from anchor frame for adaptive radius
+            velocities[agent_idx] = np.asarray(
+                [anchor_actor.vx, anchor_actor.vy], dtype=np.float32,
             )
 
         for hist_idx, frame in enumerate(history):
@@ -409,13 +507,27 @@ def build_window_sample(
         y_mask = y_mask[keep_indices]
         anchor_positions = anchor_positions[keep_indices]
         global_positions = global_positions[keep_indices]
+        velocities = velocities[keep_indices]
         actor_ids = [actor_ids[i] for i in keep_indices]
         n_agents = len(actor_ids)
+
+    # --- Build adjacency matrix: fixed or adaptive radius ------------------
+    if config.adaptive_radius_enabled:
+        # Use adaptive radius based on velocity magnitude
+        adjacency = build_adaptive_adjacency(
+            global_positions,
+            velocities,
+            r_base=float(config.radius_base),
+            alpha=float(config.radius_alpha),
+        )
+    else:
+        # Use fixed radius (legacy mode)
+        adjacency = _build_adjacency(global_positions, config.adjacency_radius_m)
 
     return {
         "x": x,
         "y": y,
-        "adj": _build_adjacency(global_positions, config.adjacency_radius_m),
+        "adj": adjacency,
         "x_mask": x_mask,
         "y_mask": y_mask,
         "actor_ids": np.asarray(list(actor_ids), dtype=np.int64),
@@ -474,6 +586,179 @@ def build_multi_agent_samples(
             continue
         samples.append(sample)
     return samples
+
+
+def compute_multimodal_metrics(
+    pred: Any,
+    target: Any,
+    y_mask: Any,
+    agent_mask: Any,
+) -> dict:
+    """Compute minADE, minFDE, MissRate for multimodal predictions.
+    
+    This function evaluates multimodal trajectory predictions by selecting the best
+    mode per agent and computing standard trajectory prediction metrics.
+    
+    Args:
+        pred: Predicted trajectories with shape [B, N, K, T, 2] for multimodal (K>1)
+              or [B, N, T, 2] for unimodal (K=1), where:
+              - B: batch size
+              - N: max number of agents
+              - K: number of trajectory modes
+              - T: number of future timesteps
+              - 2: (x, y) coordinates
+        target: Ground truth trajectories with shape [B, N, T, 2]
+        y_mask: Valid timestep mask with shape [B, N, T] (True if observed, False if missing)
+        agent_mask: Valid agent mask with shape [B, N] (True if valid agent, False if padding)
+    
+    Returns:
+        Dictionary containing:
+        - 'minADE': Minimum Average Displacement Error across K modes (float)
+        - 'minFDE': Minimum Final Displacement Error across K modes (float)
+        - 'MissRate': Fraction of predictions where minFDE > 2.0 meters (float)
+        - 'mode_0_ADE', 'mode_1_ADE', ...: Per-mode ADE for analysis (float)
+        - 'mode_0_FDE', 'mode_1_FDE', ...: Per-mode FDE for analysis (float)
+    
+    Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.8, 4.9
+    """
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("torch is required for compute_multimodal_metrics.") from exc
+    
+    # Convert inputs to torch tensors if needed
+    if not isinstance(pred, torch.Tensor):
+        pred = torch.as_tensor(pred, dtype=torch.float32)
+    if not isinstance(target, torch.Tensor):
+        target = torch.as_tensor(target, dtype=torch.float32)
+    if not isinstance(y_mask, torch.Tensor):
+        y_mask = torch.as_tensor(y_mask, dtype=torch.bool)
+    if not isinstance(agent_mask, torch.Tensor):
+        agent_mask = torch.as_tensor(agent_mask, dtype=torch.bool)
+    
+    # Handle both unimodal (K=1) and multimodal (K>1) predictions
+    # Unimodal: [B, N, T, 2] → add mode dimension → [B, N, 1, T, 2]
+    # Multimodal: [B, N, K, T, 2] → keep as is
+    if pred.dim() == 4:
+        # Unimodal case: add mode dimension
+        pred = pred.unsqueeze(2)  # [B, N, T, 2] → [B, N, 1, T, 2]
+    
+    batch_size, max_agents, num_modes, future_steps, _ = pred.shape
+    
+    # Expand target to match pred shape for broadcasting: [B, N, T, 2] → [B, N, 1, T, 2]
+    target_expanded = target.unsqueeze(2)  # [B, N, 1, T, 2]
+    
+    # Expand y_mask for broadcasting: [B, N, T] → [B, N, 1, T]
+    y_mask_expanded = y_mask.unsqueeze(2)  # [B, N, 1, T]
+    
+    # Compute displacement errors: [B, N, K, T]
+    # Euclidean distance between predicted and ground truth positions at each timestep
+    displacements = torch.norm(pred - target_expanded, dim=-1)  # [B, N, K, T]
+    
+    # Apply y_mask: set invalid timesteps to 0 (they won't contribute to metrics)
+    # Shape: [B, N, K, T]
+    masked_displacements = displacements * y_mask_expanded.float()
+    
+    # Count valid timesteps per agent per mode: [B, N, K]
+    valid_timesteps = y_mask_expanded.float().sum(dim=-1)  # [B, N, K]
+    # Avoid division by zero: replace 0 with 1 (will be masked out by agent_mask later)
+    valid_timesteps = torch.clamp(valid_timesteps, min=1.0)
+    
+    # Compute ADE per agent per mode: average displacement over valid timesteps
+    # ADE[b, n, k] = sum_t(displacement[b, n, k, t] * mask[b, n, t]) / count_valid[b, n]
+    # Shape: [B, N, K]
+    ade_per_mode = masked_displacements.sum(dim=-1) / valid_timesteps  # [B, N, K]
+    
+    # Compute FDE per agent per mode: displacement at final valid timestep
+    # For each agent, find the last valid timestep and extract displacement there
+    # Shape: [B, N, K]
+    fde_per_mode = torch.zeros_like(ade_per_mode)  # [B, N, K]
+    
+    # Find last valid timestep for each agent using vectorized operations
+    # Create a mask of valid timesteps and find the last one per agent
+    # y_mask: [B, N, T]
+    # We need to find the index of the last True value in each [B, N] sequence
+    
+    # Create indices tensor: [T]
+    timestep_indices = torch.arange(future_steps, device=y_mask.device)  # [T]
+    
+    # Expand to match y_mask shape: [B, N, T]
+    timestep_indices_expanded = timestep_indices.view(1, 1, -1).expand(batch_size, max_agents, -1)
+    
+    # Set invalid timesteps to -1
+    masked_indices = torch.where(y_mask, timestep_indices_expanded, torch.tensor(-1, device=y_mask.device))
+    
+    # Find the maximum index (last valid timestep) for each agent: [B, N]
+    last_valid_timesteps, _ = torch.max(masked_indices, dim=2)  # [B, N]
+    
+    # Clamp to valid range [0, future_steps-1] to avoid index errors
+    last_valid_timesteps = torch.clamp(last_valid_timesteps, min=0, max=future_steps-1)
+    
+    # Extract FDE at last valid timestep for all modes
+    # Use advanced indexing to gather the displacements at the last valid timestep
+    # displacements: [B, N, K, T]
+    # We want to select displacements[b, n, k, last_valid_timesteps[b, n]] for all b, n, k
+    
+    batch_indices = torch.arange(batch_size, device=displacements.device).view(-1, 1, 1).expand(batch_size, max_agents, num_modes)
+    agent_indices = torch.arange(max_agents, device=displacements.device).view(1, -1, 1).expand(batch_size, max_agents, num_modes)
+    mode_indices = torch.arange(num_modes, device=displacements.device).view(1, 1, -1).expand(batch_size, max_agents, num_modes)
+    time_indices = last_valid_timesteps.unsqueeze(2).expand(batch_size, max_agents, num_modes)
+    
+    fde_per_mode = displacements[batch_indices, agent_indices, mode_indices, time_indices]  # [B, N, K]
+    
+    # Select best mode per agent (minimum ADE and minimum FDE)
+    # minADE: [B, N]
+    minADE_per_agent, best_mode_ade = torch.min(ade_per_mode, dim=2)  # [B, N]
+    
+    # minFDE: [B, N]
+    minFDE_per_agent, best_mode_fde = torch.min(fde_per_mode, dim=2)  # [B, N]
+    
+    # Apply agent_mask: only consider valid agents
+    # Expand agent_mask for broadcasting: [B, N] → [B, N]
+    valid_agents = agent_mask.float()  # [B, N]
+    
+    # Compute MissRate: fraction where minFDE > 2.0 meters
+    # Shape: [B, N]
+    miss_threshold = 2.0
+    miss_per_agent = (minFDE_per_agent > miss_threshold).float()  # [B, N]
+    
+    # Aggregate metrics across all valid agents
+    num_valid_agents = valid_agents.sum()
+    
+    if num_valid_agents == 0:
+        # No valid agents: return zero metrics
+        metrics = {
+            'minADE': 0.0,
+            'minFDE': 0.0,
+            'MissRate': 0.0,
+        }
+        # Add per-mode metrics
+        for k in range(num_modes):
+            metrics[f'mode_{k}_ADE'] = 0.0
+            metrics[f'mode_{k}_FDE'] = 0.0
+        return metrics
+    
+    # Compute final metrics
+    minADE = (minADE_per_agent * valid_agents).sum() / num_valid_agents
+    minFDE = (minFDE_per_agent * valid_agents).sum() / num_valid_agents
+    MissRate = (miss_per_agent * valid_agents).sum() / num_valid_agents
+    
+    metrics = {
+        'minADE': float(minADE.item()),
+        'minFDE': float(minFDE.item()),
+        'MissRate': float(MissRate.item()),
+    }
+    
+    # Compute per-mode metrics for analysis
+    # For each mode k, compute average ADE and FDE across all valid agents
+    for k in range(num_modes):
+        mode_ade = (ade_per_mode[:, :, k] * valid_agents).sum() / num_valid_agents
+        mode_fde = (fde_per_mode[:, :, k] * valid_agents).sum() / num_valid_agents
+        
+        metrics[f'mode_{k}_ADE'] = float(mode_ade.item())
+        metrics[f'mode_{k}_FDE'] = float(mode_fde.item())
+    
+    return metrics
 
 
 def sample_to_torch_payload(sample: dict, raw_source: str | Path = "") -> dict:

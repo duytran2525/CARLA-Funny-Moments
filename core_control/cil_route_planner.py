@@ -38,12 +38,15 @@ class CILRoutePlanner:
         self,
         route_locations: list[Any],
         anchor_location: Any,
-        max_probe: int = 120,
+        max_probe: Optional[int] = None,
     ) -> int:
         if not route_locations or anchor_location is None:
             return 0
 
-        probe_count = max(1, min(int(max_probe), len(route_locations)))
+        if max_probe is None or int(max_probe) <= 0:
+            probe_count = len(route_locations)
+        else:
+            probe_count = max(1, min(int(max_probe), len(route_locations)))
         best_idx = 0
         best_dist = float("inf")
         for idx, loc in enumerate(route_locations[:probe_count]):
@@ -58,11 +61,12 @@ class CILRoutePlanner:
         route_locations: list[Any],
         anchor_location: Any,
         max_gap_m: float = 35.0,
+        max_probe: Optional[int] = None,
     ) -> list[Any]:
         if not route_locations:
             return []
 
-        start_idx = self._nearest_route_index(route_locations, anchor_location)
+        start_idx = self._nearest_route_index(route_locations, anchor_location, max_probe=max_probe)
 
         sanitized: list[Any] = [route_locations[start_idx]]
         for loc in route_locations[start_idx + 1 :]:
@@ -221,6 +225,7 @@ class CILRoutePlanner:
                 route_locations,
                 anchor_location=anchor_location,
                 max_gap_m=35.0,
+                max_probe=0,
             )
 
         if anchor_location is not None and not route_locations:

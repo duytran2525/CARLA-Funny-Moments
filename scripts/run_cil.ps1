@@ -4,13 +4,18 @@ param(
     [ValidateSet("cil", "cil_yolo")]
     [string]$Agent = "cil_yolo",
     [string]$Model = "models\waypoint_predictor_h5.pth",
-    [string]$YoloModel = "D:\AI\CARLA-Funny-Moments\rtdetr-l.engine",
+    [string]$YoloModel = "D:\AI\CARLA-Funny-Moments\models\rtdetr-l.engine",
     [Nullable[double]]$TargetSpeedKmh = $null,
     [Nullable[double]]$MaxThrottle = $null,
     [Nullable[double]]$MaxBrake = $null,
     [Nullable[int]]$Ticks = $null,
+    [Nullable[double]]$Fps = $null,
     [string]$Device = "auto",
     [Nullable[int]]$YoloEveryNTicks = $null,
+    [string]$GTNetModel = "D:\AI\CARLA-Funny-Moments\models\gtnet_full_best.pt",
+    [Nullable[int]]$GTNetEveryNTicks = $null,
+    [switch]$DisableGTNet,
+    [switch]$GTNetDrawDebug,
     [switch]$NoYoloVisualize,
     [switch]$NoYoloDrawOverlay,
     [switch]$OpencvRouteMap,
@@ -80,6 +85,25 @@ if ($yoloModelExt -ne ".pt" -and $yoloModelExt -ne ".engine" -and $yoloModelExt 
 }
 $yoloModelPath = $resolvedYoloModel
 
+# GTNet model path is always resolved so run_agents.py can load and log the
+# checkpoint metadata even when gtnet.enabled=false in carla_env.yaml.
+# The -DisableGTNet switch is a hard CLI override (passes --disable-gtnet) that
+# overrides even a YAML enabled=true.  Without it, YAML controls the enabled flag.
+if ([System.IO.Path]::IsPathRooted($GTNetModel)) {
+    $resolvedGTNetModel = $GTNetModel
+}
+else {
+    $resolvedGTNetModel = Join-Path $repoRoot $GTNetModel
+}
+if (-not (Test-Path $resolvedGTNetModel)) {
+    throw "GTNet model file not found: $resolvedGTNetModel"
+}
+$gtnetModelExt = [System.IO.Path]::GetExtension($resolvedGTNetModel).ToLowerInvariant()
+if ($gtnetModelExt -ne ".pt" -and $gtnetModelExt -ne ".pth") {
+    throw "GTNet model must be .pt or .pth, not '$gtnetModelExt': $resolvedGTNetModel"
+}
+$gtnetModelPath = $resolvedGTNetModel
+
 $pythonApi = Join-Path $CarlaRoot "PythonAPI"
 if (-not (Test-Path $pythonApi)) {
     throw "CARLA PythonAPI not found: $pythonApi"
@@ -111,7 +135,14 @@ else {
     Write-Host "CIL   : $modelPath"
 }
 Write-Host "YOLO  : $yoloModelPath"
+Write-Host "GTNet : $gtnetModelPath"
+if ($DisableGTNet) {
+    Write-Host "GTNet : FORCE-DISABLED via -DisableGTNet switch (overrides YAML)"
+}
 Write-Host "Agent : $Agent"
+if ($null -ne $Fps) {
+    Write-Host "FPS   : $Fps (fixed_delta=$([double](1.0 / [double]$Fps)))"
+}
 Write-Host "CARLA : $CarlaRoot"
 Write-Host "----- Running CIL + YOLO agent -----"
 
@@ -122,6 +153,12 @@ $runnerArgs = @(
     "--yolo-model-path", $yoloModelPath,
     "--device", $Device
 )
+
+
+$runnerArgs += @("--gtnet-model-path", $gtnetModelPath)
+if ($DisableGTNet) {
+    $runnerArgs += "--disable-gtnet"
+}
 
 if ($null -ne $TargetSpeedKmh) {
     $runnerArgs += @("--target-speed-kmh", [string]$TargetSpeedKmh)
@@ -147,8 +184,21 @@ if ($null -ne $NpcPedestrianCount) {
 if ($null -ne $Ticks) {
     $runnerArgs += @("--ticks", [string]$Ticks)
 }
+if ($null -ne $Fps) {
+    if ($Fps -le 0) {
+        throw "Fps must be > 0, got $Fps"
+    }
+    $fixedDelta = 1.0 / [double]$Fps
+    $runnerArgs += @("--fixed-delta", [string]$fixedDelta)
+}
 if ($null -ne $YoloEveryNTicks) {
     $runnerArgs += @("--yolo-every-n-ticks", [string]$YoloEveryNTicks)
+}
+if ($null -ne $GTNetEveryNTicks) {
+    $runnerArgs += @("--gtnet-every-n-ticks", [string]$GTNetEveryNTicks)
+}
+if ($GTNetDrawDebug) {
+    $runnerArgs += "--gtnet-draw-debug"
 }
 if ($NoYoloVisualize) {
     $runnerArgs += "--no-yolo-visualize"
