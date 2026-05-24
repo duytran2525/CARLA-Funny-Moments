@@ -4,12 +4,10 @@
   tm_port: 8000
   timeout: 60.0
   sync: true
-  # 20 FPS CARLA runtime. GTNet below still samples history at expected_dt=0.1
-  # so the current 10 Hz checkpoint sees the same 2s history distribution.
   fixed_delta: 0.05
   no_rendering: false
 
-  map: "Town03"
+  map: "Town07"
 
 
 
@@ -96,7 +94,6 @@ gtnet:
   draw_debug: true
 
 traffic_spawn:
-  # Giảm vehicle_count / pedestrian_count nếu FPS CARLA thấp (thường là bottleneck lớn hơn OpenCV).
   vehicle_count: 30
   bike_count: 20
   motorbike_count: 20
