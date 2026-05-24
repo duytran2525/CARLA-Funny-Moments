@@ -802,6 +802,7 @@ class RunConfig:
     cil_command_trigger_min_m: float
     cil_command_trigger_max_m: float
     cil_use_pure_pursuit: bool
+    cil_lane_constrain_blended: bool
 
 class BaseSession:
     """Shared interface for CARLA and dry-run sessions."""
@@ -4392,7 +4393,17 @@ class CILAgent(BaseAgent):
         vehicle: Any,
         command: int,
     ) -> Any:
-        """Project predicted ego-frame waypoints onto valid same-direction lanes."""
+        """Smoothly blend predicted ego-waypoints toward valid CARLA lane waypoints.
+
+        Strategy:
+        1) Project model waypoints to driving lanes in map space (same direction).
+        2) Build a smooth transition curve with 4 control points in ego-frame:
+           - C0: current ego position (0, 0)
+           - C1: inertia point ahead of ego heading
+           - C2: lane-projected waypoint A2
+           - C3: lane-projected waypoint A4
+        3) Blend model waypoints W_i with smooth curve S_i using progressive weights.
+        """
         if carla is None or np is None or vehicle is None:
             return pred_waypoints
         if self.session is None or self.session.world is None:
@@ -4402,6 +4413,8 @@ class CILAgent(BaseAgent):
             waypoints = np.asarray(pred_waypoints, dtype=np.float32)
             if waypoints.ndim != 2 or waypoints.shape[1] != 2:
                 return pred_waypoints
+            if waypoints.shape[0] < 2:
+                return waypoints
 
             world_map = self.session.world.get_map()
             transform = vehicle.get_transform()
@@ -4419,10 +4432,11 @@ class CILAgent(BaseAgent):
                 return pred_waypoints
 
             ego_lane_id = int(getattr(ego_wp, "lane_id", 0))
-            constrained = np.array(waypoints, copy=True)
+            lane_projected = np.array(waypoints, copy=True)
             prev_valid_wp = ego_wp
+            valid_lane_points = 0
 
-            for i in range(constrained.shape[0]):
+            for i in range(lane_projected.shape[0]):
                 ex = float(waypoints[i, 0])
                 ey = float(waypoints[i, 1])
 
@@ -4449,11 +4463,52 @@ class CILAgent(BaseAgent):
                 snapped_loc = map_wp.transform.location
                 dx = float(snapped_loc.x - ego_loc.x)
                 dy = float(snapped_loc.y - ego_loc.y)
-                constrained[i, 0] = cos_yaw * dx + sin_yaw * dy
-                constrained[i, 1] = -sin_yaw * dx + cos_yaw * dy
+                lane_projected[i, 0] = cos_yaw * dx + sin_yaw * dy
+                lane_projected[i, 1] = -sin_yaw * dx + cos_yaw * dy
                 prev_valid_wp = map_wp
+                valid_lane_points += 1
 
-            return constrained
+            if valid_lane_points < 2:
+                return waypoints
+
+            # Control points for smooth transfer (ego-frame)
+            n_points = int(waypoints.shape[0])
+            idx_mid = min(2, n_points - 1)
+            idx_far = min(4, n_points - 1)
+            a2 = lane_projected[idx_mid]
+            a4 = lane_projected[idx_far]
+
+            # Inertia anchor (keep near-term steering stable)
+            forward_hint = max(2.0, float(waypoints[1, 0]) if n_points > 1 else 2.0)
+            inertia_x = float(np.clip(forward_hint, 2.0, 8.0))
+
+            c0 = np.array([0.0, 0.0], dtype=np.float32)
+            c1 = np.array([inertia_x, 0.0], dtype=np.float32)
+            c2 = np.array([float(a2[0]), float(a2[1])], dtype=np.float32)
+            c3 = np.array([float(a4[0]), float(a4[1])], dtype=np.float32)
+
+            def _bezier_point(t: float):
+                omt = 1.0 - t
+                return (
+                    (omt ** 3) * c0
+                    + 3.0 * (omt ** 2) * t * c1
+                    + 3.0 * omt * (t ** 2) * c2
+                    + (t ** 3) * c3
+                )
+
+            ts = np.linspace(0.0, 1.0, n_points, dtype=np.float32)
+            smooth_curve = np.stack([_bezier_point(float(t)) for t in ts], axis=0).astype(np.float32)
+
+            # Progressive blending: keep near points close to model, far points
+            # align stronger to map/lane curve.
+            alphas = np.linspace(0.20, 0.95, n_points, dtype=np.float32)
+            if int(command) in (1, 2, 3):
+                alphas = np.clip(alphas + 0.03, 0.0, 0.98)
+            blended = (1.0 - alphas[:, None]) * waypoints + alphas[:, None] * smooth_curve
+
+            # Keep forward progression stable for pure-pursuit.
+            blended[:, 0] = np.maximum.accumulate(np.maximum(blended[:, 0], 0.2))
+            return blended.astype(np.float32)
         except Exception as exc:
             logging.debug("CIL lane constraint skipped: %s", exc)
             return pred_waypoints
@@ -4937,19 +4992,13 @@ class CILAgent(BaseAgent):
 
         control_t0 = time.perf_counter()
 
-        # ── Compute CARLA route waypoints for control ──
-        # Use 15 points for dense curve representation (critical for roundabouts)
-        # route_locations was already collected above
-        carla_waypoints = self._route_locations_to_ego_waypoints(
-            vehicle, route_locations, max_points=15,
-        )
-        if carla_waypoints is None or (np is not None and carla_waypoints.shape[0] < 2):
-            # Fallback: not enough CARLA route points → use model waypoints
-            carla_waypoints = model_waypoints
-
-        # CARLA route waypoints are already on valid road — no lane constraint
-        # needed (constraining can snap roundabout points to wrong lane)
-        pred_waypoints = carla_waypoints
+        # ── Use MODEL waypoints for control (optional smooth lane blending constraint) ──
+        # CARLA route is kept for command extraction; this optional constraint uses
+        # map lanes only to smooth/correct geometry, not to replace planner commands.
+        if bool(self.config.cil_lane_constrain_blended):
+            pred_waypoints = self._constrain_waypoints_to_lane(model_waypoints, vehicle, command)
+        else:
+            pred_waypoints = model_waypoints
 
         # NOTE: Huber-only model has no valid uncertainty head → disable VETO
         ai_is_confused = float(mean_uncertainty) > 1e9
@@ -7139,6 +7188,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="0 means no smoothing, closer to 1 means smoother steering.",
     )
+    parser.add_argument(
+        "--cil-lane-constrain-blended",
+        dest="cil_lane_constrain_blended",
+        action="store_true",
+        default=None,
+        help="Enable smooth lane-constrain trajectory blending for CIL waypoints.",
+    )
+    parser.add_argument(
+        "--no-cil-lane-constrain-blended",
+        dest="cil_lane_constrain_blended",
+        action="store_false",
+        help="Disable smooth lane-constrain blending and use raw model waypoints.",
+    )
     parser.add_argument("--camera-width", type=int, default=None)
     parser.add_argument("--camera-height", type=int, default=None)
     parser.add_argument("--camera-fov", type=float, default=None)
@@ -7399,6 +7461,10 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     cil_use_pure_pursuit = _to_bool(
         _cfg_get(env_cfg, "cil", "use_pure_pursuit", False),
         False,
+    )
+    cil_lane_constrain_blended = _to_bool(
+        args.cil_lane_constrain_blended,
+        _to_bool(_cfg_get(env_cfg, "cil", "lane_constrain_blended", True), True),
     )
 
     nav_agent_type = str(pick(args.nav_agent_type, "cil", "nav_agent_type", "basic")).lower()
@@ -7683,6 +7749,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         cil_command_trigger_min_m=cil_command_trigger_min_m,
         cil_command_trigger_max_m=cil_command_trigger_max_m,
         cil_use_pure_pursuit=cil_use_pure_pursuit,
+        cil_lane_constrain_blended=cil_lane_constrain_blended,
     )
 
 
