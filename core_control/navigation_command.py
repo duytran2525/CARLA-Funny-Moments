@@ -668,7 +668,6 @@ class NavigationCommandOracle:
                     and self._command_latch_frames >= 8
                     and self._turn_distance_rising_frames >= COMMAND_PASSED_TURN_RISING_FRAMES
                     and not junction_still_near
-                    and self._armed_best_distance_to_turn_m <= max(3.0, 0.6 * arm_distance_m)
                     and command_distance_m
                     >= self._armed_best_distance_to_turn_m
                     + passed_turn_delta_m
