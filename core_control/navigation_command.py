@@ -11,6 +11,15 @@ COMMAND_TURN_ARM_MAX_M = 12.0
 COMMAND_STRAIGHT_ARM_MAX_M = 16.0
 COMMAND_NEAR_JUNCTION_HOLD_M = 10.0
 COMMAND_PROGRESS_EPS_M = 0.35
+COMMAND_PASSED_TURN_RESET_MIN_M = 2.5
+COMMAND_PASSED_TURN_RESET_MAX_M = 8.0
+COMMAND_PASSED_TURN_RESET_BASE_M = 2.3
+COMMAND_PASSED_TURN_RESET_SPEED_GAIN = 0.055
+COMMAND_PASSED_TURN_LEFT_MULT = 1.20
+COMMAND_PASSED_TURN_RIGHT_MULT = 1.00
+COMMAND_PASSED_TURN_STRAIGHT_MULT = 1.10
+COMMAND_PASSED_TURN_RISING_EPS_M = 0.20
+COMMAND_PASSED_TURN_RISING_FRAMES = 3
 REFERENCE_ROUTE_MAX_ITEMS = 4096
 
 
@@ -325,6 +334,9 @@ class NavigationCommandOracle:
         self._command_latch_frames = 0
         self._command_entered_junction = False
         self._armed_best_distance_to_junction_m = float("inf")
+        self._armed_best_distance_to_turn_m = float("inf")
+        self._last_turn_distance_m = float("inf")
+        self._turn_distance_rising_frames = 0
         self._armed_no_progress_frames = 0
         self._reference_route_progress_idx = 0
         self._last_debug = {}
@@ -538,6 +550,29 @@ class NavigationCommandOracle:
 
         return float(base_distance_m)
 
+    def _passed_turn_reset_delta_m(
+        self,
+        speed_kmh: float,
+        active_command: int,
+        arm_distance_m: float,
+    ) -> float:
+        base = COMMAND_PASSED_TURN_RESET_BASE_M + COMMAND_PASSED_TURN_RESET_SPEED_GAIN * max(0.0, float(speed_kmh))
+        command = int(active_command)
+        if command == 1:
+            base *= COMMAND_PASSED_TURN_LEFT_MULT
+        elif command == 2:
+            base *= COMMAND_PASSED_TURN_RIGHT_MULT
+        elif command == 3:
+            base *= COMMAND_PASSED_TURN_STRAIGHT_MULT
+
+        dynamic_cap = max(COMMAND_PASSED_TURN_RESET_MIN_M, 0.8 * float(arm_distance_m))
+        delta = min(float(base), float(dynamic_cap))
+        return clamp(
+            delta,
+            COMMAND_PASSED_TURN_RESET_MIN_M,
+            COMMAND_PASSED_TURN_RESET_MAX_M,
+        )
+
     def update(
         self,
         speed_kmh: float,
@@ -574,6 +609,9 @@ class NavigationCommandOracle:
                 self._command_latch_frames = 1
                 self._command_phase = "in_junction" if in_junction else "armed"
                 self._armed_best_distance_to_junction_m = float(distance_to_junction_m)
+                self._armed_best_distance_to_turn_m = float(command_distance_m)
+                self._last_turn_distance_m = float(command_distance_m)
+                self._turn_distance_rising_frames = 0
                 self._armed_no_progress_frames = 0
             else:
                 self._command_phase = "cruise"
@@ -593,6 +631,15 @@ class NavigationCommandOracle:
                     6.0,
                     min(COMMAND_NEAR_JUNCTION_HOLD_M, arm_distance_m + 1.5),
                 )
+                if math.isfinite(command_distance_m):
+                    if command_distance_m + COMMAND_PROGRESS_EPS_M < self._armed_best_distance_to_turn_m:
+                        self._armed_best_distance_to_turn_m = float(command_distance_m)
+                    if math.isfinite(self._last_turn_distance_m):
+                        if command_distance_m >= self._last_turn_distance_m + COMMAND_PASSED_TURN_RISING_EPS_M:
+                            self._turn_distance_rising_frames += 1
+                        else:
+                            self._turn_distance_rising_frames = 0
+                    self._last_turn_distance_m = float(command_distance_m)
                 junction_still_near = (
                     math.isfinite(distance_to_junction_m)
                     and distance_to_junction_m <= near_junction_hold_m
@@ -609,6 +656,23 @@ class NavigationCommandOracle:
                     self._armed_no_progress_frames += 1
                 if upcoming_command not in (1, 2, 3) and not junction_still_near:
                     reset_reason = "planner_turn_lost"
+                    self.reset()
+                elif (
+                    math.isfinite(command_distance_m)
+                    and math.isfinite(self._armed_best_distance_to_turn_m)
+                    and self._command_latch_frames >= 8
+                    and self._turn_distance_rising_frames >= COMMAND_PASSED_TURN_RISING_FRAMES
+                    and not junction_still_near
+                    and self._armed_best_distance_to_turn_m <= max(3.0, 0.6 * arm_distance_m)
+                    and command_distance_m
+                    >= self._armed_best_distance_to_turn_m
+                    + self._passed_turn_reset_delta_m(
+                        speed_kmh=speed_kmh,
+                        active_command=self._active_navigation_command,
+                        arm_distance_m=arm_distance_m,
+                    )
+                ):
+                    reset_reason = "passed_turn"
                     self.reset()
                 elif self._armed_no_progress_frames >= self._max_armed_frames:
                     reset_reason = "armed_stalled"
