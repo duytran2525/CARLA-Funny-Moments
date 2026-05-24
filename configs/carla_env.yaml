@@ -7,7 +7,7 @@
   fixed_delta: 0.05
   no_rendering: false
 
-  map: "Town07"
+  map: "Town03"
 
 
 
@@ -72,7 +72,7 @@ yolo:
   # false = chỉ hiện raw camera feed.
   debug_overlay: true
   # Chỉ ẩn 2 vùng ROI đèn đỏ trên màn hình debug; logic dừng đèn đỏ vẫn giữ nguyên.
-  show_red_light_rois: false
+  show_red_light_rois: true
 
 gtnet:
   # GTNet dùng như safety supervisor cho cil/cil_yolo.
