@@ -39,9 +39,9 @@ cil:
   max_brake: 0.80
   steer_smoothing: 0.85
   nav_agent_type: "basic"
-  command_prep_time_s: 1.8
-  command_trigger_min_m: 9.0
-  command_trigger_max_m: 24.0
+  command_prep_time_s: 1.2
+  command_trigger_min_m: 6.0
+  command_trigger_max_m: 18.0
   recovery_interval_frames: 100
   recovery_duration_frames: 10
   recovery_steer_offset: 0.3
