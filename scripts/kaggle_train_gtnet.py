@@ -1,48 +1,48 @@
 """
-kaggle_train_gtnet.py  — v3 (GTNet improved)
-═════════════════════════════════════════════════════════════════════════════
+kaggle_train_gtnet.py  â€” v3 (GTNet improved)
+â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
-CẢI TIẾN so với v2:
+Cáº¢I TIáº¾N so vá»›i v2:
 
-[IMP-A] WarmupCosineScheduler (mới)
-    Linear warmup trong --warmup-epochs epoch đầu → cosine decay.
-    Tránh LR đột ngột cao ngay epoch 1 gây instability.
-    Hỗ trợ nhiều param groups (GAT dual-LR) tự động.
-    Thay thế CosineAnnealingLR khi --cosine-lr được bật.
+[IMP-A] WarmupCosineScheduler (má»›i)
+    Linear warmup trong --warmup-epochs epoch Ä‘áº§u â†’ cosine decay.
+    TrĂ¡nh LR Ä‘á»™t ngá»™t cao ngay epoch 1 gĂ¢y instability.
+    Há»— trá»£ nhiá»u param groups (GAT dual-LR) tá»± Ä‘á»™ng.
+    Thay tháº¿ CosineAnnealingLR khi --cosine-lr Ä‘Æ°á»£c báº­t.
 
-[IMP-B] Diversity loss (mới)
-    Penalize các mode có endpoint quá gần nhau (khoảng cách < margin).
-    Ngăn mode collapse khi dùng WTA với K=5.
-    Kích hoạt bằng --diversity-weight > 0 (khuyến nghị 0.05–0.1).
+[IMP-B] Diversity loss (má»›i)
+    Penalize cĂ¡c mode cĂ³ endpoint quĂ¡ gáº§n nhau (khoáº£ng cĂ¡ch < margin).
+    NgÄƒn mode collapse khi dĂ¹ng WTA vá»›i K=5.
+    KĂ­ch hoáº¡t báº±ng --diversity-weight > 0 (khuyáº¿n nghá»‹ 0.05â€“0.1).
 
-[IMP-C] Data augmentation (mới)
-    _augment_batch(): áp dụng trong training loop:
-      • Random in-plane rotation (±rot_std_deg°) trên x, y, vx, vy, heading
-        và target y → tăng cường tính invariance với góc quay ego
-      • History frame dropout: ngẫu nhiên mask một số frame lịch sử
-        (giữ nguyên anchor frame cuối) → mô hình robust hơn với missing obs.
-    Kích hoạt bằng --augment.
+[IMP-C] Data augmentation (má»›i)
+    _augment_batch(): Ă¡p dá»¥ng trong training loop:
+      â€¢ Random in-plane rotation (Â±rot_std_degÂ°) trĂªn x, y, vx, vy, heading
+        vĂ  target y â†’ tÄƒng cÆ°á»ng tĂ­nh invariance vá»›i gĂ³c quay ego
+      â€¢ History frame dropout: ngáº«u nhiĂªn mask má»™t sá»‘ frame lá»‹ch sá»­
+        (giá»¯ nguyĂªn anchor frame cuá»‘i) â†’ mĂ´ hĂ¬nh robust hÆ¡n vá»›i missing obs.
+    KĂ­ch hoáº¡t báº±ng --augment.
 
-[IMP-D] Early stopping dựa trên val_ADE (thay vì val_loss)
-    val_ADE = metric trực tiếp phản ánh chất lượng dự đoán quỹ đạo.
-    val_loss bị ảnh hưởng bởi scale của smooth-L1 → không luôn monotone
-    với ADE. Thêm --early-stop-metric (loss|ade, default: ade).
-    Lưu riêng best_ade.pt và best_loss.pt.
+[IMP-D] Early stopping dá»±a trĂªn val_ADE (thay vĂ¬ val_loss)
+    val_ADE = metric trá»±c tiáº¿p pháº£n Ă¡nh cháº¥t lÆ°á»£ng dá»± Ä‘oĂ¡n quá»¹ Ä‘áº¡o.
+    val_loss bá»‹ áº£nh hÆ°á»Ÿng bá»Ÿi scale cá»§a smooth-L1 â†’ khĂ´ng luĂ´n monotone
+    vá»›i ADE. ThĂªm --early-stop-metric (loss|ade, default: ade).
+    LÆ°u riĂªng best_ade.pt vĂ  best_loss.pt.
 
-[IMP-E] Best result tracking chính xác
-    best_val_ade và best_val_fde trong kết quả giờ được lấy từ CÙNG epoch
-    với best checkpoint, không phải min() độc lập qua toàn history.
+[IMP-E] Best result tracking chĂ­nh xĂ¡c
+    best_val_ade vĂ  best_val_fde trong káº¿t quáº£ giá» Ä‘Æ°á»£c láº¥y tá»« CĂ™NG epoch
+    vá»›i best checkpoint, khĂ´ng pháº£i min() Ä‘á»™c láº­p qua toĂ n history.
 
 [IMP-F] New config fields forwarded to build_model()
     --use-temporal-attention, --mode-embed-dim, --encoder-dropout
-    → tự động forward vào MultiAgentModelConfig.
+    â†’ tá»± Ä‘á»™ng forward vĂ o MultiAgentModelConfig.
 
-KHAI THÁC TỪ PHÂN TÍCH 39 EPOCHS:
-  • Train/val ADE gap = 3.5× → [IMP-C] augmentation + [IMP-F] encoder_dropout
-  • Val plateau sau epoch 24 → [IMP-A] warmup giúp giai đoạn đầu tốt hơn
-  • K=5 WTA risk collapse → [IMP-B] diversity loss
-  • LR không warmup → [IMP-A]
-  • Early stop dựa loss → [IMP-D] dựa ADE
+KHAI THĂC Tá»ª PHĂ‚N TĂCH 39 EPOCHS:
+  â€¢ Train/val ADE gap = 3.5Ă— â†’ [IMP-C] augmentation + [IMP-F] encoder_dropout
+  â€¢ Val plateau sau epoch 24 â†’ [IMP-A] warmup giĂºp giai Ä‘oáº¡n Ä‘áº§u tá»‘t hÆ¡n
+  â€¢ K=5 WTA risk collapse â†’ [IMP-B] diversity loss
+  â€¢ LR khĂ´ng warmup â†’ [IMP-A]
+  â€¢ Early stop dá»±a loss â†’ [IMP-D] dá»±a ADE
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ try:
 except Exception:
     pass
 
-# ── AMP compatibility ──────────────────────────────────────────────────────────
+# â”€â”€ AMP compatibility â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 try:
     from torch.amp import GradScaler as _GradScaler
     from torch.amp import autocast as _autocast
@@ -90,9 +90,9 @@ except (ImportError, TypeError):
         return _LegacyAutocast(enabled=enabled)
 
 
-# ── sys.path setup ─────────────────────────────────────────────────────────────
+# â”€â”€ sys.path setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CORE_PARENT  = Path("/kaggle/input/datasets/dungnguyentrung/f23456")
+CORE_PARENT  = Path("/kaggle/input/datasets/dungnguyentrung/f1234567")
 for _root in (CORE_PARENT, PROJECT_ROOT):
     if str(_root) not in sys.path:
         sys.path.insert(0, str(_root))
@@ -110,9 +110,9 @@ from core_perception.multi_agent_model import (  # noqa: E402
 )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Multimodal-aware loss & metrics (unchanged from v2)
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def _compute_loss(
     pred: torch.Tensor,
@@ -120,21 +120,25 @@ def _compute_loss(
     y_mask: torch.Tensor,
     agent_mask: torch.Tensor,
     diversity_weight: float = 0.0,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, float]:
     """
     Compute training loss.
 
-    Unimodal  [B, A, T, 2]   → masked smooth-L1
-    Multimodal [B, A, K, T, 2] → Winner-Takes-All + optional diversity term
+    Unimodal  [B, A, T, 2]   â†’ masked smooth-L1
+    Multimodal [B, A, K, T, 2] â†’ Winner-Takes-All + optional diversity term
 
     [IMP-B] diversity_weight > 0 adds a pairwise endpoint repulsion loss
     that penalizes modes whose final positions are too close together.
     This prevents mode collapse when K is large (e.g. K=5).
+
+    Returns:
+        (total_loss, div_loss_scalar) â€” div_loss_scalar is 0.0 for unimodal
+        or when diversity_weight == 0. Caller uses it for separate logging.
     """
     if pred.dim() == 4:
-        return masked_smooth_l1_loss(pred, target, y_mask, agent_mask)
+        return masked_smooth_l1_loss(pred, target, y_mask, agent_mask), 0.0
 
-    # ── Multimodal WTA ────────────────────────────────────────────────────────
+    # â”€â”€ Multimodal WTA â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     B, A, K, T, C = pred.shape
     target_exp = target.unsqueeze(2).expand(B, A, K, T, C)
 
@@ -154,9 +158,8 @@ def _compute_loss(
 
     if diversity_weight > 0.0 and K > 1:
         div = _diversity_loss(pred, agent_mask, y_mask)
-        return main_loss + diversity_weight * div
-
-    return main_loss
+        return main_loss + diversity_weight * div, float(div.detach().cpu().item())
+    return main_loss, 0.0
 
 
 def _last_valid_displacement(
@@ -212,9 +215,9 @@ def _compute_metrics(
     return (min_ade * mask).sum() / n_valid, (min_fde * mask).sum() / n_valid
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # [IMP-B] Mode diversity loss
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def _diversity_loss(
     pred: torch.Tensor,
@@ -226,7 +229,7 @@ def _diversity_loss(
     Pairwise endpoint repulsion loss for multimodal predictions.
 
     Penalizes pairs of modes whose final predicted positions are within
-    `margin` metres of each other. This prevents mode collapse — a
+    `margin` metres of each other. This prevents mode collapse â€” a
     common failure mode for WTA loss when K is large.
 
     Loss per pair (i, j): ReLU(margin - ||endpoint_i - endpoint_j||)
@@ -250,8 +253,15 @@ def _diversity_loss(
     valid = (agent_mask & y_mask.any(dim=-1)).float()  # [B, A]
     n_valid = valid.sum().clamp_min(1.0)
 
-    # Use last timestep as "endpoint" for efficiency
-    endpoints = pred[:, :, :, -1, :]  # [B, A, K, 2]
+    # [FIX-3] Use last *valid* timestep per agent (not always index -1).
+    # y_mask: [B, A, T] â€” True = valid future step.
+    # For agents with all-False mask, last_idx falls back to T-1 (harmless,
+    # they are excluded from the loss via the valid weight).
+    valid_counts = y_mask.long().sum(dim=-1).clamp_min(1)   # [B, A]
+    last_idx = (valid_counts - 1)                            # [B, A]
+    # Expand to [B, A, K, 1, 2] for gather on pred [B, A, K, T, 2]
+    last_idx_exp = last_idx.view(B, A, 1, 1, 1).expand(B, A, K, 1, C)
+    endpoints = pred.gather(3, last_idx_exp).squeeze(3)      # [B, A, K, 2]
 
     total = pred.new_tensor(0.0)
     n_pairs = 0
@@ -267,9 +277,9 @@ def _diversity_loss(
     return total / max(1, n_pairs)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # [IMP-C] Data augmentation
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def _augment_batch(
     batch: Dict,
@@ -280,12 +290,12 @@ def _augment_batch(
     Apply random in-plane rotation and history frame dropout.
 
     Random rotation:
-        Rotates features in ego-frame by ±rot_std_deg° (sampled per sample).
+        Rotates features in ego-frame by Â±rot_std_degÂ° (sampled per sample).
         Applied consistently to all feature channels:
-          x[..., 0:2]  — local position (x, y)
-          x[..., 2:4]  — local velocity (vx, vy)   [if feature_dim >= 4]
-          x[..., 4:6]  — heading unit vector        [if feature_dim >= 6]
-          y[..., 0:2]  — target position (x, y)
+          x[..., 0:2]  â€” local position (x, y)
+          x[..., 2:4]  â€” local velocity (vx, vy)   [if feature_dim >= 4]
+          x[..., 4:6]  â€” heading unit vector        [if feature_dim >= 6]
+          y[..., 0:2]  â€” target position (x, y)
         Adjacency matrix is unchanged (distances are rotation-invariant).
         Rationale: CARLA ego can spawn at any yaw; augmentation forces the
         model to be invariant to small ego orientation perturbations.
@@ -308,7 +318,7 @@ def _augment_batch(
     B = batch["x"].shape[0]
     device = batch["x"].device
 
-    # ── Random rotation ──────────────────────────────────────────────────────
+    # â”€â”€ Random rotation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if rot_std_deg > 0.0:
         angles = torch.randn(B, device=device) * math.radians(rot_std_deg)
         cos_a = angles.cos()  # [B]
@@ -328,17 +338,20 @@ def _augment_batch(
 
         feat_dim = batch["x"].shape[-1]
         x = batch["x"].clone()
-        x = _rot2d(x, 0)           # position
+        x = _rot2d(x, 0)           # channels 0-1: local position (always present)
         if feat_dim >= 4:
-            x = _rot2d(x, 2)       # velocity (new format) or heading (old)
+            # channels 2-3: local velocity (vx, vy) in new 6-ch format, OR
+            # heading unit vector (hx, hy) in legacy 4-ch format.
+            # Both are 2D vectors in ego-frame â†’ rotation applies identically.
+            x = _rot2d(x, 2)
         if feat_dim >= 6:
-            x = _rot2d(x, 4)       # heading (new format)
+            x = _rot2d(x, 4)       # channels 4-5: heading unit vector (new 6-ch format)
         batch["x"] = x
 
         # Rotate targets (always 2D position)
         batch["y"] = _rot2d(batch["y"].clone(), 0)
 
-    # ── History frame dropout ────────────────────────────────────────────────
+    # â”€â”€ History frame dropout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if hist_dropout > 0.0 and batch["x_mask"].shape[-1] > 1:
         x_mask = batch["x_mask"].clone()
         # Bernoulli dropout on currently-valid frames, but NEVER drop t=-1
@@ -349,27 +362,37 @@ def _augment_batch(
     return batch
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # [IMP-A] Warmup + Cosine scheduler
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class WarmupCosineScheduler:
     """
-    Linear LR warmup then cosine annealing.
+    Linear LR warmup then cosine annealing, with optional per-group start epoch.
 
     Drop-in replacement for CosineAnnealingLR. Works with multi-group
     optimizers (e.g. the GAT dual-LR setup) by scaling each group's
     initial LR independently.
 
-    Schedule:
-        epoch 1..warmup_epochs : LR ramps linearly from 0 → base_lr
-        epoch warmup_epochs+1.. : cosine decay from base_lr → min_lr
+    Schedule per group:
+        epoch < start_epoch              : LR = 0  (group is frozen/inactive)
+        start_epoch .. start_epoch+warmup: LR ramps linearly 0 â†’ base_lr
+        after warmup                     : cosine decay from base_lr â†’ min_lr
+                                           (cosine runs from start_epoch to total_epochs)
 
     Args:
-        optimizer:      PyTorch optimizer (single or multi group)
-        warmup_epochs:  number of linear warmup epochs (0 = no warmup)
-        total_epochs:   total training epochs (for cosine end point)
-        min_lr_ratio:   min LR = base_lr × min_lr_ratio (default 0.01)
+        optimizer:         PyTorch optimizer (single or multi group)
+        warmup_epochs:     default warmup epochs for all groups (0 = no warmup)
+        total_epochs:      total training epochs (cosine endpoint)
+        min_lr_ratio:      min LR = base_lr Ă— min_lr_ratio (default 0.01)
+        group_start_epochs: dict {group_name: start_epoch} â€” groups whose name
+                            matches will not receive any LR until start_epoch,
+                            then get their own warmup from that epoch onward.
+                            Groups not listed start at epoch 0 (normal behaviour).
+
+    [FIX-3] group_start_epochs lets the GAT param group start warming up only
+    after gat_freeze_epochs, so its cosine budget is calculated correctly and it
+    never gets decayed before it has even started training.
     """
 
     def __init__(
@@ -378,25 +401,43 @@ class WarmupCosineScheduler:
         warmup_epochs: int,
         total_epochs: int,
         min_lr_ratio: float = 0.01,
+        group_start_epochs: Optional[Dict[str, int]] = None,
     ) -> None:
-        self.optimizer     = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.total_epochs  = total_epochs
-        self.min_lr_ratio  = min_lr_ratio
-        # Snapshot initial LRs for each group at construction time
+        self.optimizer          = optimizer
+        self.warmup_epochs      = warmup_epochs
+        self.total_epochs       = total_epochs
+        self.min_lr_ratio       = min_lr_ratio
+        self.group_start_epochs = group_start_epochs or {}
+        # Snapshot initial LRs for each group at construction time.
         self.base_lrs = [float(pg["lr"]) for pg in optimizer.param_groups]
         self._epoch   = 0
+
+    def _group_start(self, pg: dict) -> int:
+        """Return the start epoch for a given param group (0 if not listed)."""
+        name = str(pg.get("name", ""))
+        return self.group_start_epochs.get(name, 0)
 
     def step(self) -> None:
         self._epoch += 1
         e = self._epoch
         for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
-            min_lr = base_lr * self.min_lr_ratio
-            if self.warmup_epochs > 0 and e <= self.warmup_epochs:
-                lr = base_lr * e / self.warmup_epochs
+            min_lr     = base_lr * self.min_lr_ratio
+            start_ep   = self._group_start(pg)
+
+            if e <= start_ep:
+                # Group not yet active â€” keep LR at 0 (params are frozen anyway,
+                # but setting it makes logs correct after unfreeze).
+                pg["lr"] = 0.0
+                continue
+
+            # Local epoch relative to this group's start
+            local_e = e - start_ep
+            if self.warmup_epochs > 0 and local_e <= self.warmup_epochs:
+                lr = base_lr * local_e / self.warmup_epochs
             else:
-                cos_e   = e - self.warmup_epochs
-                cos_max = max(1, self.total_epochs - self.warmup_epochs)
+                # Cosine decays from start_ep to total_epochs
+                cos_e   = local_e - self.warmup_epochs
+                cos_max = max(1, self.total_epochs - start_ep - self.warmup_epochs)
                 progress = cos_e / cos_max
                 lr = min_lr + 0.5 * (base_lr - min_lr) * (
                     1.0 + math.cos(math.pi * progress)
@@ -407,9 +448,9 @@ class WarmupCosineScheduler:
         return [float(pg["lr"]) for pg in self.optimizer.param_groups]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Ablation variant definitions
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class AblationVariant(NamedTuple):
     name: str
@@ -424,11 +465,11 @@ ABLATION_VARIANTS: List[AblationVariant] = [
     AblationVariant("Baseline",   "000", False, False, False,
                     "GCN + unimodal + fixed radius (baseline)"),
     AblationVariant("GAT_only",   "100", True,  False, False,
-                    "Adds Graph Attention — learns edge weights between agents"),
+                    "Adds Graph Attention â€” learns edge weights between agents"),
     AblationVariant("Multi_only", "010", False, True,  False,
-                    "Adds multimodal output — K future trajectory hypotheses"),
+                    "Adds multimodal output â€” K future trajectory hypotheses"),
     AblationVariant("AdpR_only",  "001", False, False, True,
-                    "Adds adaptive radius — interaction range scales with speed"),
+                    "Adds adaptive radius â€” interaction range scales with speed"),
     AblationVariant("GAT_Multi",  "110", True,  True,  False,
                     "GAT + multimodal"),
     AblationVariant("GAT_AdpR",   "101", True,  False, True,
@@ -436,13 +477,13 @@ ABLATION_VARIANTS: List[AblationVariant] = [
     AblationVariant("Multi_AdpR", "011", False, True,  True,
                     "Multimodal + adaptive radius"),
     AblationVariant("GTNet_Full", "111", True,  True,  True,
-                    "All improvements enabled — full GTNet"),
+                    "All improvements enabled â€” full GTNet"),
 ]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # CLI
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -454,7 +495,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["baseline", "full", "ablation", "per-town"],
                    default="full")
 
-    # ── Hyper-params ──────────────────────────────────────────────────────────
+    # â”€â”€ Hyper-params â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     p.add_argument("--epochs",              type=int,   default=50)
     p.add_argument("--batch-size",          type=int,   default=64)
     p.add_argument("--accum-steps",         type=int,   default=1)
@@ -464,7 +505,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed",                type=int,   default=42)
     p.add_argument("--num-workers",         type=int,   default=2)
 
-    # ── Model architecture ────────────────────────────────────────────────────
+    # â”€â”€ Model architecture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     p.add_argument("--hidden-dim",           type=int,   default=256)
     p.add_argument("--graph-layers",         type=int,   default=3)
     p.add_argument("--dropout",              type=float, default=0.1)
@@ -477,13 +518,17 @@ def parse_args() -> argparse.Namespace:
                    help="[IMP-2] Mode embedding dim in shared-GRU decoder.")
     p.add_argument("--encoder-dropout", type=float, default=0.0,
                    help="[IMP-3] Dropout on GRU encoder output. Reduces train/val gap.")
+    # [V4-B] GAT edge feature dimension
+    p.add_argument("--gat-edge-dim", type=int, default=32,
+                   help="[V4-B] GAT edge feature dimension (0 = disable). "
+                        "Enables RelativeEdgeEncoder for spatial awareness.")
 
-    # ── Feature flags ─────────────────────────────────────────────────────────
+    # â”€â”€ Feature flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     p.add_argument("--enable-gat",             action="store_true")
     p.add_argument("--enable-multimodal",      action="store_true")
     p.add_argument("--enable-adaptive-radius", action="store_true")
 
-    # ── Training config ───────────────────────────────────────────────────────
+    # â”€â”€ Training config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     p.add_argument("--grad-clip",                type=float, default=1.0)
     p.add_argument("--early-stopping-patience",  type=int,   default=10)
     p.add_argument("--lr-patience",              type=int,   default=4)
@@ -500,7 +545,12 @@ def parse_args() -> argparse.Namespace:
     # [IMP-B]
     p.add_argument("--diversity-weight", type=float, default=0.0,
                    help="[IMP-B] Weight for mode diversity loss (0 = disabled). "
-                        "Recommended: 0.05–0.1 when --enable-multimodal + K>=3.")
+                        "Recommended: 0.05â€“0.1 when --enable-multimodal + K>=3.")
+    p.add_argument("--diversity-ramp-epochs", type=int, default=20,
+                   help="[IMP-D] Ramp diversity weight from 0 â†’ target over this "
+                        "many epochs. Prevents diversity loss from destabilising "
+                        "WTA training in early epochs. 0 = no ramp (full weight "
+                        "from epoch 1).")
     # [IMP-C]
     p.add_argument("--augment",          action="store_true",
                    help="[IMP-C] Enable online data augmentation (rotation + "
@@ -513,8 +563,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every",   type=int,   default=50)
     p.add_argument("--no-amp",      action="store_true")
     # GAT stability
-    p.add_argument("--gat-lr-scale",  type=float, default=0.1)
-    p.add_argument("--gat-clip-scale", type=float, default=0.5)
+    # [FIX-1] gat_lr_scale 0.1â†’0.5 so GAT actually moves during 30-epoch runs.
+    # [FIX-1] gat_clip_scale 0.5â†’1.0 so the backbone is no longer clipped at 0.4.
+    p.add_argument("--gat-lr-scale",   type=float, default=0.5,
+                   help="GAT param-group LR = base_lr Ă— gat_lr_scale.")
+    p.add_argument("--gat-clip-scale", type=float, default=1.0,
+                   help="Unused when --gat-per-group-clip is set; kept for compat.")
+    p.add_argument("--gat-per-group-clip", action="store_true",
+                   help="[FIX-1] Clip backbone and GAT params separately "
+                        "(backbone=grad_clip, GAT=grad_clipĂ—0.5 post-unfreeze).")
+    # [FIX-2] Freeze GAT for first N epochs so backbone stabilises first.
+    p.add_argument("--gat-freeze-epochs", type=int, default=5,
+                   help="[FIX-2] Freeze GAT graph_blocks for this many epochs "
+                        "before unfreezing with its own LR warmup. 0 = disabled.")
     p.add_argument("--nan-patience",   type=int,   default=3)
     p.add_argument("--debug-gat",      action="store_true")
     # Misc
@@ -524,9 +585,9 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Helpers
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -582,14 +643,14 @@ def _grad_norms(model: nn.Module) -> Dict[str, float]:
 def _print_separator(title: str = "", width: int = 72) -> None:
     if title:
         pad = max(0, width - len(title) - 4)
-        print(f"\n{'─' * 2} {title} {'─' * pad}")
+        print(f"\n{'â”€' * 2} {title} {'â”€' * pad}")
     else:
-        print("─" * width)
+        print("â”€" * width)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Dataset helpers
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def load_all_sample_paths(data_dirs: List[Path], limit: int = 0) -> List[Path]:
     all_paths: List[Path] = []
@@ -656,9 +717,9 @@ def build_loaders(
     )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Model factory
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def build_model(
     input_dim: int,
@@ -694,6 +755,9 @@ def build_model(
         new_kwargs["mode_embed_dim"] = getattr(args, "mode_embed_dim", 64)
     if hasattr(MultiAgentModelConfig, "encoder_dropout"):
         new_kwargs["encoder_dropout"] = getattr(args, "encoder_dropout", 0.0)
+    # [V4-B] Forward GAT edge dimension
+    if hasattr(MultiAgentModelConfig, "gat_edge_dim"):
+        new_kwargs["gat_edge_dim"] = getattr(args, "gat_edge_dim", 32)
 
     try:
         cfg = MultiAgentModelConfig(**base_kwargs, **gtnet_kwargs, **new_kwargs)
@@ -737,9 +801,41 @@ def build_optimizer(
     return torch.optim.AdamW(groups, weight_decay=weight_decay)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+def _clip_gradients(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    grad_clip: float,
+    per_group: bool = False,
+    gat_clip_ratio: float = 0.5,
+) -> None:
+    """
+    Clip gradients for all or per param-group.
+
+    [FIX-1] per_group=True clips backbone and GAT separately:
+      - backbone ("base" group): clipped at grad_clip
+      - GAT ("gat" group):       clipped at grad_clip Ă— gat_clip_ratio
+    This prevents large GAT gradients (especially right after unfreeze)
+    from destabilising the backbone through the global norm calculation.
+
+    per_group=False: standard global clip_grad_norm_ (backward-compatible).
+    """
+    if grad_clip <= 0:
+        return
+    if not per_group:
+        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        return
+
+    for pg in optimizer.param_groups:
+        name  = str(pg.get("name", ""))
+        clip  = grad_clip * (gat_clip_ratio if name == "gat" else 1.0)
+        params = [p for p in pg["params"] if p.grad is not None]
+        if params:
+            nn.utils.clip_grad_norm_(params, clip)
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Training epoch
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def run_epoch(
     model: nn.Module,
@@ -752,23 +848,43 @@ def run_epoch(
     log_every: int = 0,
     use_amp: bool = True,
     debug_gat: bool = False,
+    per_group_clip: bool = False,       # [FIX-1] per-group gradient clipping
     # [IMP-B, IMP-C]
     diversity_weight: float = 0.0,
     augment: bool = False,
     aug_rot_std: float = 10.0,
     aug_hist_dropout: float = 0.1,
-) -> Tuple[float, float, float]:
+    # [IMP-D] Progressive diversity weight annealing
+    current_epoch: int = 0,
+    total_epochs: int = 1,
+    diversity_ramp_epochs: int = 20,
+) -> Tuple[float, float, float, float]:
     """
-    Run one epoch.  Returns (mean_loss, mean_ADE, mean_FDE).
+    Run one epoch.  Returns (mean_loss, mean_ADE, mean_FDE, mean_div_loss).
 
     [IMP-B] diversity_weight > 0 adds mode repulsion to loss (multimodal only).
     [IMP-C] augment=True applies random rotation + history dropout per batch.
+    [IMP-D] diversity_weight is progressively ramped from 0 to its target value
+            over diversity_ramp_epochs to avoid destabilising early training.
+            effective_div_weight = diversity_weight * min(1, epoch / ramp_epochs)
     """
     training = optimizer is not None
     model.train(training)
 
-    total_loss = total_ade = total_fde = 0.0
+    # [IMP-D] Anneal diversity weight: ramp from 0 â†’ target over ramp_epochs
+    # so early epochs focus on WTA loss before mode separation is enforced.
+    if training and diversity_weight > 0.0 and diversity_ramp_epochs > 0:
+        ramp_frac = min(1.0, float(max(1, current_epoch)) / float(diversity_ramp_epochs))
+        effective_div_weight = diversity_weight * ramp_frac
+    else:
+        effective_div_weight = diversity_weight
+
+    total_loss = total_ade = total_fde = total_div_loss = 0.0
     n_valid = nan_batches = nonfinite_preds = 0
+    # [BUG-6 FIX] Track accumulation position explicitly so a NaN batch in the
+    # middle of an accumulation window doesn't silently mix a reset gradient with
+    # gradients from the previous (valid) mini-batches in the same window.
+    accum_pos = 0  # counts valid backward steps in the current window
 
     if training:
         optimizer.zero_grad(set_to_none=True)
@@ -804,13 +920,13 @@ def run_epoch(
 
             pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
 
-            # [IMP-B] Pass diversity_weight into loss
-            loss = _compute_loss(
+            # [IMP-B] Pass effective (ramped) diversity_weight into loss
+            loss, div_loss_val = _compute_loss(
                 pred=pred,
                 target=batch["y"],
                 y_mask=batch["y_mask"],
                 agent_mask=batch["agent_mask"],
-                diversity_weight=diversity_weight if training else 0.0,
+                diversity_weight=effective_div_weight if training else 0.0,
             )
             loss_scaled = loss / accum_steps
 
@@ -821,14 +937,18 @@ def run_epoch(
             if log_every > 0 and idx % log_every == 0:
                 print(
                     f"    [WARN] step={idx}/{len(loader)}: "
-                    f"loss={loss_val} — skipping, resetting scaler"
+                    f"loss={loss_val} â€” skipping, resetting scaler"
                 )
+            # [BUG-6 FIX] Reset the entire accumulation window: discard any
+            # gradients accumulated from valid batches earlier in this window,
+            # then reset the position counter so the next batch starts fresh.
+            # This is safer than letting a partial window reach optimizer.step().
             optimizer.zero_grad(set_to_none=True)
-            if scaler is not None:
-                try:
-                    scaler._scale = torch.tensor(2.0 ** 12, device=device)
-                except Exception:
-                    pass
+            accum_pos = 0
+            # [SCALER FIX] Do NOT touch scaler._scale (private API). The
+            # GradScaler will reduce its scale automatically via scaler.update()
+            # the next time scaler.step() encounters inf/NaN gradients. No
+            # manual intervention needed here; just skip this batch cleanly.
             continue
 
         if training:
@@ -837,7 +957,12 @@ def run_epoch(
             else:
                 loss_scaled.backward()
 
-            if idx % accum_steps == 0:
+            accum_pos += 1
+            # [BUG-6 FIX] Step only when the accumulation window is full (based
+            # on valid-batch count, not raw batch index). This ensures NaN-skipped
+            # batches don't shift the optimizer step off-boundary.
+            if accum_pos >= accum_steps:
+                accum_pos = 0
                 if scaler is not None:
                     if grad_clip > 0 or debug_gat:
                         scaler.unscale_(optimizer)
@@ -848,7 +973,8 @@ def run_epoch(
                             f"gat={norms['gat']:.3e} other={norms['other']:.3e}"
                         )
                     if grad_clip > 0:
-                        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                        _clip_gradients(model, optimizer, grad_clip,
+                                        per_group=per_group_clip)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
@@ -859,7 +985,8 @@ def run_epoch(
                             f"gat={norms['gat']:.3e} other={norms['other']:.3e}"
                         )
                     if grad_clip > 0:
-                        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                        _clip_gradients(model, optimizer, grad_clip,
+                                        per_group=per_group_clip)
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -875,15 +1002,20 @@ def run_epoch(
         fde_val = _to_float(fde)
 
         if not (math.isnan(ade_val) or math.isnan(fde_val)):
-            total_loss += loss_val
-            total_ade  += ade_val
-            total_fde  += fde_val
-            n_valid    += 1
+            total_loss     += loss_val
+            total_ade      += ade_val
+            total_fde      += fde_val
+            total_div_loss += div_loss_val
+            n_valid        += 1
 
         if training and log_every > 0 and idx % log_every == 0:
+            div_info = (
+                f" div={div_loss_val:.4f}(w={effective_div_weight:.3f})"
+                if effective_div_weight > 0.0 else ""
+            )
             print(
                 f"    step={idx}/{len(loader)} loss={loss_val:.4f} "
-                f"ADE={ade_val:.3f} FDE={fde_val:.3f}"
+                f"ADE={ade_val:.3f} FDE={fde_val:.3f}{div_info}"
             )
 
     if training and nan_batches > 0:
@@ -896,15 +1028,16 @@ def run_epoch(
         )
 
     d = max(1, n_valid)
-    avg_loss = total_loss / d if n_valid > 0 else float("nan")
-    avg_ade  = total_ade  / d if n_valid > 0 else float("nan")
-    avg_fde  = total_fde  / d if n_valid > 0 else float("nan")
-    return avg_loss, avg_ade, avg_fde
+    avg_loss     = total_loss     / d if n_valid > 0 else float("nan")
+    avg_ade      = total_ade      / d if n_valid > 0 else float("nan")
+    avg_fde      = total_fde      / d if n_valid > 0 else float("nan")
+    avg_div_loss = total_div_loss / d if n_valid > 0 else 0.0
+    return avg_loss, avg_ade, avg_fde, avg_div_loss
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Single training run
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def train_single(
     *,
@@ -944,28 +1077,65 @@ def train_single(
     is_gat  = variant.enable_gat if variant else args.enable_gat
     base_lr = args.learning_rate
     gat_lr  = base_lr * (args.gat_lr_scale if is_gat else 1.0)
-    eff_clip = args.grad_clip * (args.gat_clip_scale if is_gat else 1.0)
-    if is_gat:
-        print(
-            f"  [GAT] LR groups: base={base_lr:.2e}, gat={gat_lr:.2e} "
-            f"({args.gat_lr_scale:g}×) | clip={args.grad_clip:.2f}→{eff_clip:.2f}"
-        )
+    # [FIX-1] eff_clip = grad_clip always (gat_clip_scale removed from global clip).
+    # Per-group clip is handled inside _clip_gradients when --gat-per-group-clip.
+    eff_clip     = args.grad_clip
+    per_grp_clip = getattr(args, "gat_per_group_clip", False) and is_gat
 
+    # [CRITICAL FIX] Build optimizer BEFORE freezing so GAT params are
+    # registered in AdamW's state. If we froze first, build_optimizer would
+    # skip requires_grad=False params â†’ GAT never gets Adam moments â†’ never
+    # updated after unfreeze. Frozen params with grad=None are safely skipped
+    # by AdamW internally, so having them in the group is harmless.
     optimizer = build_optimizer(
         model, base_lr=base_lr, gat_lr=gat_lr,
         weight_decay=args.weight_decay, is_gat_variant=is_gat,
     )
 
-    # [IMP-A] Scheduler selection
+    # [FIX-2] Freeze GAT graph_blocks for the first gat_freeze_epochs epochs.
+    # Must happen AFTER build_optimizer (see above).
+    freeze_epochs = int(getattr(args, "gat_freeze_epochs", 0)) if is_gat else 0
+    gat_frozen    = freeze_epochs > 0
+
+    def _set_gat_frozen(frozen: bool) -> None:
+        raw = model.module if hasattr(model, "module") else model
+        for name, param in raw.named_parameters():
+            if _is_gat_param_name(name):
+                param.requires_grad_(not frozen)
+
+    if gat_frozen:
+        _set_gat_frozen(True)
+        print(
+            f"  [GAT-freeze] Freezing graph_blocks for {freeze_epochs} epochs; "
+            f"will unfreeze at epoch {freeze_epochs + 1} with own warmup."
+        )
+
+    if is_gat:
+        clip_desc = "per-group" if per_grp_clip else f"{eff_clip:.2f}"
+        print(
+            f"  [GAT] LR groups: base={base_lr:.2e}, gat={gat_lr:.2e} "
+            f"({args.gat_lr_scale:g}Ă—) | clip={clip_desc}"
+        )
+
+    # [FIX-3] Build scheduler with GAT group_start_epochs so the GAT group's
+    # cosine budget is measured from unfreeze_epoch, not from epoch 0.
     warmup_ep = getattr(args, "warmup_epochs", 0)
     if args.cosine_lr:
+        # GAT group starts its warmup AFTER freeze phase ends.
+        gat_start  = freeze_epochs  # epoch at which GAT unfreezes
+        group_starts: Optional[Dict[str, int]] = (
+            {"gat": gat_start} if (is_gat and gat_start > 0) else None
+        )
         scheduler = WarmupCosineScheduler(
             optimizer,
             warmup_epochs=warmup_ep,
             total_epochs=epochs,
-            min_lr_ratio=0.01,
+            min_lr_ratio=0.001,  # [IMP-F] 0.01â†’0.001: exploit cosine tail better
+            group_start_epochs=group_starts,
         )
         sched_mode = f"warmup({warmup_ep})+cosine"
+        if group_starts:
+            sched_mode += f" [GAT starts ep {gat_start + 1}+warmup]"
     else:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=args.lr_patience,
@@ -982,6 +1152,7 @@ def train_single(
         f"eff_batch={args.batch_size * args.accum_steps * max(1, n_gpus)} | "
         f"LR={base_lr:.2e} | sched={sched_mode} | "
         f"early_stop_on={stop_metric} | "
+        f"freeze_epochs={freeze_epochs} | "
         f"diversity_w={getattr(args, 'diversity_weight', 0.0):.3f} | "
         f"augment={getattr(args, 'augment', False)}"
     )
@@ -999,7 +1170,39 @@ def train_single(
 
     for epoch in range(1, epochs + 1):
         t0 = time.time()
-        tr_loss, tr_ade, tr_fde = run_epoch(
+
+        # [FIX-2/4] Unfreeze GAT at the designated epoch and reset early-stop.
+        if gat_frozen and epoch > freeze_epochs:
+            gat_frozen = False
+            _set_gat_frozen(False)
+            # Reset early-stop so the post-unfreeze phase gets a full budget.
+            stale = 0
+            # [FIX-5] Reset best_metric so the frozen-phase checkpoint (with
+            # random GAT weights) doesn't block saving the real best after unfreeze.
+            best_metric = math.inf
+            # [BUG-4 FIX] Also reset best_ade_metric and best_ade_record so the
+            # independent ADE tracker doesn't keep a frozen-phase checkpoint
+            # (which has untrained GAT) as the "best ADE" model after unfreeze.
+            # Before wiping, archive the frozen-best checkpoint under a distinct
+            # name so it remains retrievable for comparison.
+            if best_ade_record:
+                frozen_best_path = out_dir / f"{run_tag}_frozen_best_ade.pt"
+                if best_ade_path.exists():
+                    import shutil
+                    shutil.copy2(best_ade_path, frozen_best_path)
+                    print(
+                        f"  [GAT-unfreeze] Archived frozen-phase best-ADE checkpoint "
+                        f"â†’ {frozen_best_path.name} "
+                        f"(ADE={best_ade_record.get('val_ade', float('nan')):.4f})"
+                    )
+            best_ade_metric = math.inf
+            best_ade_record = {}
+            print(
+                f"  [GAT-unfreeze] Epoch {epoch}: GAT graph_blocks unfrozen. "
+                f"Early-stop counter, best_metric, and best_ade_metric reset."
+            )
+
+        tr_loss, tr_ade, tr_fde, tr_div = run_epoch(
             model, train_loader, device,
             optimizer=optimizer, scaler=scaler,
             accum_steps=args.accum_steps,
@@ -1007,12 +1210,17 @@ def train_single(
             log_every=args.log_every,
             use_amp=use_amp,
             debug_gat=args.debug_gat and is_gat,
+            per_group_clip=per_grp_clip,
             diversity_weight=getattr(args, "diversity_weight", 0.0),
             augment=getattr(args, "augment", False),
             aug_rot_std=getattr(args, "aug_rot_std", 10.0),
             aug_hist_dropout=getattr(args, "aug_hist_dropout", 0.1),
+            # [IMP-D] Pass epoch info so diversity weight ramps gradually
+            current_epoch=epoch,
+            total_epochs=epochs,
+            diversity_ramp_epochs=getattr(args, "diversity_ramp_epochs", 20),
         )
-        val_loss, val_ade, val_fde = run_epoch(
+        val_loss, val_ade, val_fde, _ = run_epoch(
             model, val_loader, device, use_amp=use_amp
         )
 
@@ -1032,7 +1240,7 @@ def train_single(
 
         record = dict(
             epoch=epoch,
-            tr_loss=tr_loss, tr_ade=tr_ade, tr_fde=tr_fde,
+            tr_loss=tr_loss, tr_ade=tr_ade, tr_fde=tr_fde, tr_div=tr_div,
             val_loss=val_loss, val_ade=val_ade, val_fde=val_fde,
             lr=optimizer.param_groups[0]["lr"], lr_groups=lr_groups,
         )
@@ -1057,10 +1265,14 @@ def train_single(
             current = val_loss
         improved = (not math.isnan(current)) and current < best_metric
 
-        marker = " ✓" if improved else ""
+        # [IMP-I] Log diversity loss when active
+        div_info = (
+            f" div={tr_div:.4f}" if tr_div > 0.0 else ""
+        )
+        marker = " âœ“" if improved else ""
         print(
             f"  [{run_tag}] epoch={epoch:03d}/{epochs} lr={lr_text} t={elapsed:.0f}s | "
-            f"tr_loss={tr_loss:.4f} ADE={tr_ade:.3f} FDE={tr_fde:.3f} | "
+            f"tr_loss={tr_loss:.4f} ADE={tr_ade:.3f} FDE={tr_fde:.3f}{div_info} | "
             f"val_loss={val_loss:.4f} ADE={val_ade:.3f} FDE={val_fde:.3f}{marker}"
         )
 
@@ -1119,9 +1331,9 @@ def train_single(
     return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Ablation runner
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def run_ablation(
     *,
@@ -1141,21 +1353,25 @@ def run_ablation(
         print(f"  Quick ablation: {epochs} epochs per variant")
 
     all_results = []
-    _print_separator("ABLATION STUDY — 8 VARIANTS")
+    _print_separator("ABLATION STUDY â€” 8 VARIANTS")
     print(
-        "\n  Variant   │ Code │ GAT │ Multi │ AdpR │ Description\n"
-        "  ──────────┼──────┼─────┼───────┼──────┼──────────────────────────────"
+        "\n  Variant   â”‚ Code â”‚ GAT â”‚ Multi â”‚ AdpR â”‚ Description\n"
+        "  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€"
     )
     for v in ABLATION_VARIANTS:
-        g = "✓" if v.enable_gat else "-"
-        m = "✓" if v.enable_multimodal else "-"
-        r = "✓" if v.enable_adaptive_radius else "-"
-        print(f"  {v.name:<10}│  {v.code}  │  {g}  │   {m}   │  {r}   │ {v.description}")
+        g = "âœ“" if v.enable_gat else "-"
+        m = "âœ“" if v.enable_multimodal else "-"
+        r = "âœ“" if v.enable_adaptive_radius else "-"
+        print(f"  {v.name:<10}â”‚  {v.code}  â”‚  {g}  â”‚   {m}   â”‚  {r}   â”‚ {v.description}")
     print()
 
     for i, variant in enumerate(ABLATION_VARIANTS, start=1):
-        _print_separator(f"Variant {i}/8 — {variant.name} [{variant.code}]")
+        _print_separator(f"Variant {i}/8 â€” {variant.name} [{variant.code}]")
         variant_dir = out_dir / f"ablation_{variant.code}_{variant.name}"
+        # [FIX] Reset RNG so every variant gets the same random model init.
+        # Without this, the 8 variants receive progressively different weight
+        # initialisations, making ADE comparisons unfair.
+        set_seed(args.seed)
         try:
             result = train_single(
                 out_dir=variant_dir,
@@ -1186,7 +1402,7 @@ def run_ablation(
     print(
         f"\n  {'Variant':<14} {'Code':>4}  {'val_ADE':>8}  {'val_FDE':>8}  "
         f"{'val_loss':>10}  Status\n"
-        f"  {'─'*14}  {'─'*4}  {'─'*8}  {'─'*8}  {'─'*10}  {'─'*8}"
+        f"  {'â”€'*14}  {'â”€'*4}  {'â”€'*8}  {'â”€'*8}  {'â”€'*10}  {'â”€'*8}"
     )
 
     def _sort_key(r: dict) -> tuple:
@@ -1205,9 +1421,9 @@ def run_ablation(
     print(f"\n  [OK] Summary: {summary_path}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Per-town runner
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 TOWNS = ["Town01", "Town02", "Town03", "Town04", "Town05", "Town06", "Town07"]
 
@@ -1261,9 +1477,9 @@ def run_per_town(
     print(f"\n  [OK] Summary: {summary_path}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # main
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def main() -> int:
     args = parse_args()
@@ -1287,6 +1503,7 @@ def main() -> int:
     print(f"  Augmentation  : {getattr(args, 'augment', False)}")
     print(f"  Temporal attn : {getattr(args, 'use_temporal_attention', False)}")
     print(f"  Encoder drop  : {getattr(args, 'encoder_dropout', 0.0):.2f}")
+    print(f"  GAT edge dim  : {getattr(args, 'gat_edge_dim', 32)}")
     print(f"  Data dirs     : {[str(d) for d in data_dirs]}")
 
     all_paths = load_all_sample_paths(data_dirs, limit=args.limit_samples)

@@ -1,35 +1,30 @@
 """
-multi_agent_model.py  — GTNet v3
+multi_agent_model.py  — GTNet v4
 ═══════════════════════════════════════════════════════════════════════════════
 
-CẢI TIẾN so với v2 (dựa trên phân tích 39-epoch GTNet_Full):
+CẢI TIẾN so với v3:
 
-[IMP-1] TemporalSelfAttention (mới)
-    Lightweight single-head attention trên toàn bộ GRU output sequence.
-    Cho phép model chú ý tới những timestep quan trọng trong lịch sử
-    (phanh gấp, chuyển hướng) thay vì chỉ dùng hidden[-1].
-    Kích hoạt bằng config.use_temporal_attention = True.
+[V4-A] Adaptive Radius thực sự hoạt động
+    Implement _compute_adaptive_adj() trong forward() của MultiAgentTrajectoryPredictor.
+    Khi config.enable_adaptive_radius = True, ma trận adj gốc từ dataset
+    sẽ bị ghi đè bằng ma trận vật lý mới: bán kính tương tác mở rộng dựa
+    trên vận tốc của từng xe.
 
-[IMP-2] MultimodalDecoder — shared GRU + mode embeddings
-    Thay thế K GRUCell độc lập bằng một GRUCell chung + K learned mode
-    embeddings kích thước mode_embed_dim (default 64).
-    • Ít tham số hơn (đặc biệt khi K lớn): K × hidden_dim²×5 → hidden_dim²×5
-    • Mode embedding được nối vào GRU input ở TỪNG bước decode
-      → mode specialize thông qua context liên tục, không chỉ initial state
-    • Thêm score_head: Linear(hidden_dim → K) để dự đoán mode probability
-      (dùng cho NLL loss hoặc confidence-weighted inference sau này)
+[V4-B] Edge-aware GATLayer (RelativeEdgeEncoder)
+    GATLayer v4 nhận thêm edge_feat [B, N, N, edge_dim] từ RelativeEdgeEncoder.
+    Thêm thông tin không gian tương đối (dx, dy, distance) vào Attention.
+    Nếu config.gat_edge_dim = 0 → backward-compatible với v3 (mù không gian).
 
-[IMP-3] Encoder dropout (mới)
-    Dropout trên hidden state sau GRU encoder (config.encoder_dropout).
-    Giúp giảm chênh lệch train/val ADE (hiện tại ~3.5×).
-
-[IMP-4] Config backward-compatible
-    from_json / to_json tự động handle missing keys → có thể load
-    checkpoint cũ mà không cần thay đổi training pipeline.
+CẢI TIẾN TỪ v3:
+[IMP-1] TemporalSelfAttention
+[IMP-2] MultimodalDecoder (shared GRU + mode embeddings)
+[IMP-3] Encoder dropout
+[IMP-4] Config backward-compatible (Strict=False loading)
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, fields
 from typing import Optional, Tuple
 
@@ -56,6 +51,9 @@ class MultiAgentModelConfig:
     num_attention_heads: int = 4
     attention_dropout: float = 0.1
     attention_concat_mode: str = "concat"  # "concat" or "average"
+    
+    # [V4-B] GAT Edge Feature Dim (0 = disable)
+    gat_edge_dim: int = 32
 
     # ── Multimodal ───────────────────────────────────────────────────────────
     enable_multimodal: bool = False
@@ -88,13 +86,14 @@ class MultiAgentModelConfig:
             raise ValueError(f"radius_alpha >= 0, got {self.radius_alpha}")
         if self.mode_embed_dim < 1:
             raise ValueError(f"mode_embed_dim >= 1, got {self.mode_embed_dim}")
+        if self.gat_edge_dim < 0:
+            raise ValueError(f"gat_edge_dim >= 0, got {self.gat_edge_dim}")
 
     def to_json(self) -> dict:
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
     @classmethod
     def from_json(cls, data: dict) -> "MultiAgentModelConfig":
-        """Backward-compatible: silently ignore unknown keys, use defaults for missing keys."""
         known = {f.name for f in fields(cls)}
         filtered = {k: v for k, v in data.items() if k in known}
         return cls(**filtered)
@@ -108,34 +107,12 @@ class MultiAgentModelConfig:
             enable_adaptive_radius=True,
         )
 
-    @classmethod
-    def gat_config(cls, hidden_dim: int = 256) -> "MultiAgentModelConfig":
-        return cls(hidden_dim=hidden_dim, enable_gat=True)
-
-    @classmethod
-    def multimodal_config(cls, hidden_dim: int = 256) -> "MultiAgentModelConfig":
-        return cls(hidden_dim=hidden_dim, enable_multimodal=True)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # [IMP-1] Temporal Self-Attention
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TemporalSelfAttention(nn.Module):
-    """
-    Lightweight single-head self-attention over a GRU output sequence.
-
-    Instead of only using hidden[-1], this module attends over the full
-    history sequence and produces a context vector that emphasises the
-    most informative past timesteps (e.g. a sudden braking event).
-
-    Input:  seq  [BN, T, H]  — GRU output sequence
-            mask [BN, T]     — bool, True = valid timestep
-    Output: [BN, H]           — context vector (weighted sum + projection)
-
-    Designed to be applied AFTER the GRU encoder and BEFORE the graph blocks.
-    """
-
     def __init__(self, hidden_dim: int, dropout: float = 0.1) -> None:
         super().__init__()
         self.scale = hidden_dim ** -0.5
@@ -147,46 +124,74 @@ class TemporalSelfAttention(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, seq: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            seq:  [BN, T, H]
-            mask: [BN, T]  bool — True = valid
-        Returns:
-            context: [BN, H]
-        """
         BN, T, H = seq.shape
 
-        Q = self.q(seq)  # [BN, T, H]
+        Q = self.q(seq)
         K = self.k(seq)
         V = self.v(seq)
 
-        # Scaled dot-product scores
-        scores = torch.bmm(Q, K.transpose(1, 2)) * self.scale  # [BN, T, T]
+        scores = torch.bmm(Q, K.transpose(1, 2)) * self.scale  
 
-        # Mask padding timesteps in the key dimension
         if mask is not None:
-            # True = valid, so invert for masking
-            pad_mask = ~mask.unsqueeze(1)  # [BN, 1, T]
+            pad_mask = ~mask.unsqueeze(1)
             scores = scores.masked_fill(pad_mask, float("-inf"))
 
         attn = torch.softmax(scores, dim=-1)
-        attn = torch.nan_to_num(attn, nan=0.0)  # rows with all -inf → uniform 0
+        attn = torch.nan_to_num(attn, nan=0.0)
         attn = self.drop(attn)
 
-        out = torch.bmm(attn, V)  # [BN, T, H]
+        out = torch.bmm(attn, V)
 
-        # Use the last valid timestep as the residual anchor
-        # (fallback to seq[:, -1] which is always populated after GRU)
-        anchor = seq[:, -1, :]  # [BN, H]
-
-        # Weighted context = attention output at the query position of anchor
-        # Simpler: use global average of attention-weighted values + residual
-        ctx = out[:, -1, :]  # [BN, H] — context from the "now" query position
-        return self.norm(anchor + self.proj(ctx))  # [BN, H]
+        anchor = seq[:, -1, :]
+        ctx = out[:, -1, :]
+        return self.norm(anchor + self.proj(ctx))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Graph interaction blocks (GCN & GAT)
+# [V4-B] Edge Feature Encoder
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RelativeEdgeEncoder(nn.Module):
+    """
+    Maps relative coordinates (dx, dy, distance) between agents to an edge feature.
+    Input: last valid positions [B, N, 2]
+    Output: edge features [B, N, N, edge_dim]
+    """
+    def __init__(self, edge_dim: int):
+        super().__init__()
+        self.edge_dim = edge_dim
+        # input dim = 3: dx, dy, Euclidean distance
+        self.mlp = nn.Sequential(
+            nn.Linear(3, edge_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(edge_dim, edge_dim)
+        )
+
+    def forward(self, pos: torch.Tensor, agent_mask: torch.Tensor) -> torch.Tensor:
+        B, N, _ = pos.shape
+        # Create [B, N, N, 2] distance vectors
+        pos_i = pos.unsqueeze(2).expand(B, N, N, 2)
+        pos_j = pos.unsqueeze(1).expand(B, N, N, 2)
+        diff = pos_j - pos_i  # relative vector from i to j (dx, dy)
+        
+        # Calculate Euclidean distance [B, N, N, 1]
+        dist = torch.norm(diff, dim=-1, keepdim=True)
+        
+        # Combine [B, N, N, 3]
+        inputs = torch.cat([diff, dist], dim=-1)
+        
+        # Apply MLP to get edge features [B, N, N, edge_dim]
+        edge_feat = self.mlp(inputs)
+        
+        # Mask out invalid pairs
+        mask_bool = agent_mask.to(torch.bool)
+        valid_pair = mask_bool.unsqueeze(1) & mask_bool.unsqueeze(2) # [B, N, N]
+        
+        return edge_feat * valid_pair.unsqueeze(-1).to(edge_feat.dtype)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Graph interaction blocks (GCN & GAT v4)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class GraphInteractionBlock(nn.Module):
@@ -205,6 +210,7 @@ class GraphInteractionBlock(nn.Module):
         h: torch.Tensor,
         adj: torch.Tensor,
         agent_mask: torch.Tensor,
+        edge_feat: Optional[torch.Tensor] = None, # Ignore edge_feat for baseline GCN
     ) -> torch.Tensor:
         mask = agent_mask.to(dtype=h.dtype)
         adj = adj.to(dtype=h.dtype) * mask.unsqueeze(1) * mask.unsqueeze(2)
@@ -219,25 +225,23 @@ class GraphInteractionBlock(nn.Module):
 
 class GATLayer(nn.Module):
     """
-    Multi-head Graph Attention Network layer.
-
-    [FIX-7] Uses boolean masking to avoid fp16 -1e9 overflow.
-    Renormalizes attention weights after dropout so padded agents
-    never leak NaN into valid agents across stacked layers.
+    [V4-B] Multi-head Graph Attention Network layer (Edge-aware).
+    Receives edge_feat. If edge_dim > 0, concatenates it before calculating attention.
     """
-
     def __init__(
         self,
         hidden_dim: int,
         num_heads: int = 4,
         dropout: float = 0.1,
         concat_heads: bool = True,
+        edge_dim: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.dropout = dropout
         self.concat_heads = concat_heads
+        self.edge_dim = edge_dim
 
         if concat_heads:
             assert hidden_dim % num_heads == 0, (
@@ -251,8 +255,10 @@ class GATLayer(nn.Module):
         self.W = nn.ModuleList(
             [nn.Linear(hidden_dim, self.head_dim, bias=False) for _ in range(num_heads)]
         )
+        
+        # Attention now takes (2 * head_dim + edge_dim)
         self.attention = nn.ModuleList(
-            [nn.Linear(2 * self.head_dim, 1, bias=False) for _ in range(num_heads)]
+            [nn.Linear(2 * self.head_dim + edge_dim, 1, bias=False) for _ in range(num_heads)]
         )
         self.leaky_relu = nn.LeakyReLU(0.2)
         self.dropout_layer = nn.Dropout(dropout)
@@ -265,6 +271,7 @@ class GATLayer(nn.Module):
         h: torch.Tensor,
         adj: torch.Tensor,
         agent_mask: torch.Tensor,
+        edge_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, N, _ = h.shape
         device, dtype = h.device, h.dtype
@@ -281,7 +288,12 @@ class GATLayer(nn.Module):
             h_t = self.W[head_idx](h)  # [B, N, head_dim]
             h_i = h_t.unsqueeze(2).expand(B, N, N, self.head_dim)
             h_j = h_t.unsqueeze(1).expand(B, N, N, self.head_dim)
-            h_cat = torch.cat([h_i, h_j], dim=-1)  # [B, N, N, 2*head_dim]
+            
+            # [V4-B] Concat edge features if enabled
+            if self.edge_dim > 0 and edge_feat is not None:
+                h_cat = torch.cat([h_i, h_j, edge_feat], dim=-1)  # [B, N, N, 2*head_dim + edge_dim]
+            else:
+                h_cat = torch.cat([h_i, h_j], dim=-1)  # [B, N, N, 2*head_dim] (Backward compatible v3)
 
             e = self.attention[head_idx](h_cat).squeeze(-1)  # [B, N, N]
             e = self.leaky_relu(e)
@@ -316,33 +328,6 @@ class GATLayer(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MultimodalDecoder(nn.Module):
-    """
-    Multimodal decoder with K trajectory hypotheses.
-
-    ARCHITECTURE CHANGE (v2 → v3):
-      Old: K independent GRUCells (each K×(hidden_dim²×5) params)
-      New: 1 shared GRUCell + K learned mode embeddings (mode_embed_dim)
-
-    How it works:
-      At every decoding step t, the GRU receives:
-          input = cat([prev_delta (2-D), mode_embedding_k (mode_embed_dim)])
-      This means mode identity flows through the GRU at EVERY step,
-      not just as an initial state offset — modes diverge more naturally.
-
-    Additional score_head outputs K logits from the initial hidden state,
-    representing the model's confidence in each mode. These can be used for:
-      • Confidence-weighted averaging at inference time
-      • NLL (Gaussian Mixture) loss in future training versions
-      (Currently NOT used in loss — stored for compatibility)
-
-    Args:
-        hidden_dim:     Encoder output dimension
-        num_modes:      K — number of trajectory hypotheses
-        future_steps:   Prediction horizon
-        mode_embed_dim: Dimension of per-mode conditioning embeddings
-        dropout:        Dropout in delta_head MLP
-    """
-
     def __init__(
         self,
         hidden_dim: int,
@@ -357,41 +342,27 @@ class MultimodalDecoder(nn.Module):
         self.future_steps = future_steps
         self.mode_embed_dim = mode_embed_dim
 
-        # Learned per-mode conditioning embeddings
         self.mode_embeddings = nn.Embedding(num_modes, mode_embed_dim)
 
-        # Shared decoder: input = [prev_delta(2), mode_embed(mode_embed_dim)]
         self.decoder_cell = nn.GRUCell(
             input_size=2 + mode_embed_dim,
             hidden_size=hidden_dim,
         )
 
-        # Shared delta prediction head
         self.delta_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(p=float(dropout)),
             nn.Linear(hidden_dim, 2),
         )
-
-        # Mode score head: predict relative confidence of each mode
-        # Input: initial hidden state h → K logits
-        # NOTE: not currently used in the training loss.
-        #       Access via model.multimodal_decoder.score_head(h_flat)
         self.score_head = nn.Linear(hidden_dim, num_modes)
 
     def forward(
         self,
-        h: torch.Tensor,           # [B, N, H]
-        last_pos: torch.Tensor,    # [B, N, 2]
-        agent_mask: torch.Tensor,  # [B, N]
-    ) -> torch.Tensor:             # [B, N, K, T, 2]
-        """
-        Predict K alternative future trajectories.
-
-        Returns:
-            trajectories: [B, N, K, T, 2]  (same shape as v2, backward compatible)
-        """
+        h: torch.Tensor,
+        last_pos: torch.Tensor,
+        agent_mask: torch.Tensor,
+    ) -> torch.Tensor:
         B, N, H = h.shape
         BN = B * N
         device, dtype = h.device, h.dtype
@@ -400,42 +371,34 @@ class MultimodalDecoder(nn.Module):
         flat_pos  = last_pos.reshape(BN, 2)
         flat_mask = agent_mask.reshape(BN).to(dtype=dtype).unsqueeze(-1)
 
-        # Zero out positions for padded agents
         flat_pos = flat_pos * flat_mask
 
-        # Precompute mode embeddings for all K modes: [K, E]
         mode_ids = torch.arange(self.num_modes, device=device)
-        mode_embeds = self.mode_embeddings(mode_ids)  # [K, E]
+        mode_embeds = self.mode_embeddings(mode_ids)
 
         all_mode_preds = []
 
         for k in range(self.num_modes):
-            # Each mode starts from the SAME initial hidden state h
-            # (diversity emerges from different mode_embed at every step)
-            state     = flat_h.clone()       # [BN, H]
-            prev_pos  = flat_pos.clone()     # [BN, 2]
+            state     = flat_h.clone()
+            prev_pos  = flat_pos.clone()
             prev_delta = torch.zeros(BN, 2, device=device, dtype=dtype)
 
-            # Broadcast mode embedding: [BN, E]
             mode_emb_k = mode_embeds[k].unsqueeze(0).expand(BN, -1)
 
             mode_preds = []
             for _ in range(self.future_steps):
-                # GRU input: concat prev_delta with mode conditioning
-                gru_in = torch.cat([prev_delta, mode_emb_k], dim=-1)  # [BN, 2+E]
-                state  = self.decoder_cell(gru_in, state)               # [BN, H]
+                gru_in = torch.cat([prev_delta, mode_emb_k], dim=-1)
+                state  = self.decoder_cell(gru_in, state)
 
-                delta    = self.delta_head(state) * flat_mask           # [BN, 2]
+                delta    = self.delta_head(state) * flat_mask
                 prev_pos = prev_pos + delta
                 mode_preds.append(prev_pos)
                 prev_delta = delta
 
-            # [BN, T, 2] → store
             mode_preds_t = torch.stack(mode_preds, dim=1)
             all_mode_preds.append(mode_preds_t)
 
-        # Stack K modes: [BN, K, T, 2] → reshape → [B, N, K, T, 2]
-        all_modes = torch.stack(all_mode_preds, dim=1)          # [BN, K, T, 2]
+        all_modes = torch.stack(all_mode_preds, dim=1)
         return all_modes.reshape(B, N, self.num_modes, self.future_steps, 2)
 
 
@@ -444,14 +407,6 @@ class MultimodalDecoder(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MultiAgentTrajectoryPredictor(nn.Module):
-    """
-    GRU encoder  →  [TemporalAttention]  →  Graph blocks  →  Decoder
-
-    [IMP-1] Optional TemporalSelfAttention between encoder and graph blocks.
-    [IMP-2] MultimodalDecoder now uses shared GRU + mode embeddings.
-    [IMP-3] Optional dropout on encoder output (config.encoder_dropout).
-    """
-
     def __init__(self, config: Optional[MultiAgentModelConfig] = None) -> None:
         super().__init__()
         self.config = config or MultiAgentModelConfig()
@@ -464,21 +419,27 @@ class MultiAgentTrajectoryPredictor(nn.Module):
             batch_first=True,
         )
 
-        # [IMP-1] Temporal self-attention (optional)
+        # [IMP-1] Temporal self-attention
         if cfg.use_temporal_attention:
             self.temporal_attn = TemporalSelfAttention(
                 hidden_dim=int(cfg.hidden_dim),
                 dropout=float(cfg.dropout),
             )
         else:
-            self.temporal_attn = None  # type: ignore[assignment]
+            self.temporal_attn = None
 
-        # [IMP-3] Encoder output dropout (optional)
+        # [IMP-3] Encoder output dropout
         self.enc_dropout = (
             nn.Dropout(p=float(cfg.encoder_dropout))
             if cfg.encoder_dropout > 0.0
             else nn.Identity()
         )
+
+        # ── [V4-B] Edge Feature Encoder ─────────────────────────────────────────
+        if cfg.enable_gat and cfg.gat_edge_dim > 0:
+            self.edge_encoder = RelativeEdgeEncoder(edge_dim=int(cfg.gat_edge_dim))
+        else:
+            self.edge_encoder = None
 
         # ── Graph interaction blocks ──────────────────────────────────────────
         if cfg.enable_gat:
@@ -488,6 +449,7 @@ class MultiAgentTrajectoryPredictor(nn.Module):
                     num_heads=int(cfg.num_attention_heads),
                     dropout=float(cfg.attention_dropout),
                     concat_heads=(cfg.attention_concat_mode == "concat"),
+                    edge_dim=int(cfg.gat_edge_dim),  # [V4-B]
                 )
                 for _ in range(max(0, int(cfg.graph_layers)))
             ])
@@ -502,7 +464,6 @@ class MultiAgentTrajectoryPredictor(nn.Module):
 
         # ── Decoder ──────────────────────────────────────────────────────────
         if cfg.enable_multimodal:
-            # [IMP-2] Shared GRU + mode embeddings
             self.multimodal_decoder = MultimodalDecoder(
                 hidden_dim=int(cfg.hidden_dim),
                 num_modes=int(cfg.num_modes),
@@ -530,6 +491,56 @@ class MultiAgentTrajectoryPredictor(nn.Module):
             x.shape[0], x.shape[1], 1, 1
         ).expand(-1, -1, 1, 2)
         return torch.gather(x[..., :2], dim=2, index=last_idx).squeeze(2)
+        
+    @staticmethod
+    def _last_valid_velocities(
+        x: torch.Tensor, x_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Extract last valid (vx, vy) velocity from history for each agent."""
+        # Assuming feature dim 2 and 3 are vx and vy
+        if x.shape[-1] < 4:
+            return torch.zeros((x.shape[0], x.shape[1], 2), dtype=x.dtype, device=x.device)
+            
+        valid_counts = x_mask.long().sum(dim=-1).clamp_min(1)
+        last_idx = (valid_counts - 1).view(
+            x.shape[0], x.shape[1], 1, 1
+        ).expand(-1, -1, 1, 2)
+        return torch.gather(x[..., 2:4], dim=2, index=last_idx).squeeze(2)
+
+    def _compute_adaptive_adj(
+        self, 
+        last_pos: torch.Tensor, 
+        last_vel: torch.Tensor, 
+        agent_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        [V4-A] Dynamically compute physics-based adjacency matrix.
+        Radius = base_radius + speed * alpha
+        """
+        B, N, _ = last_pos.shape
+        device, dtype = last_pos.device, last_pos.dtype
+        
+        # Calculate speed for each agent [B, N]
+        speed = torch.norm(last_vel, dim=-1)
+        
+        # Calculate dynamic radius [B, N]
+        radius = self.config.radius_base + speed * self.config.radius_alpha
+        
+        # Create distance matrix [B, N, N]
+        pos_i = last_pos.unsqueeze(2).expand(B, N, N, 2)
+        pos_j = last_pos.unsqueeze(1).expand(B, N, N, 2)
+        dist = torch.norm(pos_j - pos_i, dim=-1)
+        
+        # Check if distance is within radius (agent i observing agent j)
+        # radius is [B, N] -> expand to [B, N, N] where radius depends on agent i
+        radius_i = radius.unsqueeze(2).expand(B, N, N)
+        adj_dynamic = (dist <= radius_i).to(dtype)
+        
+        # Mask out invalid agents
+        mask_float = agent_mask.to(dtype)
+        valid_pair = mask_float.unsqueeze(1) * mask_float.unsqueeze(2)
+        
+        return adj_dynamic * valid_pair
 
     def forward(
         self,
@@ -538,17 +549,6 @@ class MultiAgentTrajectoryPredictor(nn.Module):
         x_mask: Optional[torch.Tensor] = None,
         agent_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Args:
-            x:          [B, N, T_hist, input_dim]
-            adj:        [B, N, N]
-            x_mask:     [B, N, T_hist]  bool (True = valid timestep)
-            agent_mask: [B, N]          bool (True = valid agent)
-
-        Returns:
-            Unimodal:   [B, N, T_future, 2]
-            Multimodal: [B, N, K, T_future, 2]
-        """
         if x_mask is None:
             x_mask = torch.ones(x.shape[:3], dtype=torch.bool, device=x.device)
         if agent_mask is None:
@@ -563,32 +563,40 @@ class MultiAgentTrajectoryPredictor(nn.Module):
         flat_mask = x_mask.reshape(BN, T_hist).to(dtype=flat_x.dtype)
         flat_x    = flat_x * flat_mask.unsqueeze(-1)
 
-        encoded_seq, hidden = self.encoder(flat_x)  # encoded_seq: [BN, T, H]
+        encoded_seq, hidden = self.encoder(flat_x)
 
-        # [IMP-1] Optional temporal attention
         if self.temporal_attn is not None:
             flat_mask_bool = x_mask.reshape(BN, T_hist)
-            h_flat = self.temporal_attn(encoded_seq, flat_mask_bool)  # [BN, H]
+            h_flat = self.temporal_attn(encoded_seq, flat_mask_bool)
         else:
-            h_flat = hidden[-1]  # [BN, H] — standard: use final hidden state
+            h_flat = hidden[-1]
 
-        # [IMP-3] Encoder dropout
         h_flat = self.enc_dropout(h_flat)
 
         h = h_flat.reshape(B, N, H)
         h = h * agent_mask.to(dtype=h.dtype).unsqueeze(-1)
+        
+        # Get final position and velocity for spatial logic
+        last_pos = self._last_valid_positions(x, x_mask)  # [B, N, 2]
+        last_vel = self._last_valid_velocities(x, x_mask) # [B, N, 2]
+        
+        # ── [V4-A] Adaptive Radius Logic ───────────────────────────────────────
+        if self.config.enable_adaptive_radius:
+            adj = self._compute_adaptive_adj(last_pos, last_vel, agent_mask)
+            
+        # ── [V4-B] Edge Feature Encoding ───────────────────────────────────────
+        edge_feat = None
+        if self.edge_encoder is not None:
+            edge_feat = self.edge_encoder(last_pos, agent_mask)
 
         # ── Graph interaction ──────────────────────────────────────────────────
         for block in self.graph_blocks:
-            h = block(h, adj=adj, agent_mask=agent_mask)
+            h = block(h, adj=adj, agent_mask=agent_mask, edge_feat=edge_feat)
 
         # ── Decode future trajectory ───────────────────────────────────────────
-        last_pos = self._last_valid_positions(x, x_mask)  # [B, N, 2]
-
         if self.config.enable_multimodal:
             return self.multimodal_decoder(h, last_pos, agent_mask)
 
-        # Unimodal autoregressive decode
         state      = h.reshape(BN, H)
         prev_pos   = last_pos.reshape(BN, 2)
         prev_delta = torch.zeros_like(prev_pos)
@@ -604,11 +612,11 @@ class MultiAgentTrajectoryPredictor(nn.Module):
             preds.append(prev_pos.reshape(B, N, 2))
             prev_delta = delta
 
-        return torch.stack(preds, dim=2)  # [B, N, T, 2]
+        return torch.stack(preds, dim=2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Loss & metrics
+# Loss & metrics (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def masked_smooth_l1_loss(
@@ -629,15 +637,6 @@ def wta_loss(
     y_mask: torch.Tensor,
     agent_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Winner-Takes-All loss for multimodal predictions.
-
-    Args:
-        pred:       [B, N, K, T, 2]
-        target:     [B, N, T, 2]
-        y_mask:     [B, N, T]
-        agent_mask: [B, N]
-    """
     B, N, K, T, C = pred.shape
     target_exp = target.unsqueeze(2).expand(B, N, K, T, C)
 
@@ -650,7 +649,7 @@ def wta_loss(
     valid_steps = valid_f.squeeze(-1).sum(dim=-1).clamp_min(1.0)
     per_mode_loss = per_mode_loss.sum(dim=(-1, -2)) / (valid_steps * C)
 
-    wta, _ = per_mode_loss.min(dim=-1)  # [B, N]
+    wta, _ = per_mode_loss.min(dim=-1)
 
     mask = valid_agent.float()
     return (wta * mask).sum() / mask.sum().clamp_min(1.0)
@@ -688,16 +687,6 @@ def load_checkpoint_with_compatibility(
     device: "torch.device | str" = "cpu",
     target_config: Optional[MultiAgentModelConfig] = None,
 ) -> "tuple[MultiAgentTrajectoryPredictor, dict]":
-    """
-    Load checkpoint with full backward / forward compatibility.
-
-    Changes in v3:
-      • MultimodalDecoder keys changed (decoder_cells.{k}.* → decoder_cell.*)
-        → handled by strict=False with informative printing
-      • New keys (temporal_attn.*, enc_dropout.*) initialized randomly
-      • MultiAgentModelConfig.from_json now silently ignores unknown fields
-        and uses defaults for missing fields → no KeyError on old checkpoints
-    """
     if isinstance(device, str):
         device = torch.device(device)
 
@@ -709,11 +698,13 @@ def load_checkpoint_with_compatibility(
         ckpt_cfg = MultiAgentModelConfig()
     else:
         ckpt_cfg = MultiAgentModelConfig.from_json(cfg_dict)
+        edge_dim = getattr(ckpt_cfg, 'gat_edge_dim', 0)
         print(
             f"✓ Checkpoint config: GAT={ckpt_cfg.enable_gat}, "
             f"Multimodal={ckpt_cfg.enable_multimodal}, "
             f"AdaptiveRadius={ckpt_cfg.enable_adaptive_radius}, "
-            f"TemporalAttn={ckpt_cfg.use_temporal_attention}"
+            f"TemporalAttn={ckpt_cfg.use_temporal_attention}, "
+            f"EdgeDim={edge_dim}"
         )
 
     use_cfg = target_config if target_config is not None else ckpt_cfg
