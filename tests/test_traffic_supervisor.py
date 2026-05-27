@@ -130,7 +130,7 @@ class TrafficSupervisorRedLightTests(unittest.TestCase):
         self.assertFalse(debug["red_hard_stop_locked"])
         self.assertFalse(debug["red_hard_stop_active"])
 
-    def test_red_light_does_not_late_lock_after_stop_line_already_passed(self):
+    def test_red_light_still_hard_stops_when_stop_line_distance_jitters_close(self):
         supervisor = TrafficSupervisor({})
 
         brake = supervisor.compute(
@@ -140,10 +140,10 @@ class TrafficSupervisorRedLightTests(unittest.TestCase):
             dt=0.1,
         )
 
-        self.assertEqual(brake, 0.0)
+        self.assertEqual(brake, 1.0)
         debug = supervisor.get_debug_info()
-        self.assertFalse(debug["red_hard_stop_locked"])
-        self.assertEqual(debug["selected_target_type"], "none")
+        self.assertTrue(debug["red_hard_stop_locked"])
+        self.assertEqual(debug["selected_target_type"], "stop_line")
 
     def test_red_light_near_stop_line_overrides_stale_green_immunity(self):
         supervisor = TrafficSupervisor({})

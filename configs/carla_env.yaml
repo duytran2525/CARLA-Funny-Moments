@@ -57,7 +57,6 @@ yolo:
   nav_agent_type: "basic"
   disable_autopilot_red_light: true
   # Tracker dùng bởi Ultralytics model.track().
-  # Chạy 2 lần với "botsort.yaml" và "bytetrack.yaml" để so sánh tracking metrics.
   tracker: "botsort.yaml"
   # 1 = mỗi tick chạy YOLO (nặng nhất). Đặt 2 hoặc 3 để tăng FPS cil_yolo (dùng lại detection giữa các tick).
   inference_every_n_ticks: 3
