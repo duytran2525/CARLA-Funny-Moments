@@ -1720,6 +1720,151 @@ def write_comparison_outputs(
     comparison_txt.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+ALL_RUNS_SUMMARY_FILENAME = "all_runs_summary.csv"
+
+ALL_RUNS_BASE_FIELDS = [
+    "run_timestamp",
+    "run_dir",
+    "dry_run",
+    "map_name",
+    "weather",
+    "npc_vehicles",
+    "npc_pedestrians",
+    "model_name",
+    "model_type",
+    "frames",
+    "conf_threshold",
+    "iou_threshold",
+    "gt_detections",
+    "pred_detections",
+    "true_positives",
+    "false_positives",
+    "false_negatives",
+    "precision",
+    "recall",
+    "f1",
+    "mAP@0.5",
+    "mAP@0.5:0.95",
+    "avg_inference_ms",
+    "p50_inference_ms",
+    "p95_inference_ms",
+    "fps",
+]
+
+
+def _all_runs_summary_fields(eval_classes: Sequence[str]) -> List[str]:
+    """Build ordered field list including per-class metric columns."""
+    fields = list(ALL_RUNS_BASE_FIELDS)
+    for class_name in eval_classes:
+        safe = safe_name(class_name)
+        fields.append(f"{safe}_precision")
+        fields.append(f"{safe}_recall")
+        fields.append(f"{safe}_f1")
+        fields.append(f"{safe}_ap50")
+        fields.append(f"{safe}_map")
+    return fields
+
+
+def append_all_runs_summary(
+    out_dir: Path,
+    run_config: RunConfig,
+    metrics_by_model: Dict[str, Dict[str, Any]],
+    frames_processed: int,
+    dry_run: bool,
+) -> Path:
+    """Append one row per model to the cumulative all-runs summary CSV.
+
+    The CSV is placed in the *parent* of the per-run output directory
+    (i.e. ``outputs/detection_test_eval/all_runs_summary.csv``) so that
+    every run appends to the same file regardless of its timestamp folder.
+    """
+    summary_path = out_dir.parent / ALL_RUNS_SUMMARY_FILENAME
+    eval_classes = run_config.eval_cfg.eval_classes
+    fieldnames = _all_runs_summary_fields(eval_classes)
+
+    run_timestamp = out_dir.name
+
+    needs_header = not summary_path.exists()
+    if not needs_header:
+        try:
+            with summary_path.open("r", newline="", encoding="utf-8") as check_file:
+                reader = csv.reader(check_file)
+                existing_header = next(reader, None)
+            if existing_header is not None and list(existing_header) != fieldnames:
+                merged = list(existing_header)
+                for field_name in fieldnames:
+                    if field_name not in merged:
+                        merged.append(field_name)
+                fieldnames = merged
+        except Exception:
+            pass
+
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with summary_path.open("a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames, extrasaction="ignore")
+        if needs_header:
+            writer.writeheader()
+
+        carla_cfg = run_config.carla_cfg
+        total_npc_vehicles = (
+            carla_cfg.npc_vehicle_count
+            + carla_cfg.npc_bike_count
+            + carla_cfg.npc_motorbike_count
+        )
+
+        for model_cfg in run_config.eval_cfg.models:
+            model_name = model_cfg.name
+            metrics = metrics_by_model.get(model_name, {})
+            per_class = metrics.get("per_class", {})
+
+            row: Dict[str, Any] = {
+                "run_timestamp": run_timestamp,
+                "run_dir": str(out_dir),
+                "dry_run": str(dry_run),
+                "map_name": carla_cfg.map_name,
+                "weather": carla_cfg.weather_preset,
+                "npc_vehicles": total_npc_vehicles,
+                "npc_pedestrians": carla_cfg.npc_pedestrian_count,
+                "model_name": model_name,
+                "model_type": model_cfg.model_type,
+                "frames": int(metrics.get("frames", frames_processed)),
+                "conf_threshold": float(run_config.eval_cfg.conf_threshold),
+                "iou_threshold": float(run_config.eval_cfg.iou_threshold),
+                "gt_detections": int(metrics.get("gt_detections", 0)),
+                "pred_detections": int(metrics.get("pred_detections", 0)),
+                "true_positives": int(metrics.get("true_positives", 0)),
+                "false_positives": int(metrics.get("false_positives", 0)),
+                "false_negatives": int(metrics.get("false_negatives", 0)),
+                "precision": f"{float(metrics.get('precision', 0.0)):.6f}",
+                "recall": f"{float(metrics.get('recall', 0.0)):.6f}",
+                "f1": f"{float(metrics.get('f1', 0.0)):.6f}",
+                "mAP@0.5": f"{float(metrics.get('mAP@0.5', 0.0)):.6f}",
+                "mAP@0.5:0.95": f"{float(metrics.get('mAP@0.5:0.95', 0.0)):.6f}",
+                "avg_inference_ms": f"{float(metrics.get('avg_inference_ms', 0.0)):.3f}",
+                "p50_inference_ms": f"{float(metrics.get('p50_inference_ms', 0.0)):.3f}",
+                "p95_inference_ms": f"{float(metrics.get('p95_inference_ms', 0.0)):.3f}",
+                "fps": f"{float(metrics.get('fps', 0.0)):.1f}",
+            }
+
+            for class_name in eval_classes:
+                safe = safe_name(class_name)
+                cls_stats = per_class.get(class_name, {})
+                row[f"{safe}_precision"] = f"{float(cls_stats.get('precision', 0.0)):.6f}"
+                row[f"{safe}_recall"] = f"{float(cls_stats.get('recall', 0.0)):.6f}"
+                row[f"{safe}_f1"] = f"{float(cls_stats.get('f1', 0.0)):.6f}"
+                row[f"{safe}_ap50"] = f"{float(cls_stats.get('ap@0.5', 0.0)):.6f}"
+                row[f"{safe}_map"] = f"{float(cls_stats.get('mAP@0.5:0.95', 0.0)):.6f}"
+
+            writer.writerow(row)
+
+    logging.info(
+        "Appended %d model rows to cumulative summary: %s",
+        len(run_config.eval_cfg.models),
+        summary_path,
+    )
+    return summary_path
+
+
 def write_run_metadata(
     out_dir: Path,
     run_config: RunConfig,
@@ -1839,6 +1984,13 @@ def write_all_outputs(
         frames_processed=frames_processed,
         dry_run=dry_run,
         extra=extra_metadata,
+    )
+    append_all_runs_summary(
+        out_dir=out_dir,
+        run_config=run_config,
+        metrics_by_model=metrics_by_model,
+        frames_processed=frames_processed,
+        dry_run=dry_run,
     )
     return metrics_by_model
 
