@@ -13,8 +13,8 @@
 
 vehicle:
   filter: "vehicle.tesla.model3"
-  spawn_point: 1
-  destination_point: 50
+  spawn_point: 10
+  destination_point: 40
   role_name: "hero"
 
 spectator:
@@ -57,7 +57,6 @@ yolo:
   nav_agent_type: "basic"
   disable_autopilot_red_light: true
   # Tracker dùng bởi Ultralytics model.track().
-  # Chạy 2 lần với "botsort.yaml" và "bytetrack.yaml" để so sánh tracking metrics.
   tracker: "botsort.yaml"
   # 1 = mỗi tick chạy YOLO (nặng nhất). Đặt 2 hoặc 3 để tăng FPS cil_yolo (dùng lại detection giữa các tick).
   inference_every_n_ticks: 3
@@ -77,10 +76,10 @@ yolo:
 gtnet:
   # GTNet dùng như safety supervisor cho cil/cil_yolo.
   # Model này không thay CIL waypoint model; nó dự đoán quỹ đạo NPC và chỉ override phanh.
-  enabled: true
+  enabled: false
   # BUG FIX: gtnet_full_best.pt được train ở 20fps (dt=0.05) với history=40, future=60.
   # Phải dùng expected_dt=0.05 và history_frames=40 để khớp với training data.
-  model_path: "models/gtnet_full_best.pt"
+  model_path: "models/gtnet_full_best_ade.pt"
   history_frames: 40
   expected_dt: 0.05
   # gtnet_full_best.pt được train với adaptive-radius dataset.
@@ -91,13 +90,13 @@ gtnet:
   # 20 FPS runtime, expected_dt=0.05 => stride=1, infer every 2 ticks.
   inference_every_n_ticks: 2
   # Vẽ quỹ đạo threat trong CARLA world debug; bật khi cần kiểm tra trực quan.
-  draw_debug: true
+  draw_debug: false
 
 traffic_spawn:
-  vehicle_count: 0
-  bike_count: 0
-  motorbike_count: 0
-  pedestrian_count: 0
+  vehicle_count: 30
+  bike_count: 20
+  motorbike_count: 20
+  pedestrian_count: 20
   npc_enable_autopilot: true
 
 recording:
@@ -117,9 +116,9 @@ runtime:
   # 1) YOLO: bật/tắt lúc start qua yolo.debug_window; khi chạy bấm 'y' (xem comment ở khối yolo:).
   # 2) Route map: cửa sổ "CIL Route Map", tách khỏi vẽ route trong world (cil_enable_route_map).
   #    Bật/tắt lúc start: cil_opencv_route_map. Khi chạy: phím 'r'.
-  cil_opencv_route_map: true
+  cil_opencv_route_map: false
   # Vẽ waypoint dự đoán trong world (debug CARLA). Tắt để bớt RPC debug → FPS ổn định hơn.
-  cil_world_waypoint_debug: true
+  cil_world_waypoint_debug: false
   cil_enable_telemetry_csv: false
   cil_profile_tick_timing: false
   cil_profile_log_interval_ticks: 60

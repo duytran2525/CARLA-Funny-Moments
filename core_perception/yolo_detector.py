@@ -414,6 +414,8 @@ class YoloDetector:
             self.current_frame_id = 1
         results = self._track(frame_bgr)
         tracked_objects = self._detections_from_results(results, include_tracking=True)
+        if not tracked_objects:
+            tracked_objects = self._detections_from_results(self._predict(frame_bgr), include_tracking=True)
 
         for obj in tracked_objects:
             x1, y1, x2, y2 = [int(v) for v in obj["bbox"]]
