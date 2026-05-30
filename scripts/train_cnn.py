@@ -1,15 +1,23 @@
+#!/usr/bin/env python3
+"""
+Kaggle Training Script – WaypointPredictor from CSV + image files.
+Phiên bản tối ưu cho RTX 6000 Pro + dữ liệu recovery (15.5%).
+Lane penalty đối xứng (cả trái & phải), bỏ qua recovery.
+ĐÃ SỬA: rec_mask.squeeze(1) để an toàn với mọi batch size.
+"""
+
 from __future__ import annotations
 
+import gc
 import os
-os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
-os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
-
 import random
+import shutil
+import subprocess
 import sys
 import warnings
 from pathlib import Path
-from typing import Iterable, Optional
 
+import cv2
 import numpy as np
 import pandas as pd
 import torch
@@ -17,26 +25,30 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms as transforms
 import yaml
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-# FIX KAGGLE OOM LOG: Tắt sạch các warning tự động để tránh treo Jupyter
 warnings.filterwarnings("ignore")
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from core_perception.cnn_model import WaypointPredictor
+# ============================================================================
+# CONFIGURATION – cập nhật đường dẫn cho môi trường của bạn
+# ============================================================================
+REPO_URL = "https://github.com/duytran2525/CARLA-Funny-Moments.git"
+WORKING_DIR = "/kaggle/working/CARLA-Funny-Moments"
 
-try:
-    from core_perception.dataset import WaypointCarlaDataset
-except ImportError:  # pragma: no cover
-    WaypointCarlaDataset = None
+CSV_PATH = "/kaggle/input/datasets/trasuaolong/data-carla-recovery/data_carlav2/driving_log_with_recovery.csv"
+IMAGE_ROOT = "/kaggle/input/datasets/trasuaolong/data-carla-recovery/data_carlav2"
 
+# ============================================================================
+# 1. WORKSPACE SETUP
+# ============================================================================
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
-def load_config(config_path):
-    with open(config_path, "r", encoding="utf-8") as file:
-        return yaml.safe_load(file)
-
-
-def _to_bool(value, default: bool) -> bool:
+def _to_bool(value, default: bool = False) -> bool:
     if value is None:
         return default
     if isinstance(value, bool):
@@ -49,534 +61,650 @@ def _to_bool(value, default: bool) -> bool:
             return False
     return bool(value)
 
+def prepare_workspace() -> Path:
+    script_root = Path(__file__).resolve().parents[1]
+    target_root = Path(WORKING_DIR)
+    kaggle_detected = Path("/kaggle/input").is_dir()
+    bootstrap_default = kaggle_detected and not _is_relative_to(script_root, target_root)
+    bootstrap_enabled = _env_flag("KAGGLE_BOOTSTRAP", bootstrap_default)
 
-def set_seed(seed: Optional[int]) -> None:
-    if seed is None:
-        return
-    seed = int(seed)
+    print("🚀 ĐANG KHỞI TẠO HỆ THỐNG HUẤN LUYỆN (CSV MODE)...")
+    project_dir = script_root
+    if bootstrap_enabled:
+        if _is_relative_to(script_root, target_root):
+            print("  Đang chạy trong WORKING_DIR hiện tại; bỏ qua clone lại repo.")
+        else:
+            if target_root.exists():
+                shutil.rmtree(target_root)
+            subprocess.run(["git", "clone", REPO_URL, str(target_root)], check=True)
+            project_dir = target_root.resolve()
+
+    os.chdir(project_dir)
+    (project_dir / "models").mkdir(exist_ok=True)
+    project_text = str(project_dir)
+    if project_text not in sys.path:
+        sys.path.insert(0, project_text)
+
+    print("\n⚙️ ĐANG GHI ĐÈ CẤU HÌNH YAML...")
+    yaml_path = project_dir / "configs" / "train_params.yaml"
+    with yaml_path.open("r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    config["data_root"] = "/kaggle/working" if Path("/kaggle/working").is_dir() else str(project_dir)
+    for key in ("csv_path", "data_csv"):
+        config.pop(key, None)
+    with yaml_path.open("w", encoding="utf-8") as f:
+        yaml.dump(config, f)
+    print("✅ Đã cập nhật train_params.yaml!")
+    return project_dir
+
+def _is_relative_to(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+# ============================================================================
+# 2. DATASET CLASS
+# ============================================================================
+class WaypointCarlaDatasetCSV(Dataset):
+    def __init__(
+        self,
+        csv_path: str,
+        image_root: str,
+        transform=None,
+        is_training: bool = True,
+        train_ratio: float = 0.75,
+        seed: int = 42,
+        geometric_offset: float = 0.35,
+        include_side_cameras: bool = True,
+        min_speed_kmh: float = 1.0,
+        min_wp5_x_m: float = 3.0,
+        check_images: bool = False,
+        recovery_jitter_std: float = 0.0,
+    ):
+        self.image_root = Path(image_root)
+        self.transform = transform
+        self.is_training = is_training
+        self.recovery_jitter_std = recovery_jitter_std
+
+        print("  📋 Đang tải CSV tổng...")
+        df_full = pd.read_csv(csv_path)
+
+        # Lọc stationary
+        if {"speed", "wp_5_x"}.issubset(df_full.columns) and min_speed_kmh > 0:
+            speed = pd.to_numeric(df_full["speed"], errors="coerce")
+            wp5x = pd.to_numeric(df_full["wp_5_x"], errors="coerce")
+            mask = (speed < min_speed_kmh) & (wp5x < min_wp5_x_m)
+            before = len(df_full)
+            df_full = df_full[~mask].reset_index(drop=True)
+            print(f"  🚗 Stationary filter: {before} → {len(df_full)} rows")
+
+        # Stratified split
+        strat_col = df_full["recovery_flag"].fillna(0).astype(int)
+        indices = np.arange(len(df_full))
+        train_idx, val_idx = train_test_split(
+            indices,
+            test_size=1.0 - train_ratio,
+            stratify=strat_col,
+            random_state=seed,
+        )
+        selected_idx = train_idx if is_training else val_idx
+        selected_df = df_full.iloc[selected_idx].reset_index(drop=True)
+
+        # Camera configs
+        camera_configs = [("images_center", 0.0)]
+        if is_training and include_side_cameras:
+            camera_configs.extend([
+                ("images_left", geometric_offset),
+                ("images_right", -geometric_offset),
+            ])
+
+        print(f"  🔨 Đang xây dựng sample list ({'Train' if is_training else 'Val'})...")
+        self.samples = []
+        self.recovery_flags = []
+        skipped_wp = 0
+        skipped_img = 0
+
+        for _, row in selected_df.iterrows():
+            wp = self._extract_waypoints(row)
+            if wp is None:
+                skipped_wp += 1
+                continue
+
+            command = int(row.get("command", 0))
+            recovery = float(row.get("recovery_flag", 0.0))
+            speed_kmh = float(row.get("speed", 0.0))
+
+            fn_t0   = self._normalize_filename(row.get("image_filename", ""))
+            fn_tm03 = self._normalize_filename(row.get("image_filename_tm03", ""))
+            fn_tm06 = self._normalize_filename(row.get("image_filename_tm06", ""))
+            if not fn_t0 or not fn_tm03 or not fn_tm06:
+                skipped_img += 1
+                continue
+
+            for cam_dir, offset in camera_configs:
+                col_name = f"{cam_dir.split('_')[-1]}_camera"
+                full_cam_path = row.get(col_name)
+                if pd.isna(full_cam_path) or not isinstance(full_cam_path, str):
+                    skipped_img += 1
+                    continue
+                base_dir = os.path.dirname(full_cam_path)
+                if not base_dir:
+                    skipped_img += 1
+                    continue
+
+                img_paths = [f"{base_dir}/{fn}" for fn in (fn_t0, fn_tm03, fn_tm06)]
+
+                if check_images:
+                    missing = any(not (self.image_root / p).exists() for p in img_paths)
+                    if missing:
+                        skipped_img += 1
+                        continue
+
+                wp_cam = wp.copy()
+                wp_cam[:, 1] += offset
+
+                self.samples.append({
+                    "img_paths": img_paths,
+                    "waypoints": wp_cam,
+                    "command": command,
+                    "recovery_flag": recovery,
+                    "speed_kmh": speed_kmh,
+                })
+                self.recovery_flags.append(int(recovery))
+
+        tag = "Train" if is_training else "Val"
+        print(f"  ✅ {tag}: {len(self.samples)} samples")
+        if skipped_wp > 0:
+            print(f"     Bỏ qua {skipped_wp} rows (thiếu waypoints)")
+        if skipped_img > 0:
+            print(f"     Bỏ qua {skipped_img} camera-triplets (thiếu ảnh/đường dẫn)")
+
+        if len(self.samples) == 0:
+            raise RuntimeError(f"{tag} dataset rỗng! Kiểm tra CSV_PATH, IMAGE_ROOT và cột *_camera.")
+
+    @staticmethod
+    def _normalize_filename(value) -> str:
+        text = str(value or "").strip()
+        if not text or text.lower() == "nan":
+            return ""
+        if not text.endswith(".jpg"):
+            stem = text.split(".")[0] if "." in text else text
+            text = stem.zfill(8) + ".jpg"
+        return text
+
+    @staticmethod
+    def _extract_waypoints(row) -> np.ndarray | None:
+        keys = [f"wp_{i}_{c}" for i in range(1, 6) for c in ("x", "y")]
+        try:
+            values = [float(row[k]) for k in keys]
+        except (KeyError, TypeError, ValueError):
+            return None
+        return np.array(values, dtype=np.float32).reshape(5, 2)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def get_recovery_flags(self):
+        return list(self.recovery_flags)
+
+    # Augmentations
+    @staticmethod
+    def _random_brightness(img):
+        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+        hsv[:, :, 2] = np.clip(hsv[:, :, 2] * (1.0 + (random.random() - 0.5)), 0, 255)
+        return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+
+    @staticmethod
+    def _random_shadow(img):
+        h, w = img.shape[:2]
+        pts = np.array([[random.randint(0, w), 0], [random.randint(0, w), h],
+                        [random.randint(0, w), h], [random.randint(0, w), 0]], np.int32)
+        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+        mask = np.zeros_like(hsv[:, :, 2])
+        cv2.fillPoly(mask, [pts], 255)
+        hsv[:, :, 2][mask == 255] = (hsv[:, :, 2][mask == 255] * 0.5).astype(np.uint8)
+        return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+
+    @staticmethod
+    def _random_blur(img):
+        k = random.choice([3, 5])
+        return cv2.GaussianBlur(img, (k, k), 0)
+
+    @staticmethod
+    def _random_noise(img):
+        sigma = random.uniform(5, 15)
+        noise = np.random.normal(0, sigma, img.shape).astype(np.float32)
+        return np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _random_contrast(img):
+        factor = random.uniform(0.7, 1.3)
+        mean = np.mean(img, axis=(0, 1), keepdims=True)
+        return np.clip((img - mean) * factor + mean, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _random_cutout(img):
+        h, w = img.shape[:2]
+        ch = int(h * random.uniform(0.1, 0.3))
+        cw = int(w * random.uniform(0.1, 0.3))
+        cy, cx = random.randint(0, h), random.randint(0, w)
+        y1, y2 = max(0, cy - ch // 2), min(h, cy + ch // 2)
+        x1, x2 = max(0, cx - cw // 2), min(w, cx + cw // 2)
+        img[y1:y2, x1:x2, :] = 0
+        return img
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        waypoints = sample["waypoints"].copy()
+        command = int(sample["command"])
+        recovery = float(sample["recovery_flag"])
+        speed_norm = min(float(sample.get("speed_kmh", 0.0)), 120.0) / 120.0
+
+        do_flip = self.is_training and random.random() > 0.5
+        do_brightness = self.is_training and random.random() > 0.5
+        do_shadow = self.is_training and random.random() > 0.5
+        do_blur = self.is_training and random.random() > 0.5
+        do_noise = self.is_training and random.random() > 0.7
+        do_contrast = self.is_training and random.random() > 0.5
+        do_cutout = self.is_training and random.random() > 0.5
+
+        # Lateral jitter cho recovery (nhẹ)
+        if self.is_training and recovery > 0.5 and self.recovery_jitter_std > 0:
+            waypoints[:, 1] += np.random.normal(0, self.recovery_jitter_std, size=waypoints.shape[0]).astype(np.float32)
+
+        images = []
+        for rel_path in sample["img_paths"]:
+            full_path = self.image_root / rel_path
+            img = cv2.imread(str(full_path))
+            if img is None:
+                raise FileNotFoundError(f"Không đọc được ảnh: {full_path}")
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+            h = img.shape[0]
+            img = img[int(h * 0.45):, :, :]
+
+            if self.is_training:
+                if do_brightness: img = self._random_brightness(img)
+                if do_shadow:     img = self._random_shadow(img)
+                if do_blur:       img = self._random_blur(img)
+                if do_noise:      img = self._random_noise(img)
+                if do_contrast:   img = self._random_contrast(img)
+                if do_cutout:     img = self._random_cutout(img)
+                if do_flip:       img = cv2.flip(img, 1)
+
+            img = cv2.resize(img, (200, 66))
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2YUV)
+            images.append(img)
+
+        stacked = np.concatenate(images, axis=-1)
+        tensor = torch.from_numpy(stacked).permute(2, 0, 1).float() / 255.0
+
+        if self.transform:
+            tensor = self.transform(tensor)
+
+        if do_flip:
+            waypoints[:, 1] = -waypoints[:, 1]
+            if command == 1: command = 2
+            elif command == 2: command = 1
+
+        return (
+            tensor,
+            torch.tensor(waypoints, dtype=torch.float32),
+            torch.tensor(command, dtype=torch.long),
+            torch.tensor(recovery, dtype=torch.float32),
+            torch.tensor(speed_norm, dtype=torch.float32),
+        )
+
+# ============================================================================
+# 3. TRAINING
+# ============================================================================
+def main():
+    project_dir = prepare_workspace()
+    print("\n🔥 BẮT ĐẦU HUẤN LUYỆN (CSV + ẢNH TRỰC TIẾP)...")
+
+    from core_perception.cnn_model import WaypointPredictor
+
+    with (project_dir / "configs" / "train_params.yaml").open("r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    seed = int(config.get("seed", 42))
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-
-def print_gpu_info():
-    if not torch.cuda.is_available():
-        print("CUDA unavailable.")
-        return
-
-    num_gpus = torch.cuda.device_count()
-    print(f"Detected GPUs: {num_gpus}")
-
-    for i in range(num_gpus):
-        props = torch.cuda.get_device_properties(i)
-        print(f"  GPU {i}: {props.name}")
-        print(f"    Memory: {props.total_memory / 1024**3:.1f} GB")
-        print(f"    Compute Capability: {props.major}.{props.minor}")
-
-
-def collate_waypoint_batch(batch):
-    images, waypoints, commands, recovery_flags, speeds = zip(*batch)
-    return (
-        torch.stack(images),
-        torch.stack(waypoints).float(),
-        torch.stack(commands).long(),
-        torch.stack(recovery_flags).float()
-        if torch.is_tensor(recovery_flags[0])
-        else torch.tensor(recovery_flags, dtype=torch.float32),
-        torch.stack(speeds).float(),
-    )
-
-
-def _get_recovery_flags(dataset) -> Optional[Iterable[int]]:
-    if hasattr(dataset, "get_recovery_flags"):
-        return dataset.get_recovery_flags()
-    if hasattr(dataset, "recovery_flags"):
-        return dataset.recovery_flags
-    return None
-
-
-def _build_recovery_sampler(flags: Optional[Iterable[int]], recovery_weight: float) -> Optional[WeightedRandomSampler]:
-    if flags is None:
-        return None
-    weights = [recovery_weight if int(flag) == 1 else 1.0 for flag in flags]
-    return WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
-
-
-def _load_training_dataframe(data_root: Path, csv_path: Optional[Path]) -> tuple[pd.DataFrame, str]:
-    resolved_root = data_root.resolve()
-
-    if csv_path is not None and csv_path.exists():
-        df = pd.read_csv(csv_path)
-        if "dataset_subdir" not in df.columns:
-            try:
-                relative_parent = csv_path.resolve().parent.relative_to(resolved_root)
-            except ValueError:
-                relative_parent = None
-            if relative_parent is not None:
-                rel_text = relative_parent.as_posix()
-                if rel_text not in {"", "."}:
-                    df = df.copy()
-                    df["dataset_subdir"] = rel_text
-        return df, str(csv_path)
-
-    town_csvs = sorted(path for path in resolved_root.glob("*/driving_log.csv") if path.is_file())
-    if town_csvs:
-        frames = []
-        for town_csv in town_csvs:
-            town_df = pd.read_csv(town_csv)
-            rel_text = town_csv.parent.relative_to(resolved_root).as_posix()
-            town_df = town_df.copy()
-            town_df["dataset_subdir"] = rel_text
-            frames.append(town_df)
-        merged = pd.concat(frames, ignore_index=True)
-        return merged, f"{resolved_root} (merged {len(town_csvs)} sub-datasets)"
-
-    missing_path = csv_path if csv_path is not None else (resolved_root / "driving_log.csv")
-    raise FileNotFoundError(
-        "Cannot find training CSV. Checked "
-        f"'{missing_path}' and subdirectories matching '{resolved_root}/*/driving_log.csv'."
-    )
-
-
-def _stratified_split(df: pd.DataFrame, train_ratio: float, seed: int) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if df.empty:
-        return df.copy(), df.copy()
-
-    working_df = df.copy()
-    command_series = pd.to_numeric(working_df.get("command", 0), errors="coerce").fillna(-1).astype(int).astype(str)
-    if "dataset_subdir" in working_df.columns:
-        subdir_series = working_df["dataset_subdir"].fillna("root").astype(str)
-    else:
-        subdir_series = pd.Series(["root"] * len(working_df), index=working_df.index, dtype="object")
-    working_df["_split_key"] = subdir_series + "|" + command_series
-
-    train_parts = []
-    val_parts = []
-    for _, group in working_df.groupby("_split_key", sort=False):
-        shuffled = group.sample(frac=1.0, random_state=seed)
-        if len(shuffled) <= 1:
-            train_parts.append(shuffled)
-            continue
-
-        split_idx = int(round(float(train_ratio) * len(shuffled)))
-        split_idx = min(max(1, split_idx), len(shuffled) - 1)
-        train_parts.append(shuffled.iloc[:split_idx])
-        val_parts.append(shuffled.iloc[split_idx:])
-
-    train_df = pd.concat(train_parts, ignore_index=True) if train_parts else working_df.iloc[0:0].copy()
-    val_df = pd.concat(val_parts, ignore_index=True) if val_parts else working_df.iloc[0:0].copy()
-
-    if val_df.empty and len(train_df) > 1:
-        val_df = train_df.tail(1).copy()
-        train_df = train_df.iloc[:-1].copy()
-
-    train_df = train_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    val_df = val_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    train_df = train_df.drop(columns=["_split_key"], errors="ignore")
-    val_df = val_df.drop(columns=["_split_key"], errors="ignore")
-    return train_df, val_df
-
-
-def _print_split_summary(label: str, df: pd.DataFrame) -> None:
-    print(f"{label}: {len(df)} rows")
-    if "command" in df.columns:
-        counts = pd.to_numeric(df["command"], errors="coerce").fillna(-1).astype(int).value_counts().sort_index().to_dict()
-        print(f"  command_counts={counts}")
-    if "dataset_subdir" in df.columns:
-        counts = df["dataset_subdir"].fillna("root").astype(str).value_counts().sort_index().to_dict()
-        print(f"  dataset_counts={counts}")
-
-
-def _maybe_cap_rows(df: pd.DataFrame, limit: int, *, seed: int) -> pd.DataFrame:
-    if limit <= 0 or len(df) <= limit:
-        return df
-    return df.sample(n=int(limit), random_state=seed).reset_index(drop=True)
-
-
-def main():
-    root_dir = Path(__file__).resolve().parent.parent
-    config = load_config(root_dir / "configs" / "train_params.yaml")
-
-    seed = int(config.get("seed", 42))
-    set_seed(seed)
-    print(f"Seed: {seed}")
-    torch.set_float32_matmul_precision("high")
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-
-    data_root = Path(config.get("data_root", root_dir / "data"))
-    if not data_root.is_absolute():
-        data_root = (root_dir / data_root).resolve()
-
-    csv_path_cfg = config.get("csv_path") or config.get("data_csv")
-    csv_path = Path(csv_path_cfg) if csv_path_cfg else data_root / "driving_log.csv"
-    if not csv_path.is_absolute():
-        csv_path = (root_dir / csv_path).resolve()
-
-    model_save_path = Path(config.get("model_save_path", root_dir / "models" / "waypoint_predictor.pth"))
-    if not model_save_path.is_absolute():
-        model_save_path = (root_dir / model_save_path).resolve()
-    model_save_path.parent.mkdir(parents=True, exist_ok=True)
-    batch_size = int(config["batch_size"])
-
-    print("\n" + "=" * 70)
-    print("GPU SETUP")
-    print("=" * 70)
-
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    print_gpu_info()
-    torch.backends.cudnn.benchmark = torch.cuda.is_available()
-
-    requested_multi_gpu = config.get("use_multi_gpu")
-    if num_gpus > 0:
-        primary_device = torch.device("cuda:0")
-        if requested_multi_gpu is None:
-            use_multi_gpu = num_gpus > 1 and batch_size >= 48
-        else:
-            use_multi_gpu = num_gpus > 1 and _to_bool(requested_multi_gpu, True)
-        print(f"Using device: {num_gpus} GPU(s)")
-        if use_multi_gpu:
-            print("Mode: DataParallel")
-        elif num_gpus > 1:
-            print("Mode: Single GPU (DataParallel disabled by config/heuristic)")
-    else:
-        primary_device = torch.device("cpu")
-        use_multi_gpu = False
-        print("Using CPU")
-
-    print("\n" + "=" * 70)
-    print("DATA LOADING")
-    print("=" * 70)
+    primary_device = torch.device("cuda:0") if num_gpus > 0 else torch.device("cpu")
+    print(f"Device: {num_gpus} GPU(s)")
 
     transform = transforms.Compose([transforms.Normalize(mean=[0.5] * 9, std=[0.5] * 9)])
 
-    df, df_source = _load_training_dataframe(data_root, csv_path)
-    print(f"Loaded metadata from: {df_source}")
-    print(f"Total rows before split: {len(df)}")
+    train_ratio = float(config.get("train_split", 0.75))
+    geo_offset = float(config.get("geometric_offset", 0.35))
+    include_side = _to_bool(config.get("include_side_cameras_train"), True)
+    recovery_jitter = float(config.get("recovery_jitter_std", 0.0))
 
-    default_work_dir = "/kaggle/working" if os.path.isdir("/kaggle/working") else str(data_root)
-    work_dir = Path(config.get("work_dir", default_work_dir))
-    if not work_dir.is_absolute():
-        work_dir = (root_dir / work_dir).resolve()
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    train_csv_path = work_dir / "train_split_log.csv"
-    val_csv_path = work_dir / "val_split_log.csv"
-    if train_csv_path.exists():
-        train_csv_path.unlink()
-    if val_csv_path.exists():
-        val_csv_path.unlink()
-
-    train_split_ratio = float(config.get("train_split", 0.75))
-    train_df, val_df = _stratified_split(df, train_split_ratio, seed)
-    train_df = _maybe_cap_rows(train_df, int(config.get("max_train_rows", 0) or 0), seed=seed)
-    val_df = _maybe_cap_rows(val_df, int(config.get("max_val_rows", 0) or 0), seed=seed)
-
-    _print_split_summary("Train split", train_df)
-    _print_split_summary("Val split", val_df)
-
-    train_df.to_csv(train_csv_path, index=False)
-    val_df.to_csv(val_csv_path, index=False)
-
-    if WaypointCarlaDataset is None:
-        raise RuntimeError(
-            "WaypointCarlaDataset is unavailable in core_perception.dataset. "
-            "Fix the dataset module before training."
-        )
-
-    include_side_cameras_train = _to_bool(config.get("include_side_cameras_train"), True)
-    train_dataset = WaypointCarlaDataset(
-        csv_file=train_csv_path,
-        root_dir=data_root,
+    print(f"\n📦 Đang tạo dataset... (side_cameras={include_side})")
+    train_dataset = WaypointCarlaDatasetCSV(
+        csv_path=CSV_PATH,
+        image_root=IMAGE_ROOT,
         transform=transform,
         is_training=True,
-        geometric_offset=float(config.get("geometric_offset", 0.35)),
-        include_side_cameras=include_side_cameras_train,
+        train_ratio=train_ratio,
+        seed=seed,
+        geometric_offset=geo_offset,
+        include_side_cameras=include_side,
+        check_images=False,
+        recovery_jitter_std=recovery_jitter,
     )
-    val_dataset = WaypointCarlaDataset(
-        csv_file=val_csv_path,
-        root_dir=data_root,
+    val_dataset = WaypointCarlaDatasetCSV(
+        csv_path=CSV_PATH,
+        image_root=IMAGE_ROOT,
         transform=transform,
         is_training=False,
-        geometric_offset=float(config.get("geometric_offset", 0.35)),
+        train_ratio=train_ratio,
+        seed=seed,
+        geometric_offset=geo_offset,
         include_side_cameras=False,
+        check_images=False,
     )
 
-    if len(train_dataset) == 0:
-        raise RuntimeError("Train dataset is empty after path resolution/filtering. Check CSV schema and image layout.")
-    if len(val_dataset) == 0:
-        raise RuntimeError("Validation dataset is empty after split/path resolution. Adjust data split or dataset root.")
+    print(f"Train: {len(train_dataset)} samples")
+    print(f"Val  : {len(val_dataset)} samples")
 
-    num_workers_cfg = config.get("num_workers")
-    if num_workers_cfg is None:
-        num_workers = min(4, max(1, os.cpu_count() or 2))
-    else:
-        num_workers = max(0, int(num_workers_cfg))
-    pin_mem = torch.cuda.is_available()
-    prefetch_factor = max(2, int(config.get("prefetch_factor", 2)))
-    log_every_batches = max(0, int(config.get("log_every_batches", 0)))
-    val_log_every_batches = max(0, int(config.get("val_log_every_batches", 0)))
+    # ── DataLoader ──
+    def collate_fn(batch):
+        imgs, wps, cmds, recs, speeds = zip(*batch)
+        return (
+            torch.stack(imgs),
+            torch.stack(wps).float(),
+            torch.stack(cmds).long(),
+            torch.tensor(recs, dtype=torch.float32),
+            torch.tensor(speeds, dtype=torch.float32),
+        )
 
-    recovery_weight = float(config.get("recovery_weight", 2.0))
-    sampler = _build_recovery_sampler(_get_recovery_flags(train_dataset), recovery_weight)
-    generator = torch.Generator().manual_seed(seed)
+    batch_size = int(config.get("batch_size", 256))
+    rec_weight = float(config.get("recovery_weight", 3.0))
 
-    train_loader_kwargs = {
-        "batch_size": batch_size,
-        "shuffle": sampler is None,
-        "sampler": sampler,
-        "num_workers": num_workers,
-        "pin_memory": pin_mem,
-        "collate_fn": collate_waypoint_batch,
-        "persistent_workers": num_workers > 0,
-        "generator": generator,
-    }
-    val_loader_kwargs = {
-        "batch_size": batch_size,
-        "shuffle": False,
-        "num_workers": num_workers,
-        "pin_memory": pin_mem,
-        "collate_fn": collate_waypoint_batch,
-        "persistent_workers": num_workers > 0,
-    }
-    if num_workers > 0:
-        train_loader_kwargs["prefetch_factor"] = prefetch_factor
-        val_loader_kwargs["prefetch_factor"] = prefetch_factor
+    command_weights = {0: 1.0, 1: 5.0, 2: 5.0, 3: 2.0}
+    weights = []
+    for sample in train_dataset.samples:
+        w = command_weights.get(int(sample.get("command", 0)), 1.0)
+        if int(float(sample.get("recovery_flag", 0.0))) == 1:
+            w *= rec_weight
+        weights.append(w)
+    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
-    train_loader = DataLoader(train_dataset, **train_loader_kwargs)
-    val_loader = DataLoader(val_dataset, **val_loader_kwargs)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=3,
+        persistent_workers=True,
+        collate_fn=collate_fn,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True,
+        collate_fn=collate_fn,
+    )
 
-    if len(train_loader) == 0 or len(val_loader) == 0:
-        raise RuntimeError("DataLoader produced zero iterations. Reduce batch size or inspect dataset sizes.")
+    print(f"DataLoader: batch={batch_size}, workers=train4/val2, recovery_weight={rec_weight}")
 
-    print(f"DataLoader: batch_size={batch_size}, num_workers={num_workers}")
-    print(f"  train_steps={len(train_loader)} val_steps={len(val_loader)}")
-
-    print("\n" + "=" * 70)
-    print("MODEL SETUP")
-    print("=" * 70)
-
+    # ── Model ──
     model = WaypointPredictor().to(primary_device)
-    if primary_device.type == "cuda":
-        model = model.to(memory_format=torch.channels_last)
-    if use_multi_gpu:
-        model = nn.DataParallel(model, device_ids=list(range(num_gpus)))
-        print(f"Wrapped model with DataParallel ({num_gpus} GPUs)")
-    else:
-        print("Single-device mode")
+    print(f"  Model params: {sum(p.numel() for p in model.parameters()):,}")
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {total_params} ({trainable_params} trainable)")
-
-    print("\n" + "=" * 70)
-    print("TRAINING SETUP")
-    print("=" * 70)
-
-    huber_loss = nn.SmoothL1Loss(reduction="mean")
+    # ── Optimizer & Loss ──
+    huber = nn.SmoothL1Loss(reduction="mean")
     base_lr = float(config["learning_rate"])
-    optimizer = optim.Adam(model.parameters(), lr=base_lr)
-    lr_patience = int(config.get("lr_patience", 3))
-    lr_factor = float(config.get("lr_factor", 0.5))
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=lr_factor, patience=lr_patience,
-    )
+    backbone_lr_ratio = float(config.get("backbone_lr_ratio", 0.1))
+    optimizer = optim.Adam([
+        {"params": model.get_non_backbone_params(), "lr": base_lr},
+        {"params": model.get_backbone_params(), "lr": base_lr * backbone_lr_ratio},
+    ])
+
+    lr_scheduler_type = str(config.get("lr_scheduler", "plateau")).lower()
+    if lr_scheduler_type == "cosine":
+        effective_epochs = int(config["epochs"]) - int(config.get("warmup_epochs", 1))
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, effective_epochs), eta_min=1e-6)
+    else:
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=float(config.get("lr_factor", 0.5)),
+            patience=int(config.get("lr_patience", 3)),
+        )
+
     use_amp = torch.cuda.is_available()
     scaler = torch.amp.GradScaler("cuda" if use_amp else "cpu", enabled=use_amp)
-    lambda_wp = float(config.get("loss_lambda_wp", 1.0))
-    lambda_gnll = float(config.get("loss_lambda_gnll", 0.05))
-    lambda_smoothness = float(config.get("loss_lambda_smoothness", 0.1))
 
-    # GNLL stability params
+    lambda_wp = float(config.get("loss_lambda_wp", 1.0))
+    lambda_gnll = float(config.get("loss_lambda_gnll", 0.02))
+    lambda_smoothness = float(config.get("loss_lambda_smoothness", 0.1))
+    lambda_speed = float(config.get("loss_lambda_speed", 0.5))
+    lambda_lane = float(config.get("loss_lambda_lane", 0.3))
+
     grad_clip_norm = float(config.get("grad_clip_norm", 1.0))
     sigma_min = float(config.get("sigma_min", 0.01))
     sigma_max = float(config.get("sigma_max", 10.0))
-    warmup_epochs = int(config.get("warmup_epochs", 1))
-    aggressive_memory_cleanup = _to_bool(config.get("aggressive_memory_cleanup"), False)
+    warmup_epochs = int(config.get("warmup_epochs", 3))
+    backbone_freeze_epochs = int(config.get("backbone_freeze_epochs", 5))
 
-    print(f"Optimizer: Adam (lr={base_lr})")
-    lambda_speed = float(config.get("loss_lambda_speed", 0.5))
-    print(f"Loss weights: waypoint={lambda_wp} gnll={lambda_gnll} smoothness={lambda_smoothness} speed={lambda_speed}")
-    print(f"Mixed precision: {'enabled' if use_amp else 'disabled'}")
-    print(f"Grad clip: {grad_clip_norm}, sigma range: [{sigma_min}, {sigma_max}]")
-    print(f"Warmup epochs: {warmup_epochs}")
-
-    print("\n" + "=" * 70)
-    print("TRAINING")
-    print("=" * 70 + "\n")
+    model_save = project_dir / "models" / "waypoint_predictor_csv.pth"
+    model_save.parent.mkdir(exist_ok=True)
 
     epochs = int(config["epochs"])
-    early_stopping_patience = int(config.get("early_stopping_patience", 8))
-    best_val_loss = float("inf")
-    epochs_no_improve = 0
+    patience = int(config.get("early_stopping_patience", 8))
+    best_val = float("inf")
+    no_improve = 0
+    start_epoch = 0
 
-    for epoch in range(epochs):
-        # Linear LR warmup
+    # Resume
+    resume_path = config.get("resume_checkpoint")
+    if resume_path and os.path.isfile(resume_path):
+        print(f"\n🔄 ĐANG KHÔI PHỤC TỪ CHECKPOINT: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=primary_device, weights_only=True)
+        model.load_state_dict(checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint)
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        start_epoch = checkpoint.get("epoch", 0)
+        best_val = checkpoint.get("val_loss", float("inf"))
+        print(f"✅ Tiếp tục từ Epoch {start_epoch + 1}")
+
+    print(f"\n{'='*60}")
+    print(f"TRAINING | lr={base_lr} | grad_clip={grad_clip_norm} | rec_weight={rec_weight}")
+    print(f"{'='*60}\n")
+
+    for epoch in range(start_epoch, epochs):
+        # Backbone freeze
+        if epoch < backbone_freeze_epochs:
+            for p in model.get_backbone_params():
+                p.requires_grad = False
+            if epoch == 0:
+                print(f"  🧊 Backbone FROZEN for epochs 1-{backbone_freeze_epochs}")
+        elif epoch == backbone_freeze_epochs:
+            for p in model.get_backbone_params():
+                p.requires_grad = True
+            print(f"  🔥 Backbone UNFROZEN from epoch {epoch + 1}")
+
         if epoch < warmup_epochs:
             warmup_lr = base_lr * (epoch + 1) / max(1, warmup_epochs)
-            for pg in optimizer.param_groups:
-                pg["lr"] = warmup_lr
+            for idx, pg in enumerate(optimizer.param_groups):
+                scale = backbone_lr_ratio if idx == 1 else 1.0
+                pg["lr"] = warmup_lr * scale
 
+        # ── TRAIN ──
         model.train()
         running_loss = 0.0
         nan_batches = 0
-
-        for i, (images, waypoints, commands, recovery_flags, speeds) in enumerate(train_loader):
-            del recovery_flags
-            images = images.to(primary_device, non_blocking=True)
-            if primary_device.type == "cuda":
-                images = images.contiguous(memory_format=torch.channels_last)
-            commands = commands.to(primary_device, non_blocking=True)
-            waypoints = waypoints.to(primary_device, non_blocking=True)
+        for i, (imgs, wps, cmds, recs, speeds) in enumerate(train_loader):
+            imgs = imgs.to(primary_device, non_blocking=True)
+            cmds = cmds.to(primary_device, non_blocking=True)
+            wps = wps.to(primary_device, non_blocking=True)
+            recs = recs.to(primary_device, non_blocking=True)
             speeds = speeds.to(primary_device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda" if use_amp else "cpu", enabled=use_amp):
+                out = model(imgs, cmds, speeds)
+                pred_wp = out[:, :10].view(-1, 5, 2)
+                tgt_wp = wps.view(-1, 5, 2)
+                loss_wp = huber(pred_wp, tgt_wp)
 
-            with torch.amp.autocast(device_type="cuda" if use_amp else "cpu", enabled=use_amp):
-                outputs = model(images, commands, speeds)
-                pred_wp = outputs[:, :10].view(-1, 5, 2)
-                # Model outputs sigma; GNLL uses variance for numerical consistency.
-                pred_sigma = outputs[:, 10:15].view(-1, 5, 1).expand(-1, 5, 2).clamp(sigma_min, sigma_max)
-                pred_var = pred_sigma.pow(2).clamp(sigma_min**2, sigma_max**2)
-                target_wp = waypoints.view(-1, 5, 2)
+                # Lane penalty ĐỐI XỨNG – bỏ qua recovery
+                abs_lateral_y = torch.abs(pred_wp[..., 1])
+                lane_penalty = torch.where(
+                    abs_lateral_y > 3.0,
+                    (abs_lateral_y - 3.0).pow(2) * 2.0,
+                    torch.zeros_like(abs_lateral_y),
+                )
+                rec_mask = recs.view(-1, 1) > 0.5
+                lane_penalty = lane_penalty * (~rec_mask).float()
+                loss_lane = lane_penalty.mean()
 
-                loss_wp = huber_loss(pred_wp, target_wp)
-                loss_gnll = 0.5 * ((target_wp - pred_wp) ** 2 / pred_var + torch.log(pred_var))
+                pred_sig = out[:, 10:15].view(-1, 5, 1).expand(-1, 5, 2)
+                pred_var = pred_sig.pow(2).clamp(sigma_min**2, sigma_max**2)
+                loss_gnll = 0.5 * ((tgt_wp - pred_wp)**2 / pred_var + torch.log(pred_var))
 
                 vel = pred_wp[:, 1:] - pred_wp[:, :-1]
                 accel = vel[:, 1:] - vel[:, :-1]
                 smoothness_loss = accel.pow(2).mean()
 
-                # Speed prediction loss (CILRS-style auxiliary regularizer)
-                pred_speed = outputs[:, 15]
-                loss_speed = torch.nn.functional.mse_loss(pred_speed, speeds)
+                pred_speed = out[:, 15]
+                loss_speed = nn.functional.mse_loss(pred_speed, speeds)
 
                 loss = (lambda_wp * loss_wp
                         + lambda_gnll * loss_gnll.mean()
                         + lambda_smoothness * smoothness_loss
-                        + lambda_speed * loss_speed)
+                        + lambda_speed * loss_speed
+                        + lambda_lane * loss_lane)
 
-            # Skip NaN/Inf batches to protect optimizer state
             if not torch.isfinite(loss):
                 nan_batches += 1
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
             scaler.scale(loss).backward()
-
-            # Unscale before clipping (required for correct AMP gradient clipping)
             if grad_clip_norm > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-
             scaler.step(optimizer)
             scaler.update()
             running_loss += float(loss.item())
-            if log_every_batches > 0 and (i == 0 or (i + 1) % log_every_batches == 0):
-                current_lr = optimizer.param_groups[0]["lr"]
-                print(
-                    f"  [Train] Epoch {epoch + 1} - Batch {i + 1}/{len(train_loader)} "
-                    f"| loss={loss.item():.4f} | lr={current_lr:.2e}"
-                )
 
-        n_valid = max(1, len(train_loader) - nan_batches)
-        train_loss = running_loss / n_valid
-        if nan_batches > 0:
-            print(f"  Skipped {nan_batches} NaN/Inf batches")
+            if i % 50 == 0:
+                print(f"  [Train] Ep {epoch+1} Batch {i}/{len(train_loader)} loss={running_loss/(i+1):.4f}")
 
+        train_loss = running_loss / max(1, len(train_loader) - nan_batches)
+
+        # ── VAL ──
         model.eval()
         val_loss = 0.0
-        val_mae = 0.0
-        val_samples = 0
-
+        val_mae_norm = 0.0
+        val_mae_rec = 0.0
+        val_n_norm = 0
+        val_n_rec = 0
         with torch.no_grad():
-            for i, (images, waypoints, commands, recovery_flags, speeds) in enumerate(val_loader):
-                del recovery_flags
-                images = images.to(primary_device, non_blocking=True)
-                if primary_device.type == "cuda":
-                    images = images.contiguous(memory_format=torch.channels_last)
-                commands = commands.to(primary_device, non_blocking=True)
-                waypoints = waypoints.to(primary_device, non_blocking=True)
+            for imgs, wps, cmds, recs, speeds in val_loader:
+                imgs = imgs.to(primary_device, non_blocking=True)
+                cmds = cmds.to(primary_device, non_blocking=True)
+                wps = wps.to(primary_device, non_blocking=True)
+                recs = recs.to(primary_device, non_blocking=True)
                 speeds = speeds.to(primary_device, non_blocking=True)
 
-                with torch.amp.autocast(device_type="cuda" if use_amp else "cpu", enabled=use_amp):
-                    outputs = model(images, commands, speeds)
-                    pred_wp = outputs[:, :10].view(-1, 5, 2)
-                    pred_sigma = outputs[:, 10:15].view(-1, 5, 1).expand(-1, 5, 2).clamp(sigma_min, sigma_max)
-                    pred_var = pred_sigma.pow(2).clamp(sigma_min**2, sigma_max**2)
-                    target_wp = waypoints.view(-1, 5, 2)
+                with torch.amp.autocast("cuda" if use_amp else "cpu", enabled=use_amp):
+                    out = model(imgs, cmds, speeds)
+                    pred_wp = out[:, :10].view(-1, 5, 2)
+                    tgt_wp = wps.view(-1, 5, 2)
+                    loss_wp = huber(pred_wp, tgt_wp)
 
-                    loss_wp = huber_loss(pred_wp, target_wp)
-                    loss_gnll = 0.5 * ((target_wp - pred_wp) ** 2 / pred_var + torch.log(pred_var))
+                    abs_lateral_y = torch.abs(pred_wp[..., 1])
+                    lane_penalty = torch.where(
+                        abs_lateral_y > 3.0,
+                        (abs_lateral_y - 3.0).pow(2) * 2.0,
+                        torch.zeros_like(abs_lateral_y),
+                    )
+                    rec_mask = recs.view(-1, 1) > 0.5
+                    lane_penalty = lane_penalty * (~rec_mask).float()
+                    loss_lane = lane_penalty.mean()
+
+                    pred_sig = out[:, 10:15].view(-1, 5, 1).expand(-1, 5, 2)
+                    pred_var = pred_sig.pow(2).clamp(sigma_min**2, sigma_max**2)
+                    loss_g = 0.5 * ((tgt_wp - pred_wp)**2 / pred_var + torch.log(pred_var))
 
                     vel = pred_wp[:, 1:] - pred_wp[:, :-1]
                     accel = vel[:, 1:] - vel[:, :-1]
                     smoothness_loss = accel.pow(2).mean()
 
-                    # Speed prediction loss (CILRS-style auxiliary regularizer)
-                    pred_speed = outputs[:, 15]
-                    loss_speed = torch.nn.functional.mse_loss(pred_speed, speeds)
+                    pred_speed = out[:, 15]
+                    loss_speed = nn.functional.mse_loss(pred_speed, speeds)
 
                     loss = (lambda_wp * loss_wp
-                            + lambda_gnll * loss_gnll.mean()
+                            + lambda_gnll * loss_g.mean()
                             + lambda_smoothness * smoothness_loss
-                            + lambda_speed * loss_speed)
+                            + lambda_speed * loss_speed
+                            + lambda_lane * loss_lane)
 
-                bs = images.size(0)
+                bs = imgs.size(0)
                 val_loss += float(loss.item()) * bs
-                val_mae += float((pred_wp - target_wp).abs().mean().item()) * bs
-                val_samples += bs
-                if val_log_every_batches > 0 and (i == 0 or (i + 1) % val_log_every_batches == 0):
-                    print(f"  [Val] Epoch {epoch + 1} - Batch {i + 1}/{len(val_loader)}")
 
-        val_loss = val_loss / max(1, val_samples)
-        val_mae = val_mae / max(1, val_samples)
+                mae_per = (pred_wp - tgt_wp).abs().mean(dim=(1, 2))   # (B,)
+                rec_mask_sq = rec_mask.squeeze(1)   # FIX: an toàn với mọi batch size
+                norm_mask   = ~rec_mask_sq
 
-        if torch.cuda.is_available() and num_gpus > 0:
-            mem_allocated = torch.cuda.memory_allocated(primary_device) / 1024**3
-            mem_reserved = torch.cuda.memory_reserved(primary_device) / 1024**3
-            mem_str = f"| Mem: {mem_allocated:.2f}/{mem_reserved:.2f} GB"
-        else:
-            mem_str = ""
+                val_mae_norm += mae_per[norm_mask].sum().item()
+                val_n_norm   += norm_mask.sum().item()
+                if rec_mask_sq.any():
+                    val_mae_rec += mae_per[rec_mask_sq].sum().item()
+                    val_n_rec   += rec_mask_sq.sum().item()
 
-        print(
-            f"Epoch [{epoch + 1:2d}/{epochs}] | "
-            f"Train: {train_loss:.4f} | Val: {val_loss:.4f} (MAE={val_mae:.4f}) {mem_str}"
-        )
+        val_loss /= max(1, val_n_norm + val_n_rec)
+        val_mae_norm = val_mae_norm / max(1, val_n_norm)
+        val_mae_rec = val_mae_rec / max(1, val_n_rec)
 
-        # Only step scheduler after warmup
+        print(f"Epoch [{epoch+1:2d}/{epochs}] Train={train_loss:.4f} Val={val_loss:.4f} "
+              f"MAE_norm={val_mae_norm:.4f} MAE_rec={val_mae_rec:.4f} "
+              f"(n={val_n_norm}/{val_n_rec})")
+
         if epoch >= warmup_epochs:
-            scheduler.step(val_loss)
+            if lr_scheduler_type == "cosine":
+                scheduler.step()
+            else:
+                scheduler.step(val_loss)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            epochs_no_improve = 0
-            model_state = model.module.state_dict() if use_multi_gpu else model.state_dict()
-            # Save with metadata (backward compatible via unwrap_state_dict)
-            torch.save(
-                {"model_state_dict": model_state, "epoch": epoch + 1,
-                 "val_loss": val_loss, "val_mae": val_mae},
-                model_save_path,
-            )
-            print(f"  Saved best -> {model_save_path} (val={val_loss:.4f}, MAE={val_mae:.4f})")
+        if val_loss < best_val:
+            best_val = val_loss
+            no_improve = 0
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "epoch": epoch + 1,
+                "val_loss": val_loss,
+                "val_mae_norm": val_mae_norm,
+                "val_mae_rec": val_mae_rec,
+            }, model_save)
+            print(f"  💾 Saved best -> {model_save}")
         else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= early_stopping_patience:
-                print(f"\nEarly stopping after epoch {epoch + 1}")
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"\n⏹️ Early stopping at epoch {epoch+1}")
                 break
 
-        if aggressive_memory_cleanup and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    print("\n" + "=" * 70)
-    print("TRAINING COMPLETE")
-    print("=" * 70)
-    print(f"Best val loss: {best_val_loss:.4f}")
-    print(f"Model saved: {model_save_path}")
-
+    print(f"\n{'='*60}")
+    print(f"TRAINING COMPLETE  |  Best val loss: {best_val:.4f}")
+    print(f"   Model: {model_save}")
+    print(f"{'='*60}")
 
 if __name__ == "__main__":
     main()
