@@ -7,7 +7,7 @@
   fixed_delta: 0.05
   no_rendering: false
 
-  map: "Town07"
+  map: "Town03"
 
 
 
@@ -80,7 +80,7 @@ gtnet:
   enabled: true
   # BUG FIX: gtnet_full_best.pt được train ở 20fps (dt=0.05) với history=40, future=60.
   # Phải dùng expected_dt=0.05 và history_frames=40 để khớp với training data.
-  model_path: "models/gtnet_full_best.pt"
+  model_path: "models/gtnet_full_best_ade.pt"
   history_frames: 40
   expected_dt: 0.05
   # gtnet_full_best.pt được train với adaptive-radius dataset.

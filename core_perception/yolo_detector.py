@@ -362,10 +362,18 @@ class YoloDetector:
         if boxes is None or len(boxes) == 0:
             return detections
 
+        print("DEBUG: boxes is", boxes)
+        print("DEBUG: type(boxes) is", type(boxes))
+        print("DEBUG: include_tracking is", include_tracking)
+        try:
+            print("DEBUG: boxes.id is", getattr(boxes, 'id', 'NO_ATTR'))
+        except Exception as e:
+            print("DEBUG: boxes.id check failed with", type(e), e)
+
         xyxy = boxes.xyxy.round().to(dtype=torch.int32).cpu().numpy()
         confs = boxes.conf.float().cpu().numpy()
         class_ids = boxes.cls.to(dtype=torch.int32).cpu().numpy()
-        if include_tracking and boxes.id is not None:
+        if include_tracking and getattr(boxes, 'id', None) is not None:
             track_ids: Sequence[Any] = boxes.id.to(dtype=torch.int32).cpu().numpy()
         else:
             track_ids = [None] * len(boxes)
@@ -414,6 +422,8 @@ class YoloDetector:
             self.current_frame_id = 1
         results = self._track(frame_bgr)
         tracked_objects = self._detections_from_results(results, include_tracking=True)
+        if not tracked_objects:
+            tracked_objects = self._detections_from_results(self._predict(frame_bgr), include_tracking=True)
 
         for obj in tracked_objects:
             x1, y1, x2, y2 = [int(v) for v in obj["bbox"]]

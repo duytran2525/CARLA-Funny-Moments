@@ -1,0 +1,81 @@
+carla:
+  host: "127.0.0.1"
+  port: 2000
+  tm_port: 8000
+  timeout: 60.0
+  sync: true
+  fixed_delta: 0.033333
+  no_rendering: false
+  map: "Town03"
+
+vehicle:
+  filter: "vehicle.tesla.model3"
+  spawn_point: 1
+  destination_point: 50
+
+camera:
+  width: 640
+  height: 360
+  fov: 90.0
+
+weather:
+  preset: "ClearNoon"
+
+traffic_spawn:
+  vehicle_count: 15
+  bike_count: 5
+  motorbike_count: 5
+  pedestrian_count: 5
+  npc_enable_autopilot: true
+
+test_detection:
+  models:
+    - name: "yolo11l"
+      path: "models/yolo11l.engine"
+      type: "yolo"
+    - name: "yolo26l"
+      path: "models/yolo26l.engine"
+      type: "yolo"
+    - name: "rtdetr-resnet50"
+      path: "models/rtdetr-resnet50.engine"
+      type: "rtdetr"
+    - name: "rtdetr-l"
+      path: "models/rtdetr-l.engine"
+      type: "rtdetr"
+
+  conf_threshold: 0.5
+  iou_threshold: 0.3
+  class_iou_thresholds: {}
+  max_frames: 2000
+  inference_imgsz: 640
+  output_dir: "outputs/detection_test_eval"
+  save_frames: false
+  save_frame_stride: 30
+  target_speed_kmh: 35.0
+  log_interval_frames: 30
+
+  eval_classes:
+    - "vehicle"
+    - "two_wheeler"
+    - "pedestrian"
+    - "traffic_light_red"
+    - "traffic_light_green"
+
+  # Prefer tighter map-level traffic light head boxes over actor bounding boxes.
+  traffic_light_gt_mode: "level_bbs"
+  traffic_light_actor_fallback: true
+  traffic_light_head_max_extent_m: 2.5
+  traffic_light_head_max_volume_m3: 3.0
+  traffic_light_actor_match_radius_m: 10.0
+  traffic_light_min_bbox_dim_px: 4
+  traffic_light_min_bbox_area_px: 40
+  traffic_light_min_visible_area_ratio: 0.25
+  traffic_light_max_bbox_aspect_ratio: 8.0
+
+  gt_filters:
+    max_distance_m: 40.0
+    min_bbox_dim_px: 10
+    min_bbox_area_px: 600
+    min_visible_area_ratio: 0.50
+    min_depth_visible_ratio: 0.20
+    max_bbox_aspect_ratio: 6.0

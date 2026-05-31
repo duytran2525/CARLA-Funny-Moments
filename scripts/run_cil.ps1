@@ -12,7 +12,7 @@ param(
     [Nullable[double]]$Fps = $null,
     [string]$Device = "auto",
     [Nullable[int]]$YoloEveryNTicks = $null,
-    [string]$GTNetModel = "D:\AI\CARLA-Funny-Moments\models\gtnet_full_best.pt",
+    [string]$GTNetModel = "D:\AI\CARLA-Funny-Moments\models\gtnet_full_best_ade.pt",
     [Nullable[int]]$GTNetEveryNTicks = $null,
     [switch]$DisableGTNet,
     [switch]$GTNetDrawDebug,

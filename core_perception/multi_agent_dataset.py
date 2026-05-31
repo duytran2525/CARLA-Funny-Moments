@@ -85,20 +85,8 @@ class MultiAgentTrajectoryDataset(Dataset):
     def _ensure_6d_features(x: torch.Tensor) -> torch.Tensor:
         """
         Ensure features are 6-dimensional for backward compatibility.
-        
-        Old format (fixed radius): [num_agents, history_steps, 4]
-            Features: (local_x, local_y, heading_x, heading_y)
-        
         New format (adaptive radius): [num_agents, history_steps, 6]
             Features: (local_x, local_y, local_vx, local_vy, heading_x, heading_y)
-        
-        If old format is detected (4D features), pad with zero velocity components
-        to create 6D features: (local_x, local_y, 0.0, 0.0, heading_x, heading_y)
-        
-        Args:
-            x: Input features tensor [num_agents, history_steps, feature_dim]
-        
-        Returns:
             Features tensor with 6D features [num_agents, history_steps, 6]
         """
         if x.shape[-1] == 6:
@@ -126,23 +114,6 @@ def split_sample_paths(
     seed: int = 42,
 ) -> tuple[List[Path], List[Path]]:
     """Split sample paths into train / val sets.
-
-    BUG FIX (data leakage): the previous implementation did a plain random
-    shuffle over *all* windows, then split by index.  Because adjacent windows
-    share up to (history_steps - 1 + future_steps - 1) frames when stride = 1,
-    they are nearly identical sequences.  A random 80/20 split therefore places
-    highly correlated windows on both sides of the boundary, causing ~95%
-    feature overlap between train and val → inflated val metrics, unreliable
-    early-stopping.
-
-    Fix: group windows by their *run* (the parent directory, which corresponds
-    to one continuous CARLA recording).  Shuffle runs (not individual windows),
-    then assign whole runs to train or val.  Windows within a run are ordered
-    by sample index so temporal ordering is preserved inside each run.
-
-    If a path doesn't sit inside a recognisable run directory (flat layout),
-    we fall back to a deterministic time-ordered split: the first train_ratio
-    fraction goes to train, the rest to val — no shuffling.
     """
     import random
     from collections import defaultdict
@@ -150,21 +121,15 @@ def split_sample_paths(
     paths = [Path(p) for p in sample_paths]
     if not paths:
         return [], []
-
-    # Group by parent directory (= run directory in the per-town subdir layout
-    # produced by build_all_datasets.ps1: .../Town01/sample_000123.pt).
     run_groups: dict[Path, List[Path]] = defaultdict(list)
     for p in paths:
         run_groups[p.parent].append(p)
-
-    # Sort windows within each run by filename to preserve temporal order.
     for run in run_groups:
         run_groups[run].sort(key=lambda p: p.name)
 
-    runs = sorted(run_groups.keys())  # deterministic order before shuffle
+    runs = sorted(run_groups.keys()) 
 
     if len(runs) == 1:
-        # Single run — time-ordered split (no shuffle) to avoid leakage.
         ordered = run_groups[runs[0]]
         if len(ordered) <= 1:
             return ordered, []
