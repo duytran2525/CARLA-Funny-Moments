@@ -54,7 +54,7 @@ class WaypointScaling:
     """Hard-coded scaling factors for waypoint denormalization (meters)."""
 
     x_scale: float = 50.0
-    y_scale: float = 15.0
+    y_scale: float = 25.0
     sigma_scale: float = 10.0
     sigma_eps: float = 1e-4
 
