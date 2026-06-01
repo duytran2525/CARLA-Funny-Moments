@@ -438,3 +438,4 @@ class WaypointCarlaDataset(Dataset):
         recovery_tensor = torch.tensor(recovery_flag, dtype=torch.float32)
 
         return stacked_tensor, waypoint_tensor, command_tensor, recovery_tensor, speed_tensor
+    

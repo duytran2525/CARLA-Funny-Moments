@@ -341,7 +341,7 @@ class RouteMapVisualizer:
 
 		if len(route_xy) >= 2:
 			route_pixels = np.array([proj(pt) for pt in route_xy], dtype=np.int32).reshape((-1, 1, 2))
-			cv2.polylines(canvas, [route_pixels], False, (0, 220, 255), 2)
+			cv2.polylines(canvas, [route_pixels], False, (255, 220, 0), 2)
 
 		if len(trajectory_xy) >= 2:
 			traj_pixels = np.array([proj(pt) for pt in trajectory_xy], dtype=np.int32).reshape((-1, 1, 2))

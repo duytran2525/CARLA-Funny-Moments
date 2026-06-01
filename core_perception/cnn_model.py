@@ -260,6 +260,7 @@ class WaypointPredictor(nn.Module):
         self,
         scaling: WaypointScaling | None = None,
         pretrained_backbone: bool = True,
+        local_weights_path: str | None = None,  # đường dẫn file local .pth
     ) -> None:
         super().__init__()
         self.scaling = scaling or WaypointScaling()
@@ -268,8 +269,6 @@ class WaypointPredictor(nn.Module):
         self.stem = PhysicsAwareStem(in_channels=9, out_channels=32)
 
         # ── Adapter: bridge stem output to RegNet trunk input ──
-        # RegNet stem normally outputs 32ch; we skip it and feed our
-        # 32ch temporal features directly into the trunk stages.
         self.adapter = nn.Sequential(
             nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(32),
@@ -277,7 +276,7 @@ class WaypointPredictor(nn.Module):
         )
 
         # ── RegNetY-400MF backbone (pretrained, stem skipped) ──
-        self._init_backbone(pretrained_backbone)
+        self._init_backbone(pretrained_backbone, local_weights_path)
 
         c1, c2, c3, c4 = self._REGNET_CHANNELS  # 48, 104, 208, 440
 
@@ -315,25 +314,38 @@ class WaypointPredictor(nn.Module):
 
         self._init_non_backbone_weights()
 
-    def _init_backbone(self, pretrained: bool) -> None:
-        """Load RegNetY-400MF trunk stages from torchvision."""
+    def _init_backbone(self, pretrained: bool, local_weights_path: str | None) -> None:
+        """Load RegNetY-400MF trunk stages from torchvision, optionally from local file."""
         if _tv_models is None:
             raise ImportError(
                 "torchvision is required for WaypointPredictor. "
                 "Install with: pip install torchvision"
             )
-        weights = (
-            _tv_models.RegNet_Y_400MF_Weights.IMAGENET1K_V2
-            if pretrained
-            else None
-        )
-        _regnet = _tv_models.regnet_y_400mf(weights=weights)
-        # Extract trunk stages, skip stem (we use PhysicsAwareStem instead)
-        # and skip fc classifier (we use our own heads).
-        self.backbone_stage1 = _regnet.trunk_output.block1  # 32->48, stride 2
-        self.backbone_stage2 = _regnet.trunk_output.block2  # 48->104, stride 2
-        self.backbone_stage3 = _regnet.trunk_output.block3  # 104->208, stride 2
-        self.backbone_stage4 = _regnet.trunk_output.block4  # 208->440, stride 2
+
+        # Đường dẫn file local cứng (dùng trong Kaggle offline)
+        # Bạn có thể thay đổi nếu cần, hoặc truyền qua tham số local_weights_path.
+        if local_weights_path is None:
+            local_weights_path = "/kaggle/input/models/trasuaolong/pretrained-regnet/tensorflow2/default/1/regnet_y_400mf.pth"
+
+        if pretrained and local_weights_path and __import__('os').path.isfile(local_weights_path):
+            # Load kiến trúc không pretrained, rồi gán state dict từ file local
+            _regnet = _tv_models.regnet_y_400mf(weights=None)
+            state_dict = torch.load(local_weights_path, map_location='cpu')
+            _regnet.load_state_dict(state_dict)
+        else:
+            # Hoặc dùng pretrained từ torchvision (cần Internet) hoặc không pretrained
+            weights = (
+                _tv_models.RegNet_Y_400MF_Weights.IMAGENET1K_V2
+                if pretrained
+                else None
+            )
+            _regnet = _tv_models.regnet_y_400mf(weights=weights)
+
+        # Extract trunk stages, skip stem and fc
+        self.backbone_stage1 = _regnet.trunk_output.block1
+        self.backbone_stage2 = _regnet.trunk_output.block2
+        self.backbone_stage3 = _regnet.trunk_output.block3
+        self.backbone_stage4 = _regnet.trunk_output.block4
         del _regnet
 
     def _init_non_backbone_weights(self) -> None:

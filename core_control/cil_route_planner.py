@@ -156,8 +156,18 @@ class CILRoutePlanner:
             return []
 
         planner = None
-        if hasattr(nav_agent, "get_local_planner"):
-            planner = nav_agent.get_local_planner()
+        for attr_name in ("get_local_planner", "_local_planner"):
+            if hasattr(nav_agent, attr_name):
+                attr = getattr(nav_agent, attr_name)
+                if callable(attr):
+                    try:
+                        planner = attr()
+                        break
+                    except Exception:
+                        pass
+                else:
+                    planner = attr
+                    break
         if planner is None:
             return []
 
