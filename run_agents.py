@@ -2510,6 +2510,7 @@ class CILAgent(BaseAgent):
         self._init_gtnet_supervisor()
         self._init_navigation_agent(world, vehicle)
         self._command_oracle.reset()
+        self._command_delay_buffer.clear()
 
         self._collector = DataCollector(
             output_dir=self.config.collect_data_dir,
@@ -3382,12 +3383,19 @@ class CILAgent(BaseAgent):
         return bool(waypoint is not None and getattr(waypoint, "is_junction", False))
 
     def _get_local_planner(self):
-        if self._nav_agent is None or not hasattr(self._nav_agent, "get_local_planner"):
+        if self._nav_agent is None:
             return None
-        try:
-            return self._nav_agent.get_local_planner()
-        except Exception:
-            return None
+        for attr_name in ("get_local_planner", "_local_planner"):
+            if hasattr(self._nav_agent, attr_name):
+                attr = getattr(self._nav_agent, attr_name)
+                if callable(attr):
+                    try:
+                        return attr()
+                    except Exception:
+                        pass
+                else:
+                    return attr
+        return None
 
     @staticmethod
     def _planner_queue_size(planner: Any) -> Optional[int]:
@@ -3547,9 +3555,7 @@ class CILAgent(BaseAgent):
         if self._nav_agent is None:
             return
 
-        planner = None
-        if hasattr(self._nav_agent, "get_local_planner"):
-            planner = self._nav_agent.get_local_planner()
+        planner = self._get_local_planner()
 
         if planner is not None and hasattr(planner, "run_step"):
             try:
@@ -4956,14 +4962,17 @@ class CILAgent(BaseAgent):
                         and step_idx - int(self._last_replan_tick) >= 30
                     ):
                         try:
+                            self._route_start_location = vehicle.get_location()
                             set_navigation_destination(
                                 self._nav_agent,
-                                vehicle.get_location(),
+                                self._route_start_location,
                                 self._route_destination_location,
                             )
                             self._last_replan_tick = int(step_idx)
+                            self._cache_reference_route_plan(force=True)
+                            self._command_oracle.reset()
                             logging.warning(
-                                "CIL ignored early planner_done at %.2fm from D; reissued destination.",
+                                "CIL ignored early planner_done at %.2fm from D; reissued destination and refreshed reference route.",
                                 float(destination_distance_m),
                             )
                         except Exception as exc:
@@ -5358,6 +5367,7 @@ class CILAgent(BaseAgent):
         self._route_history_xy = []
         self._route_planner.reset_runtime_state()
         self._command_oracle.reset()
+        self._command_delay_buffer.clear()
         self._active_navigation_command = 0
         self._active_command_source = "none"
         self._command_phase = "cruise"
