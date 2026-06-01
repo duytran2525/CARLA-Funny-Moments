@@ -811,6 +811,7 @@ class RunConfig:
     cil_command_trigger_min_m: float
     cil_command_trigger_max_m: float
     cil_use_pure_pursuit: bool
+    cil_use_carla_waypoints: bool
     cil_lane_constrain_blended: bool
 
 class BaseSession:
@@ -4428,7 +4429,7 @@ class CILAgent(BaseAgent):
             waypoints = np.asarray(pred_waypoints, dtype=np.float32)
             if waypoints.ndim != 2 or waypoints.shape[1] != 2:
                 return pred_waypoints
-            if waypoints.shape[0] < 2:
+            if waypoints.shape[0] < 1:
                 return waypoints
 
             world_map = self.session.world.get_map()
@@ -4484,6 +4485,8 @@ class CILAgent(BaseAgent):
                 valid_lane_points += 1
 
             if valid_lane_points < 2:
+                if valid_lane_points >= 1:
+                    return lane_projected.astype(np.float32)
                 return waypoints
 
             # Control points for smooth transfer (ego-frame)
@@ -5043,10 +5046,17 @@ class CILAgent(BaseAgent):
 
         control_t0 = time.perf_counter()
 
-        # ── Use MODEL waypoints for control (optional smooth lane blending constraint) ──
-        # CARLA route is kept for command extraction; this optional constraint uses
-        # map lanes only to smooth/correct geometry, not to replace planner commands.
-        if bool(self.config.cil_lane_constrain_blended):
+        if bool(self.config.cil_use_carla_waypoints):
+            carla_waypoints = self._route_locations_to_ego_waypoints(
+                vehicle,
+                route_locations,
+                max_points=15,
+            )
+            if carla_waypoints is None or (np is not None and carla_waypoints.shape[0] < 2):
+                pred_waypoints = model_waypoints
+            else:
+                pred_waypoints = carla_waypoints
+        elif bool(self.config.cil_lane_constrain_blended):
             pred_waypoints = self._constrain_waypoints_to_lane(model_waypoints, vehicle, command)
         else:
             pred_waypoints = model_waypoints
@@ -7256,6 +7266,19 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable smooth lane-constrain blending and use raw model waypoints.",
     )
+    parser.add_argument(
+        "--cil-use-carla-waypoints",
+        dest="cil_use_carla_waypoints",
+        action="store_true",
+        default=None,
+        help="Use CARLA route waypoints for CIL pure-pursuit control.",
+    )
+    parser.add_argument(
+        "--no-cil-use-carla-waypoints",
+        dest="cil_use_carla_waypoints",
+        action="store_false",
+        help="Use CIL model-predicted waypoints for pure-pursuit control.",
+    )
     parser.add_argument("--camera-width", type=int, default=None)
     parser.add_argument("--camera-height", type=int, default=None)
     parser.add_argument("--camera-fov", type=float, default=None)
@@ -7516,6 +7539,18 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     cil_use_pure_pursuit = _to_bool(
         _cfg_get(env_cfg, "cil", "use_pure_pursuit", False),
         False,
+    )
+    cil_use_carla_waypoints = _to_bool(
+        args.cil_use_carla_waypoints,
+        _to_bool(
+            _cfg_get(
+                env_cfg,
+                "cil",
+                "use_carla_waypoints",
+                _cfg_get(env_cfg, "cil", "waypoint_carla", False),
+            ),
+            False,
+        ),
     )
     cil_lane_constrain_blended = _to_bool(
         args.cil_lane_constrain_blended,
@@ -7804,6 +7839,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         cil_command_trigger_min_m=cil_command_trigger_min_m,
         cil_command_trigger_max_m=cil_command_trigger_max_m,
         cil_use_pure_pursuit=cil_use_pure_pursuit,
+        cil_use_carla_waypoints=cil_use_carla_waypoints,
         cil_lane_constrain_blended=cil_lane_constrain_blended,
     )
 

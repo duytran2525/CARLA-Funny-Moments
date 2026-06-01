@@ -90,6 +90,18 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Limit number of samples for testing (0 = no limit)",
     )
+    parser.add_argument(
+        "--radius-base",
+        type=float,
+        default=40.0,
+        help="Base radius in meters for adaptive radius (default: 40.0)",
+    )
+    parser.add_argument(
+        "--radius-alpha",
+        type=float,
+        default=1.0,
+        help="Velocity scaling factor for adaptive radius (default: 1.0)",
+    )
     
     return parser.parse_args()
 
@@ -366,6 +378,8 @@ def train_variant(
         enable_multimodal=enable_multimodal,
         num_modes=3,
         enable_adaptive_radius=enable_adaptive_radius,
+        radius_base=float(args.radius_base),
+        radius_alpha=float(args.radius_alpha),
     )
     
     # Create model and optimizer

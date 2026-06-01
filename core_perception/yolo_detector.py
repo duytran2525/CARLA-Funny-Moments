@@ -362,14 +362,6 @@ class YoloDetector:
         if boxes is None or len(boxes) == 0:
             return detections
 
-        print("DEBUG: boxes is", boxes)
-        print("DEBUG: type(boxes) is", type(boxes))
-        print("DEBUG: include_tracking is", include_tracking)
-        try:
-            print("DEBUG: boxes.id is", getattr(boxes, 'id', 'NO_ATTR'))
-        except Exception as e:
-            print("DEBUG: boxes.id check failed with", type(e), e)
-
         xyxy = boxes.xyxy.round().to(dtype=torch.int32).cpu().numpy()
         confs = boxes.conf.float().cpu().numpy()
         class_ids = boxes.cls.to(dtype=torch.int32).cpu().numpy()

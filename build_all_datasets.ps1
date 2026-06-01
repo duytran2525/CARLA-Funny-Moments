@@ -3,8 +3,9 @@ param(
     [string]$OutputDir = "data/multi_agent_20fps/processed_adaptive",
     [double]$Fps = 20.0,
     [switch]$AdaptiveRadius,
-    [double]$RadiusBase = 20.0,
-    [double]$RadiusAlpha = 0.5
+    [double]$RadiusBase = 40.0,
+    [double]$RadiusAlpha = 1.0,
+    [int]$Limit = 10000
 )
 
 # PowerShell script to build datasets from all collected CSV files.
@@ -91,7 +92,7 @@ foreach ($csv in $csvFiles) {
             "--adjacency-radius-m", "100.0",
             "--min-agents", "2",
             "--allow-missing",
-            "--limit", "10000"
+            "--limit", [string]$Limit
         )
         if ($AdaptiveRadius) {
             $buildArgs += @(

@@ -87,14 +87,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--radius-base",
         type=float,
-        default=20.0,
-        help="Base radius in meters for adaptive radius mode (default: 20.0).",
+        default=40.0,
+        help="Base radius in meters for adaptive radius mode (default: 40.0).",
     )
     parser.add_argument(
         "--radius-alpha",
         type=float,
-        default=0.5,
-        help="Velocity scaling factor for adaptive radius mode (default: 0.5).",
+        default=1.0,
+        help="Velocity scaling factor for adaptive radius mode (default: 1.0).",
     )
     parser.add_argument(
         "--limit",

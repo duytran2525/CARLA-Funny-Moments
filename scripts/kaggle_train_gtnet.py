@@ -562,6 +562,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--enable-gat",             action="store_true")
     p.add_argument("--enable-multimodal",      action="store_true")
     p.add_argument("--enable-adaptive-radius", action="store_true")
+    p.add_argument("--radius-base",            type=float, default=40.0,
+                   help="[V4-A] Base radius in meters for adaptive radius (default: 40.0).")
+    p.add_argument("--radius-alpha",           type=float, default=1.0,
+                   help="[V4-A] Velocity scaling factor for adaptive radius (default: 1.0).")
 
     # â”€â”€ Training config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     p.add_argument("--grad-clip",                type=float, default=1.0)
@@ -807,6 +811,11 @@ def build_model(
     # [V4-B] Forward GAT edge dimension
     if hasattr(MultiAgentModelConfig, "gat_edge_dim"):
         new_kwargs["gat_edge_dim"] = getattr(args, "gat_edge_dim", 32)
+    # [V4-A] Forward adaptive radius hyperparameters
+    if hasattr(MultiAgentModelConfig, "radius_base"):
+        new_kwargs["radius_base"] = getattr(args, "radius_base", 40.0)
+    if hasattr(MultiAgentModelConfig, "radius_alpha"):
+        new_kwargs["radius_alpha"] = getattr(args, "radius_alpha", 1.0)
 
     try:
         cfg = MultiAgentModelConfig(**base_kwargs, **gtnet_kwargs, **new_kwargs)
