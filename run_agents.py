@@ -338,11 +338,11 @@ def _draw_yellow_danger_corridor(
         points = np.array(danger_polygon, dtype=np.int32).reshape((-1, 1, 2))
         
         # Màu vàng
-        corridor_color = (0, 255, 255) 
+        corridor_color = (0, 255, 255)  # BGR: Yellow
         
         # Vẽ fill nhạt
         overlay = frame_bgr.copy()
-        cv2.fillPoly(overlay, [points], (30, 200, 255))  
+        cv2.fillPoly(overlay, [points], (30, 200, 255))  # Fill màu cam nhạt
         cv2.addWeighted(overlay, 0.25, frame_bgr, 0.75, 0.0, frame_bgr)
         
         # Vẽ edge đậm

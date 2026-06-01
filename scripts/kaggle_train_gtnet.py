@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -92,10 +93,34 @@ except (ImportError, TypeError):
 
 # â”€â”€ sys.path setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CORE_PARENT  = Path("/kaggle/input/datasets/dungnguyentrung/f1234567")
-for _root in (CORE_PARENT, PROJECT_ROOT):
-    if str(_root) not in sys.path:
-        sys.path.insert(0, str(_root))
+
+
+def _candidate_project_roots() -> List[Path]:
+    roots: List[Path] = []
+    env_root = os.environ.get("GTNET_PROJECT_ROOT", "").strip()
+    if env_root:
+        roots.append(Path(env_root).expanduser())
+
+    roots.extend([PROJECT_ROOT, PROJECT_ROOT.parent, Path("/kaggle/working")])
+
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.exists():
+        roots.append(kaggle_input)
+        for pattern in ("*", "*/*", "*/*/*"):
+            for candidate in kaggle_input.glob(pattern):
+                if candidate.is_dir() and (candidate / "core_perception").exists():
+                    roots.append(candidate)
+    return roots
+
+
+for _root in _candidate_project_roots():
+    try:
+        root = _root.resolve()
+    except OSError:
+        root = _root
+    root_text = str(root)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
 
 from core_perception.multi_agent_dataset import (  # noqa: E402
     MultiAgentTrajectoryDataset,
@@ -184,7 +209,14 @@ def _compute_metrics(
     target: torch.Tensor,
     y_mask: torch.Tensor,
     agent_mask: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    miss_threshold: float = 2.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute ADE, FDE, and MissRate.
+
+    Returns:
+        (ade, fde, miss_rate) where miss_rate is the fraction of valid
+        agents whose best-mode FDE exceeds *miss_threshold* metres.
+    """
     valid_agent = agent_mask & y_mask.any(dim=-1)
 
     if pred.dim() == 4:
@@ -194,8 +226,10 @@ def _compute_metrics(
         ade = (disp * valid_f).sum() / valid_f.sum().clamp_min(1.0)
         fde_per_agent = _last_valid_displacement(disp, y_mask, agent_mask)
         mask = valid_agent.to(dtype=pred.dtype)
-        fde = (fde_per_agent * mask).sum() / mask.sum().clamp_min(1.0)
-        return ade, fde
+        n_valid = mask.sum().clamp_min(1.0)
+        fde = (fde_per_agent * mask).sum() / n_valid
+        miss = ((fde_per_agent > miss_threshold) & valid_agent).float().sum() / n_valid
+        return ade, fde, miss
 
     B, A, K, T, C = pred.shape
     target_exp = target.unsqueeze(2).expand(B, A, K, T, C)
@@ -212,7 +246,8 @@ def _compute_metrics(
 
     mask = valid_agent.float()
     n_valid = mask.sum().clamp_min(1.0)
-    return (min_ade * mask).sum() / n_valid, (min_fde * mask).sum() / n_valid
+    miss = ((min_fde > miss_threshold) & valid_agent).float().sum() / n_valid
+    return (min_ade * mask).sum() / n_valid, (min_fde * mask).sum() / n_valid, miss
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -602,6 +637,20 @@ def _to_float(v: object) -> float:
     return float(v)  # type: ignore[arg-type]
 
 
+def make_target_metrics(
+    min_ade: float,
+    min_fde: float,
+    miss_rate: float,
+    latency_ms: float,
+) -> Dict[str, float]:
+    return {
+        "minADE": float(min_ade),
+        "minFDE": float(min_fde),
+        "MissRate": float(miss_rate),
+        "inference_latency_ms": float(latency_ms),
+    }
+
+
 def move_batch(batch: Dict, device: torch.device) -> Dict:
     moved = dict(batch)
     for k in ("x", "y", "adj", "x_mask", "y_mask", "agent_mask"):
@@ -643,14 +692,14 @@ def _grad_norms(model: nn.Module) -> Dict[str, float]:
 def _print_separator(title: str = "", width: int = 72) -> None:
     if title:
         pad = max(0, width - len(title) - 4)
-        print(f"\n{'â”€' * 2} {title} {'â”€' * pad}")
+        print(f"\n{'─' * 2} {title} {'─' * pad}")
     else:
-        print("â”€" * width)
+        print("─" * width)
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ═══════════════════════════════════════════════════════════════════════════════
 # Dataset helpers
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def load_all_sample_paths(data_dirs: List[Path], limit: int = 0) -> List[Path]:
     all_paths: List[Path] = []
@@ -717,9 +766,9 @@ def build_loaders(
     )
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ═══════════════════════════════════════════════════════════════════════════════
 # Model factory
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def build_model(
     input_dim: int,
@@ -813,7 +862,7 @@ def _clip_gradients(
 
     [FIX-1] per_group=True clips backbone and GAT separately:
       - backbone ("base" group): clipped at grad_clip
-      - GAT ("gat" group):       clipped at grad_clip Ă— gat_clip_ratio
+      - GAT ("gat" group):       clipped at grad_clip × gat_clip_ratio
     This prevents large GAT gradients (especially right after unfreeze)
     from destabilising the backbone through the global norm calculation.
 
@@ -833,9 +882,63 @@ def _clip_gradients(
             nn.utils.clip_grad_norm_(params, clip)
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ═══════════════════════════════════════════════════════════════════════════════
+# Inference latency measurement
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def measure_inference_latency(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    num_batches: int = 100,
+    use_amp: bool = True,
+) -> float:
+    """Measure average inference latency in milliseconds per sample.
+
+    Runs *num_batches* forward passes (after a short warm-up) and returns
+    the mean wall-clock time per sample.  GPU synchronisation is inserted
+    when running on CUDA so the measurement is accurate.
+    """
+    model.eval()
+    latencies: List[float] = []
+
+    with torch.no_grad():
+        for batch_idx, raw_batch in enumerate(loader):
+            if batch_idx >= num_batches:
+                break
+
+            batch = move_batch(raw_batch, device)
+            actual_batch_size = batch["x"].shape[0]
+
+            # Warm-up (first batch only)
+            if device.type == "cuda" and batch_idx == 0:
+                for _ in range(5):
+                    _ = model(
+                        x=batch["x"], adj=batch["adj"],
+                        x_mask=batch["x_mask"], agent_mask=batch["agent_mask"],
+                    )
+                torch.cuda.synchronize()
+
+            amp_ctx = _make_autocast(enabled=use_amp)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            with amp_ctx:
+                _ = model(
+                    x=batch["x"], adj=batch["adj"],
+                    x_mask=batch["x_mask"], agent_mask=batch["agent_mask"],
+                )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            latencies.append(elapsed_ms / max(1, actual_batch_size))
+
+    return sum(latencies) / len(latencies) if latencies else 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Training epoch
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def run_epoch(
     model: nn.Module,
@@ -858,9 +961,9 @@ def run_epoch(
     current_epoch: int = 0,
     total_epochs: int = 1,
     diversity_ramp_epochs: int = 20,
-) -> Tuple[float, float, float, float]:
+) -> Tuple[float, float, float, float, float]:
     """
-    Run one epoch.  Returns (mean_loss, mean_ADE, mean_FDE, mean_div_loss).
+    Run one epoch.  Returns (mean_loss, mean_ADE, mean_FDE, mean_div_loss, mean_MissRate).
 
     [IMP-B] diversity_weight > 0 adds mode repulsion to loss (multimodal only).
     [IMP-C] augment=True applies random rotation + history dropout per batch.
@@ -871,7 +974,7 @@ def run_epoch(
     training = optimizer is not None
     model.train(training)
 
-    # [IMP-D] Anneal diversity weight: ramp from 0 â†’ target over ramp_epochs
+    # [IMP-D] Anneal diversity weight: ramp from 0 → target over ramp_epochs
     # so early epochs focus on WTA loss before mode separation is enforced.
     if training and diversity_weight > 0.0 and diversity_ramp_epochs > 0:
         ramp_frac = min(1.0, float(max(1, current_epoch)) / float(diversity_ramp_epochs))
@@ -879,7 +982,7 @@ def run_epoch(
     else:
         effective_div_weight = diversity_weight
 
-    total_loss = total_ade = total_fde = total_div_loss = 0.0
+    total_loss = total_ade = total_fde = total_div_loss = total_miss = 0.0
     n_valid = nan_batches = nonfinite_preds = 0
     # [BUG-6 FIX] Track accumulation position explicitly so a NaN batch in the
     # middle of an accumulation window doesn't silently mix a reset gradient with
@@ -937,7 +1040,7 @@ def run_epoch(
             if log_every > 0 and idx % log_every == 0:
                 print(
                     f"    [WARN] step={idx}/{len(loader)}: "
-                    f"loss={loss_val} â€” skipping, resetting scaler"
+                    f"loss={loss_val} — skipping, resetting scaler"
                 )
             # [BUG-6 FIX] Reset the entire accumulation window: discard any
             # gradients accumulated from valid batches earlier in this window,
@@ -991,7 +1094,7 @@ def run_epoch(
                 optimizer.zero_grad(set_to_none=True)
 
         with torch.no_grad():
-            ade, fde = _compute_metrics(
+            ade, fde, miss = _compute_metrics(
                 pred=pred.detach(),
                 target=batch["y"],
                 y_mask=batch["y_mask"],
@@ -1000,12 +1103,14 @@ def run_epoch(
 
         ade_val = _to_float(ade)
         fde_val = _to_float(fde)
+        miss_val = _to_float(miss)
 
         if not (math.isnan(ade_val) or math.isnan(fde_val)):
             total_loss     += loss_val
             total_ade      += ade_val
             total_fde      += fde_val
             total_div_loss += div_loss_val
+            total_miss     += miss_val
             n_valid        += 1
 
         if training and log_every > 0 and idx % log_every == 0:
@@ -1015,7 +1120,8 @@ def run_epoch(
             )
             print(
                 f"    step={idx}/{len(loader)} loss={loss_val:.4f} "
-                f"ADE={ade_val:.3f} FDE={fde_val:.3f}{div_info}"
+                f"ADE={ade_val:.3f} FDE={fde_val:.3f} "
+                f"MissRate={miss_val:.1%}{div_info}"
             )
 
     if training and nan_batches > 0:
@@ -1032,12 +1138,13 @@ def run_epoch(
     avg_ade      = total_ade      / d if n_valid > 0 else float("nan")
     avg_fde      = total_fde      / d if n_valid > 0 else float("nan")
     avg_div_loss = total_div_loss / d if n_valid > 0 else 0.0
-    return avg_loss, avg_ade, avg_fde, avg_div_loss
+    avg_miss     = total_miss     / d if n_valid > 0 else float("nan")
+    return avg_loss, avg_ade, avg_fde, avg_div_loss, avg_miss
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ═══════════════════════════════════════════════════════════════════════════════
 # Single training run
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def train_single(
     *,
@@ -1084,7 +1191,7 @@ def train_single(
 
     # [CRITICAL FIX] Build optimizer BEFORE freezing so GAT params are
     # registered in AdamW's state. If we froze first, build_optimizer would
-    # skip requires_grad=False params â†’ GAT never gets Adam moments â†’ never
+    # skip requires_grad=False params → GAT never gets Adam moments → never
     # updated after unfreeze. Frozen params with grad=None are safely skipped
     # by AdamW internally, so having them in the group is harmless.
     optimizer = build_optimizer(
@@ -1114,7 +1221,7 @@ def train_single(
         clip_desc = "per-group" if per_grp_clip else f"{eff_clip:.2f}"
         print(
             f"  [GAT] LR groups: base={base_lr:.2e}, gat={gat_lr:.2e} "
-            f"({args.gat_lr_scale:g}Ă—) | clip={clip_desc}"
+            f"({args.gat_lr_scale:g}×) | clip={clip_desc}"
         )
 
     # [FIX-3] Build scheduler with GAT group_start_epochs so the GAT group's
@@ -1130,7 +1237,7 @@ def train_single(
             optimizer,
             warmup_epochs=warmup_ep,
             total_epochs=epochs,
-            min_lr_ratio=0.001,  # [IMP-F] 0.01â†’0.001: exploit cosine tail better
+            min_lr_ratio=0.001,  # [IMP-F] 0.01→0.001: exploit cosine tail better
             group_start_epochs=group_starts,
         )
         sched_mode = f"warmup({warmup_ep})+cosine"
@@ -1192,7 +1299,7 @@ def train_single(
                     shutil.copy2(best_ade_path, frozen_best_path)
                     print(
                         f"  [GAT-unfreeze] Archived frozen-phase best-ADE checkpoint "
-                        f"â†’ {frozen_best_path.name} "
+                        f"→ {frozen_best_path.name} "
                         f"(ADE={best_ade_record.get('val_ade', float('nan')):.4f})"
                     )
             best_ade_metric = math.inf
@@ -1202,7 +1309,7 @@ def train_single(
                 f"Early-stop counter, best_metric, and best_ade_metric reset."
             )
 
-        tr_loss, tr_ade, tr_fde, tr_div = run_epoch(
+        tr_loss, tr_ade, tr_fde, tr_div, tr_miss = run_epoch(
             model, train_loader, device,
             optimizer=optimizer, scaler=scaler,
             accum_steps=args.accum_steps,
@@ -1220,7 +1327,7 @@ def train_single(
             total_epochs=epochs,
             diversity_ramp_epochs=getattr(args, "diversity_ramp_epochs", 20),
         )
-        val_loss, val_ade, val_fde, _ = run_epoch(
+        val_loss, val_ade, val_fde, _, val_miss = run_epoch(
             model, val_loader, device, use_amp=use_amp
         )
 
@@ -1241,7 +1348,9 @@ def train_single(
         record = dict(
             epoch=epoch,
             tr_loss=tr_loss, tr_ade=tr_ade, tr_fde=tr_fde, tr_div=tr_div,
+            tr_miss=tr_miss,
             val_loss=val_loss, val_ade=val_ade, val_fde=val_fde,
+            val_miss=val_miss,
             lr=optimizer.param_groups[0]["lr"], lr_groups=lr_groups,
         )
         history.append(record)
@@ -1272,8 +1381,10 @@ def train_single(
         marker = " âœ“" if improved else ""
         print(
             f"  [{run_tag}] epoch={epoch:03d}/{epochs} lr={lr_text} t={elapsed:.0f}s | "
-            f"tr_loss={tr_loss:.4f} ADE={tr_ade:.3f} FDE={tr_fde:.3f}{div_info} | "
-            f"val_loss={val_loss:.4f} ADE={val_ade:.3f} FDE={val_fde:.3f}{marker}"
+            f"tr_loss={tr_loss:.4f} ADE={tr_ade:.3f} FDE={tr_fde:.3f} "
+            f"MissRate={tr_miss:.1%}{div_info} | "
+            f"val_loss={val_loss:.4f} ADE={val_ade:.3f} FDE={val_fde:.3f} "
+            f"MissRate={val_miss:.1%}{marker}"
         )
 
         raw_model = model.module if hasattr(model, "module") else model
@@ -1282,6 +1393,7 @@ def train_single(
             model_config=config_to_dict(cfg),
             epoch=epoch,
             val_loss=val_loss, val_ade=val_ade, val_fde=val_fde,
+            val_miss=val_miss,
         )
         torch.save(ckpt, last_path)
 
@@ -1312,7 +1424,30 @@ def train_single(
     # [IMP-E] Report best ADE/FDE from the SAME epoch as best_ade checkpoint
     best_ade_ep = best_ade_record.get("val_ade", float("nan"))
     best_fde_ep = best_ade_record.get("val_fde", float("nan"))
+    best_miss_ep = best_ade_record.get("val_miss", float("nan"))
 
+    # Measure inference latency on the best checkpoint
+    inference_latency_ms = 0.0
+    try:
+        raw_model = model.module if hasattr(model, "module") else model
+        if best_ade_path.exists():
+            ckpt_best = torch.load(best_ade_path, map_location=device, weights_only=True)
+            raw_model.load_state_dict(ckpt_best["model_state_dict"])
+        inference_latency_ms = measure_inference_latency(
+            raw_model, val_loader, device,
+            num_batches=min(100, len(val_loader)),
+            use_amp=use_amp,
+        )
+        print(f"  Inference latency: {inference_latency_ms:.2f} ms/sample")
+    except Exception as exc:
+        print(f"  [WARN] Inference latency measurement failed: {exc}")
+
+    target_metrics = make_target_metrics(
+        best_ade_ep,
+        best_fde_ep,
+        best_miss_ep,
+        inference_latency_ms,
+    )
     results = dict(
         run_tag=run_tag,
         best_val_loss=(
@@ -1321,6 +1456,14 @@ def train_single(
         ),
         best_val_ade=best_ade_ep,
         best_val_fde=best_fde_ep,
+        best_val_miss_rate=best_miss_ep,
+        inference_latency_ms=inference_latency_ms,
+        minADE=target_metrics["minADE"],
+        minFDE=target_metrics["minFDE"],
+        MissRate=target_metrics["MissRate"],
+        latency_ms_per_sample=target_metrics["inference_latency_ms"],
+        metrics=target_metrics,
+        target_metrics=target_metrics,
         best_val_ade_epoch=best_ade_record.get("epoch", -1),
         best_path=str(best_path),
         best_ade_path=str(best_ade_path),
@@ -1384,11 +1527,20 @@ def run_ablation(
         except Exception as exc:
             print(f"\n  [ERROR] Variant {variant.name} raised: {exc}")
             traceback.print_exc()
+            failed_metrics = make_target_metrics(float("nan"), float("nan"), float("nan"), 0.0)
             result = dict(
                 run_tag=f"ablation_{variant.code}",
                 best_val_loss=float("nan"),
                 best_val_ade=float("nan"),
                 best_val_fde=float("nan"),
+                best_val_miss_rate=float("nan"),
+                inference_latency_ms=0.0,
+                minADE=failed_metrics["minADE"],
+                minFDE=failed_metrics["minFDE"],
+                MissRate=failed_metrics["MissRate"],
+                latency_ms_per_sample=failed_metrics["inference_latency_ms"],
+                metrics=failed_metrics,
+                target_metrics=failed_metrics,
                 best_path="N/A",
                 error=str(exc),
             )
@@ -1399,10 +1551,13 @@ def run_ablation(
         all_results.append(result)
 
     _print_separator("ABLATION RESULTS SUMMARY")
+    header_sep = "-"
     print(
         f"\n  {'Variant':<14} {'Code':>4}  {'val_ADE':>8}  {'val_FDE':>8}  "
+        f"{'MissRate':>8}  {'Latency':>8}  "
         f"{'val_loss':>10}  Status\n"
-        f"  {'â”€'*14}  {'â”€'*4}  {'â”€'*8}  {'â”€'*8}  {'â”€'*10}  {'â”€'*8}"
+        f"  {header_sep*14}  {header_sep*4}  {header_sep*8}  {header_sep*8}"
+        f"  {header_sep*8}  {header_sep*8}  {header_sep*10}  {header_sep*8}"
     )
 
     def _sort_key(r: dict) -> tuple:
@@ -1412,9 +1567,13 @@ def run_ablation(
     for r in sorted(all_results, key=_sort_key):
         ade_s  = f"{r['best_val_ade']:8.3f}"  if not math.isnan(r["best_val_ade"])  else "     NaN"
         fde_s  = f"{r['best_val_fde']:8.3f}"  if not math.isnan(r["best_val_fde"])  else "     NaN"
+        mr_val = r.get("best_val_miss_rate", float("nan"))
+        mr_s   = f"{mr_val:7.1%}"  if not math.isnan(mr_val) else "     NaN"
+        lat_val = r.get("inference_latency_ms", 0.0)
+        lat_s  = f"{lat_val:7.1f}ms" if lat_val > 0 else "     N/A"
         loss_s = f"{r['best_val_loss']:10.4f}" if not math.isnan(r["best_val_loss"]) else "       NaN"
         status = "FAILED" if "error" in r else ("NaN" if math.isnan(r["best_val_ade"]) else "OK")
-        print(f"  {r['variant']:<14}  {r['code']:>4}  {ade_s}  {fde_s}  {loss_s}  {status}")
+        print(f"  {r['variant']:<14}  {r['code']:>4}  {ade_s}  {fde_s}  {mr_s}  {lat_s}  {loss_s}  {status}")
 
     summary_path = out_dir / "ablation_summary.json"
     summary_path.write_text(json.dumps(all_results, indent=2), encoding="utf-8")
@@ -1473,7 +1632,15 @@ def run_per_town(
     summary_path.write_text(json.dumps(all_results, indent=2), encoding="utf-8")
     _print_separator("PER-TOWN SUMMARY")
     for r in all_results:
-        print(f"  {r['town']:8s}  ADE={r['best_val_ade']:.3f}  FDE={r['best_val_fde']:.3f}")
+        mr_val = r.get("best_val_miss_rate", float("nan"))
+        mr_s = f"{mr_val:.1%}" if not math.isnan(mr_val) else "N/A"
+        lat_val = float(r.get("inference_latency_ms", 0.0))
+        lat_s = f"{lat_val:.1f}ms" if lat_val > 0.0 else "N/A"
+        print(
+            f"  {r['town']:8s}  minADE={r['best_val_ade']:.3f}  "
+            f"minFDE={r['best_val_fde']:.3f}  MissRate={mr_s}  "
+            f"Latency={lat_s}"
+        )
     print(f"\n  [OK] Summary: {summary_path}")
 
 
@@ -1562,8 +1729,11 @@ def main() -> int:
     )
 
     _print_separator("DONE")
-    print(f"  Best val ADE : {result['best_val_ade']:.3f}")
-    print(f"  Best val FDE : {result['best_val_fde']:.3f}")
+    print(f"  minADE       : {result['minADE']:.3f}")
+    print(f"  minFDE       : {result['minFDE']:.3f}")
+    mr_val = result.get('best_val_miss_rate', float('nan'))
+    print(f"  Miss Rate    : {mr_val:.1%}" if not math.isnan(mr_val) else "  Miss Rate    : N/A")
+    print(f"  Latency      : {result['latency_ms_per_sample']:.2f} ms/sample")
     print(f"  Best at epoch: {result.get('best_val_ade_epoch', '?')}")
     print(f"  Checkpoint   : {result['best_path']}")
     print(f"  Best ADE ckpt: {result['best_ade_path']}")

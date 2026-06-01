@@ -56,16 +56,16 @@ class GTNetSupervisorConfig:
     danger_forward_max_m: float = 35.0
     danger_time_horizon_s: float = 3.0
     hard_brake_time_s: float = 1.2
-    hard_brake_forward_m: float = 13.0
+    hard_brake_forward_m: float = 8.0
     caution_brake: float = 0.35
     emergency_brake: float = 0.75
     corridor_base_half_width_m: float = 1.25
-    # BUG FIX: reduced from 0.035 → 0.025 and max from 3.0 → 2.5.
-    # Old 3.0m half-width at 35m forward = 6m corridor, nearly a full CARLA lane
-    # width on each side of ego, catching adjacent-lane vehicles.
-    corridor_growth_per_m: float = 0.025
+    # BUG FIX: reduced from 0.035 → 0.025 → 0.018 and max from 3.0 → 2.5 → 2.2.
+    # At 35m forward with 0.018: half_width = 1.25 + 0.63 = 1.88m (total 3.76m).
+    # A CARLA lane is ~3.5-3.7m, so corridor stays within ego's own lane.
+    corridor_growth_per_m: float = 0.018
     corridor_curve_gain: float = 0.55
-    corridor_max_half_width_m: float = 2.5
+    corridor_max_half_width_m: float = 2.2
     # BUG FIX: mode consensus — require at least this many modes (out of K) to
     # predict a corridor violation before treating as a real threat.
     # With K=5 modes, setting min_threat_modes=2 filters out noisy single-mode
@@ -569,6 +569,49 @@ class GTNetSupervisor:
                     current_v_towards_by_id[aid] = v_towards
 
         for agent_idx, actor_id in enumerate(actor_ids):
+            # ── BUG FIX: Euclidean distance pre-filter ─────────────────────────
+            # The corridor scan only checks forward_m ∈ [1, 35], but an actor
+            # at 70m Euclidean distance can still have forward_m=30 if it's
+            # mostly ahead.  Its predicted trajectory is unreliable at that
+            # range, so skip actors whose ACTUAL current distance exceeds the
+            # danger zone.
+            if actor_id in current_fwd_by_id and actor_id in current_right_by_id:
+                _cur_fwd = current_fwd_by_id[actor_id]
+                _cur_right = current_right_by_id[actor_id]
+                _actual_dist = math.hypot(_cur_fwd, _cur_right)
+                if _actual_dist > float(self.config.danger_forward_max_m):
+                    continue  # Actor is beyond danger range — skip entirely
+
+            # ── BUG FIX: Far same-direction same-lane vehicle filter ───────────
+            # A vehicle 20-35m ahead on the SAME lane, driving the SAME direction
+            # at similar speed, will have its entire predicted trajectory inside
+            # the corridor (because it IS in the same lane).  This is normal
+            # car-following, NOT a collision threat.  Without this filter, the
+            # supervisor triggers caution_brake continuously for any leading
+            # vehicle on the same lane.
+            #
+            # Conditions for filtering:
+            #  1. heading_y > 0.8 (within ~±37° of ego heading — same direction)
+            #  2. current forward distance > 15m (far enough to not be urgent)
+            #  3. relative forward velocity >= -1.0 m/s (not rapidly closing in;
+            #     rel_vy >= 0 means actor moves forward relative to ego,
+            #     rel_vy slightly negative means closing slowly — still safe
+            #     at 15m+)
+            if (actor_id in current_heading_y_by_id
+                    and actor_id in current_fwd_by_id
+                    and current_fwd_by_id[actor_id] > 15.0
+                    and current_heading_y_by_id[actor_id] > 0.8):
+                # Check relative forward velocity from ground-truth features
+                if history:
+                    _anchor = history[-1]
+                    _actor_st = _anchor.actors.get(actor_id)
+                    if _actor_st is not None:
+                        _feat = actor_feature_in_anchor_frame(_actor_st, _anchor.ego)
+                        if len(_feat) >= 4:
+                            _rel_vy = float(_feat[3])  # relative forward velocity
+                            if _rel_vy >= -1.0:
+                                continue  # Same-lane leader, not closing fast — safe
+
             # Stationary/Slow Adjacent Vehicle Filter & Parallel Motion Filter:
             # 1. If the vehicle is currently stationary or moving extremely slowly (< 1.5 m/s)
             #    AND its current position is OUTSIDE our corridor, ignore it.
@@ -729,6 +772,24 @@ class GTNetSupervisor:
             if is_receding:
                 continue  # Vehicle ahead is pulling away — safe, no threat
 
+            # ── BUG FIX: Relative-velocity receding filter ─────────────────────
+            # The prediction-based receding filter above can miss vehicles that
+            # are driving at a similar speed to ego (gap barely grows in 3s).
+            # Use ground-truth relative forward velocity: if rel_vy >= 0
+            # (actor is moving forward in ego frame = same speed or faster)
+            # AND actor is far enough (> 10m), it's safe car-following.
+            if (actor_id in current_fwd_by_id
+                    and median_initial_fwd > 10.0
+                    and history):
+                _anchor_rv = history[-1]
+                _actor_rv = _anchor_rv.actors.get(actor_id)
+                if _actor_rv is not None:
+                    _feat_rv = actor_feature_in_anchor_frame(_actor_rv, _anchor_rv.ego)
+                    if len(_feat_rv) >= 4:
+                        _rel_fwd_vel = float(_feat_rv[3])  # relative forward velocity
+                        if _rel_fwd_vel >= -0.5:  # not closing faster than 0.5 m/s
+                            continue  # Vehicle ahead at stable/growing gap — safe
+
             # EXCEPTION: Skip approach check when agent is already at close
             # range (forward_m < 3m) or deep inside corridor (lat_error < 0.5m).
             first_threat = min(threatening_modes, key=lambda m: float(m["time_s"]))
@@ -797,9 +858,14 @@ class GTNetSupervisor:
                 **rear_info,
             }, pred_np
 
+        # BUG FIX: Changed from OR to AND with time guard.
+        # Old logic: emergency brake if TTC <= 1.2s OR forward <= 13m.
+        # This caused emergency braking for actors at 12m predicted forward
+        # even when TTC was 2.5s (plenty of time).  New logic: emergency
+        # brake only when the threat is BOTH close AND imminent.
         hard = (
             float(best["time_s"]) <= float(self.config.hard_brake_time_s)
-            or float(best["forward_m"]) <= float(self.config.hard_brake_forward_m)
+            and float(best["forward_m"]) <= float(self.config.hard_brake_forward_m)
         )
         brake = float(self.config.emergency_brake if hard else self.config.caution_brake)
         return {

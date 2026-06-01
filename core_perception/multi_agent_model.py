@@ -99,6 +99,14 @@ class MultiAgentModelConfig:
         return cls(**filtered)
 
     @classmethod
+    def gat_config(cls, hidden_dim: int = 256) -> "MultiAgentModelConfig":
+        return cls(hidden_dim=hidden_dim, enable_gat=True)
+
+    @classmethod
+    def multimodal_config(cls, hidden_dim: int = 256) -> "MultiAgentModelConfig":
+        return cls(hidden_dim=hidden_dim, enable_multimodal=True)
+
+    @classmethod
     def full_config(cls, hidden_dim: int = 256) -> "MultiAgentModelConfig":
         return cls(
             hidden_dim=hidden_dim,

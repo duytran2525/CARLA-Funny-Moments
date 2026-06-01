@@ -90,7 +90,8 @@ foreach ($csv in $csvFiles) {
             "--dt", [string]$DT,
             "--adjacency-radius-m", "100.0",
             "--min-agents", "2",
-            "--allow-missing"
+            "--allow-missing",
+            "--limit", "10000"
         )
         if ($AdaptiveRadius) {
             $buildArgs += @(
