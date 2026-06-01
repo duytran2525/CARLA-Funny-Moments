@@ -48,6 +48,8 @@ cil:
   use_pure_pursuit: true
   # true = pure-pursuit follows CARLA route waypoints; false = follows model-predicted waypoints.
   use_carla_waypoints: false
+  lane_constrain_blended: false      # true = Bật, false = Tắt (Mặc định là false nếu không ghi gì)
+  lane_constrain_strength: 0.2        # Điều chỉnh từ 0.0 đến 1.0 (20% can thiệp)
 
 yolo:
   # backend:

@@ -813,6 +813,7 @@ class RunConfig:
     cil_use_pure_pursuit: bool
     cil_use_carla_waypoints: bool
     cil_lane_constrain_blended: bool
+    cil_lane_constrain_strength: float
 
 class BaseSession:
     """Shared interface for CARLA and dry-run sessions."""
@@ -4531,6 +4532,11 @@ class CILAgent(BaseAgent):
             alphas = np.linspace(0.20, 0.90, n_points, dtype=np.float32)  # Max 0.95→0.90
             if int(command) in (1, 2, 3):
                 alphas = np.clip(alphas + 0.01, 0.0, 0.92)  # Reduced: +0.03→+0.01, cap 0.98→0.92
+            
+            # Apply strength modifier (0.0 = no intervention, 1.0 = full intervention)
+            strength = float(getattr(self.config, "cil_lane_constrain_strength", 1.0))
+            alphas = alphas * strength
+            
             blended = (1.0 - alphas[:, None]) * waypoints + alphas[:, None] * smooth_curve
 
             # Keep forward progression stable for pure-pursuit.
@@ -7267,6 +7273,12 @@ def parse_args() -> argparse.Namespace:
         help="Disable smooth lane-constrain blending and use raw model waypoints.",
     )
     parser.add_argument(
+        "--cil-lane-constrain-strength",
+        type=float,
+        default=None,
+        help="Intervention strength of the lane constraint blending (0.0 to 1.0, default: 1.0).",
+    )
+    parser.add_argument(
         "--cil-use-carla-waypoints",
         dest="cil_use_carla_waypoints",
         action="store_true",
@@ -7554,7 +7566,15 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     )
     cil_lane_constrain_blended = _to_bool(
         args.cil_lane_constrain_blended,
-        _to_bool(_cfg_get(env_cfg, "cil", "lane_constrain_blended", True), True),
+        _to_bool(_cfg_get(env_cfg, "cil", "lane_constrain_blended", False), False),
+    )
+    cil_lane_constrain_strength = float(
+        pick(
+            args.cil_lane_constrain_strength,
+            "cil",
+            "lane_constrain_strength",
+            1.0,
+        )
     )
 
     nav_agent_type = str(pick(args.nav_agent_type, "cil", "nav_agent_type", "basic")).lower()
@@ -7841,6 +7861,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         cil_use_pure_pursuit=cil_use_pure_pursuit,
         cil_use_carla_waypoints=cil_use_carla_waypoints,
         cil_lane_constrain_blended=cil_lane_constrain_blended,
+        cil_lane_constrain_strength=cil_lane_constrain_strength,
     )
 
 
