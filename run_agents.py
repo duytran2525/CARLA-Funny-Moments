@@ -813,6 +813,7 @@ class RunConfig:
     cil_use_pure_pursuit: bool
     cil_use_carla_waypoints: bool
     cil_lane_constrain_blended: bool
+    cil_lane_constrain_strength: float
 
 class BaseSession:
     """Shared interface for CARLA and dry-run sessions."""
@@ -2469,10 +2470,10 @@ class CILAgent(BaseAgent):
         self._hud_last_tick_time: Optional[float] = None
         self._route_overlay_bounds: Optional[tuple[float, float, float, float]] = None
 
-        # 1-second command delay buffer: hold command N frames before feeding to model
-        # N is computed in setup() from fixed_delta; default 20 frames ≈ 1 s at 20 FPS
+        # Command delay buffer: hold command N frames before feeding to model.
+        # Reduced from 1.0 s → 0.3 s to avoid late turn commands at junctions.
         self._command_delay_buffer: deque = deque()
-        self._command_delay_n_frames: int = max(1, round(1.0 / max(1e-3, float(config.fixed_delta))))
+        self._command_delay_n_frames: int = max(1, round(0.3 / max(1e-3, float(config.fixed_delta))))
         # Speed control (PID)
         self._speed_controller = SpeedPIDController(
             target_speed_kmh=config.target_speed_kmh,
@@ -4498,13 +4499,13 @@ class CILAgent(BaseAgent):
             forward_hint = max(2.0, float(waypoints[1, 0]) if n_points > 1 else 2.0)
             inertia_x = float(np.clip(forward_hint, 2.0, 8.0))
 
-            # --- THÊM LOGIC XỬ LÝ LÚC RẼ ---
+            # --- LOGIC XỬ LÝ LÚC RẼ (softened to avoid oversharp turns) ---
             a2_idx = idx_mid
-            # Nếu command là 1 (Left) hoặc 2 (Right), ép đường cong ôm sát lề ngã tư hơn
-            if int(command) in (1, 2):  
-                inertia_x = max(1.5, inertia_x * 0.6)  # Giảm quán tính để xe chịu bẻ lái sớm
-                a2_idx = max(1, idx_mid - 1)           # Kéo điểm C2 gần lại
-                
+            # Khi turn command, giảm nhẹ quán tính nhưng KHÔNG ép quá mức
+            if int(command) in (1, 2):
+                inertia_x = max(2.0, inertia_x * 0.8)  # Softened: 0.6→0.8, min 1.5→2.0
+                # Không kéo a2_idx gần lại nữa — giữ nguyên idx_mid
+
             a2 = lane_projected[a2_idx]
             a4 = lane_projected[idx_far]
             # -------------------------------
@@ -4528,9 +4529,14 @@ class CILAgent(BaseAgent):
 
             # Progressive blending: keep near points close to model, far points
             # align stronger to map/lane curve.
-            alphas = np.linspace(0.20, 0.95, n_points, dtype=np.float32)
+            alphas = np.linspace(0.20, 0.90, n_points, dtype=np.float32)  # Max 0.95→0.90
             if int(command) in (1, 2, 3):
-                alphas = np.clip(alphas + 0.03, 0.0, 0.98)
+                alphas = np.clip(alphas + 0.01, 0.0, 0.92)  # Reduced: +0.03→+0.01, cap 0.98→0.92
+            
+            # Apply strength modifier (0.0 = no intervention, 1.0 = full intervention)
+            strength = float(getattr(self.config, "cil_lane_constrain_strength", 1.0))
+            alphas = alphas * strength
+            
             blended = (1.0 - alphas[:, None]) * waypoints + alphas[:, None] * smooth_curve
 
             # Keep forward progression stable for pure-pursuit.
@@ -4548,9 +4554,33 @@ class CILAgent(BaseAgent):
         command_phase: str,
     ) -> float:
         # ──────────────────────────────────────────────────────────────
-        # [TEST] Bypass all smoothing – use 100% raw CNN model steering.
+        # EMA smoothing + rate limiter to prevent jerky steering.
+        # Speed-adaptive: more responsive at low speed, smoother at high.
+        # Turn-aware: slightly higher alpha during active turns.
         # ──────────────────────────────────────────────────────────────
-        self._last_steer = clamp(float(steering_raw), -1.0, 1.0)
+        speed_ms = float(speed_kmh) / 3.6
+        is_turning = int(command) in (1, 2)
+
+        # Base EMA alpha (higher = more responsive to new input)
+        if speed_ms < 3.0:       # < ~11 km/h
+            alpha = 0.70
+        elif speed_ms < 6.0:     # < ~22 km/h
+            alpha = 0.55
+        elif speed_ms < 9.0:     # < ~32 km/h
+            alpha = 0.45
+        else:
+            alpha = 0.35
+
+        # Boost alpha slightly during active turns for responsiveness
+        if is_turning:
+            alpha = min(alpha + 0.10, 0.75)
+
+        smoothed = alpha * float(steering_raw) + (1.0 - alpha) * self._last_steer
+
+        # Rate limiter: max steering change per frame
+        max_change = 0.10 if is_turning else 0.06
+        final = clamp(smoothed, self._last_steer - max_change, self._last_steer + max_change)
+        self._last_steer = clamp(float(final), -1.0, 1.0)
         return float(self._last_steer)
 
     def _route_locations_to_ego_waypoints(
@@ -7243,6 +7273,12 @@ def parse_args() -> argparse.Namespace:
         help="Disable smooth lane-constrain blending and use raw model waypoints.",
     )
     parser.add_argument(
+        "--cil-lane-constrain-strength",
+        type=float,
+        default=None,
+        help="Intervention strength of the lane constraint blending (0.0 to 1.0, default: 1.0).",
+    )
+    parser.add_argument(
         "--cil-use-carla-waypoints",
         dest="cil_use_carla_waypoints",
         action="store_true",
@@ -7530,7 +7566,15 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     )
     cil_lane_constrain_blended = _to_bool(
         args.cil_lane_constrain_blended,
-        _to_bool(_cfg_get(env_cfg, "cil", "lane_constrain_blended", True), True),
+        _to_bool(_cfg_get(env_cfg, "cil", "lane_constrain_blended", False), False),
+    )
+    cil_lane_constrain_strength = float(
+        pick(
+            args.cil_lane_constrain_strength,
+            "cil",
+            "lane_constrain_strength",
+            1.0,
+        )
     )
 
     nav_agent_type = str(pick(args.nav_agent_type, "cil", "nav_agent_type", "basic")).lower()
@@ -7817,6 +7861,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         cil_use_pure_pursuit=cil_use_pure_pursuit,
         cil_use_carla_waypoints=cil_use_carla_waypoints,
         cil_lane_constrain_blended=cil_lane_constrain_blended,
+        cil_lane_constrain_strength=cil_lane_constrain_strength,
     )
 
 

@@ -21,10 +21,10 @@ class PurePursuitController:
         wheelbase: float = 2.87,
         max_steer_angle_deg: float = 35.0,
         k_lookahead: float = 0.45,
-        min_lookahead: float = 2.0,       # ↓ from 3.0 — tighter curves
-        max_lookahead: float = 12.0,      # ↓ from 15.0
-        steer_alpha: float = 0.55,        # ↑ from 0.3 — more responsive
-        max_steer_rate: float = 3.0,      # ↑ from 1.0 — allow fast turn-in
+        min_lookahead: float = 3.0,       # ↑ from 2.0 — look further ahead to avoid cutting corners
+        max_lookahead: float = 12.0,
+        steer_alpha: float = 0.40,        # ↓ from 0.55 — smoother turn-in
+        max_steer_rate: float = 1.5,      # ↓ from 3.0 — limit jerk at turn entry
         dt: float = 0.05,
     ):
         self.L = wheelbase
