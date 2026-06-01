@@ -89,6 +89,18 @@ def parse_args() -> argparse.Namespace:
         help="Number of attention heads for GAT (default: 4)",
     )
     parser.add_argument(
+        "--radius-base",
+        type=float,
+        default=40.0,
+        help="Base radius in meters for adaptive radius (default: 40.0).",
+    )
+    parser.add_argument(
+        "--radius-alpha",
+        type=float,
+        default=1.0,
+        help="Velocity scaling factor for adaptive radius (default: 1.0).",
+    )
+    parser.add_argument(
         "--resume",
         type=str,
         default=None,
@@ -431,6 +443,8 @@ def main() -> int:
         enable_multimodal=args.enable_multimodal,
         num_modes=int(args.num_modes),
         enable_adaptive_radius=args.enable_adaptive_radius,
+        radius_base=float(args.radius_base),
+        radius_alpha=float(args.radius_alpha),
     )
     
     model = MultiAgentTrajectoryPredictor(model_config).to(device)

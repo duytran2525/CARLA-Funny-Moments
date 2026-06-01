@@ -3,7 +3,7 @@ param(
     [string]$Config = "D:\AI\CARLA-Funny-Moments\configs\carla_env.yaml",
     [ValidateSet("cil", "cil_yolo")]
     [string]$Agent = "cil_yolo",
-    [string]$Model = "models\waypoint_predictor_h5.pth",
+    [string]$Model = "D:\AI\CARLA-Funny-Moments\models\waypoint_predictor (1).pth",
     [string]$YoloModel = "D:\AI\CARLA-Funny-Moments\models\rtdetr-l.engine",
     [Nullable[double]]$TargetSpeedKmh = $null,
     [Nullable[double]]$MaxThrottle = $null,

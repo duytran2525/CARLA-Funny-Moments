@@ -13,8 +13,8 @@
 
 vehicle:
   filter: "vehicle.tesla.model3"
-  spawn_point: 10
-  destination_point: 40
+  spawn_point: 1
+  destination_point: 50
   role_name: "hero"
 
 spectator:
@@ -46,6 +46,8 @@ cil:
   recovery_duration_frames: 10
   recovery_steer_offset: 0.3
   use_pure_pursuit: true
+  # true = pure-pursuit follows CARLA route waypoints; false = follows model-predicted waypoints.
+  use_carla_waypoints: false
 
 yolo:
   # backend:
@@ -93,10 +95,10 @@ gtnet:
   draw_debug: false
 
 traffic_spawn:
-  vehicle_count: 30
-  bike_count: 20
-  motorbike_count: 20
-  pedestrian_count: 20
+  vehicle_count: 0
+  bike_count: 0
+  motorbike_count: 0
+  pedestrian_count: 0
   npc_enable_autopilot: true
 
 recording:
@@ -116,7 +118,7 @@ runtime:
   # 1) YOLO: bật/tắt lúc start qua yolo.debug_window; khi chạy bấm 'y' (xem comment ở khối yolo:).
   # 2) Route map: cửa sổ "CIL Route Map", tách khỏi vẽ route trong world (cil_enable_route_map).
   #    Bật/tắt lúc start: cil_opencv_route_map. Khi chạy: phím 'r'.
-  cil_opencv_route_map: false
+  cil_opencv_route_map: true
   # Vẽ waypoint dự đoán trong world (debug CARLA). Tắt để bớt RPC debug → FPS ổn định hơn.
   cil_world_waypoint_debug: false
   cil_enable_telemetry_csv: false

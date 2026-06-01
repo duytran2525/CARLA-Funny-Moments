@@ -75,19 +75,19 @@ class MultiAgentModelConfig:
 
     def __post_init__(self) -> None:
         if self.num_attention_heads < 1:
-            raise ValueError(f"num_attention_heads >= 1, got {self.num_attention_heads}")
+            raise ValueError(f"num_attention_heads must be >= 1, got {self.num_attention_heads}")
         if self.attention_concat_mode not in ("concat", "average"):
-            raise ValueError(f"attention_concat_mode must be 'concat'/'average'")
+            raise ValueError(f"attention_concat_mode must be 'concat' or 'average'")
         if self.num_modes < 1:
-            raise ValueError(f"num_modes >= 1, got {self.num_modes}")
+            raise ValueError(f"num_modes must be >= 1, got {self.num_modes}")
         if self.radius_base <= 0:
-            raise ValueError(f"radius_base > 0, got {self.radius_base}")
+            raise ValueError(f"radius_base must be > 0, got {self.radius_base}")
         if self.radius_alpha < 0:
-            raise ValueError(f"radius_alpha >= 0, got {self.radius_alpha}")
+            raise ValueError(f"radius_alpha must be >= 0, got {self.radius_alpha}")
         if self.mode_embed_dim < 1:
-            raise ValueError(f"mode_embed_dim >= 1, got {self.mode_embed_dim}")
+            raise ValueError(f"mode_embed_dim must be >= 1, got {self.mode_embed_dim}")
         if self.gat_edge_dim < 0:
-            raise ValueError(f"gat_edge_dim >= 0, got {self.gat_edge_dim}")
+            raise ValueError(f"gat_edge_dim must be >= 0, got {self.gat_edge_dim}")
 
     def to_json(self) -> dict:
         return {f.name: getattr(self, f.name) for f in fields(self)}
@@ -539,10 +539,11 @@ class MultiAgentTrajectoryPredictor(nn.Module):
         pos_j = last_pos.unsqueeze(1).expand(B, N, N, 2)
         dist = torch.norm(pos_j - pos_i, dim=-1)
         
-        # Check if distance is within radius (agent i observing agent j)
-        # radius is [B, N] -> expand to [B, N, N] where radius depends on agent i
-        radius_i = radius.unsqueeze(2).expand(B, N, N)
-        adj_dynamic = (dist <= radius_i).to(dtype)
+        # Check if distance is within radius (using min(r_i, r_j) to ensure symmetric adjacency)
+        radius_i = radius.unsqueeze(2)  # [B, N, 1]
+        radius_j = radius.unsqueeze(1)  # [B, 1, N]
+        radius_min = torch.min(radius_i, radius_j)  # [B, N, N]
+        adj_dynamic = (dist <= radius_min).to(dtype)
         
         # Mask out invalid agents
         mask_float = agent_mask.to(dtype)

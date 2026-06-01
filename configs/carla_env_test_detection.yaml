@@ -60,6 +60,7 @@ test_detection:
     - "pedestrian"
     - "traffic_light_red"
     - "traffic_light_green"
+    - "traffic_sign"
 
   # Prefer tighter map-level traffic light head boxes over actor bounding boxes.
   traffic_light_gt_mode: "level_bbs"
@@ -71,6 +72,16 @@ test_detection:
   traffic_light_min_bbox_area_px: 40
   traffic_light_min_visible_area_ratio: 0.25
   traffic_light_max_bbox_aspect_ratio: 8.0
+
+  # Traffic signs are static CARLA city objects; fall back to traffic.* actors if a map lacks level BBox data.
+  traffic_sign_gt_mode: "level_bbs"
+  traffic_sign_actor_fallback: true
+  traffic_sign_min_bbox_dim_px: 4
+  traffic_sign_min_bbox_area_px: 40
+  traffic_sign_min_visible_area_ratio: 0.20
+  traffic_sign_max_bbox_aspect_ratio: 10.0
+  allow_rgb_only_if_depth_missing: true
+  max_sensor_misses: 30
 
   gt_filters:
     max_distance_m: 40.0
