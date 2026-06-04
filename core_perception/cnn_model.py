@@ -54,7 +54,7 @@ class WaypointScaling:
     """Hard-coded scaling factors for waypoint denormalization (meters)."""
 
     x_scale: float = 50.0
-    y_scale: float = 25.0
+    y_scale: float = 35.0  # FIX: was 25.0 — increased to cover WP5_y max=39.3m in dataset
     sigma_scale: float = 10.0
     sigma_eps: float = 1e-4
 

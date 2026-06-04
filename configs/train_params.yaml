@@ -33,7 +33,7 @@ geometric_offset: 0.35
 augmentation_prob: 0.75
 train_split: 0.75
 include_side_cameras_train: true
-recovery_weight: 3.0
+recovery_weight: 2.0
 
 # ── Loss Weights ──
 loss_lambda_wp: 1.0              # Huber waypoint loss
@@ -49,6 +49,7 @@ lr_factor: 0.5                   # fallback for ReduceLROnPlateau
 
 # ── Early Stopping ──
 early_stopping_patience: 10       # 6 epochs patience (enough for 25 total epochs)
+early_stopping_min_delta: 0.0005  # FIX: only count as improvement if delta > 0.05%
 
 # ── Reproducibility & I/O ──
 seed: 42

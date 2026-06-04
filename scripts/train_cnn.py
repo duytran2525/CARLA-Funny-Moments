@@ -131,14 +131,18 @@ class WaypointCarlaDatasetCSV(Dataset):
         print("  📋 Đang tải CSV tổng...")
         df_full = pd.read_csv(csv_path)
 
-        # Lọc stationary
+        # Lọc stationary + degenerate
         if {"speed", "wp_5_x"}.issubset(df_full.columns) and min_speed_kmh > 0:
             speed = pd.to_numeric(df_full["speed"], errors="coerce")
             wp5x = pd.to_numeric(df_full["wp_5_x"], errors="coerce")
-            mask = (speed < min_speed_kmh) & (wp5x < min_wp5_x_m)
+            mask_stationary = (speed < min_speed_kmh) & (wp5x < min_wp5_x_m)
+            # FIX: filter degenerate samples where vehicle is moving but waypoints are near zero
+            mask_degenerate = (speed > 5.0) & (wp5x < 0.5)
+            mask = mask_stationary | mask_degenerate
             before = len(df_full)
+            n_degenerate = int(mask_degenerate.sum())
             df_full = df_full[~mask].reset_index(drop=True)
-            print(f"  🚗 Stationary filter: {before} → {len(df_full)} rows")
+            print(f"  🚗 Stationary filter: {before} → {len(df_full)} rows (degenerate={n_degenerate})")
 
         # Stratified split
         strat_col = df_full["recovery_flag"].fillna(0).astype(int)
@@ -427,14 +431,17 @@ def main():
         )
 
     batch_size = int(config.get("batch_size", 256))
-    rec_weight = float(config.get("recovery_weight", 3.0))
+    rec_weight = float(config.get("recovery_weight", 2.0))
 
     command_weights = {0: 1.0, 1: 5.0, 2: 5.0, 3: 2.0}
+    # FIX: per-command recovery weights for granular control
+    recovery_weight_per_cmd = {0: 1.0, 1: 3.0, 2: 4.0, 3: 3.0}
     weights = []
     for sample in train_dataset.samples:
         w = command_weights.get(int(sample.get("command", 0)), 1.0)
         if int(float(sample.get("recovery_flag", 0.0))) == 1:
-            w *= rec_weight
+            cmd_key = int(sample.get("command", 0))
+            w *= recovery_weight_per_cmd.get(cmd_key, rec_weight)
         weights.append(w)
     sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
@@ -561,14 +568,23 @@ def main():
                 tgt_wp = wps.view(-1, 5, 2)
                 loss_wp = huber(pred_wp, tgt_wp)
 
-                # Lane penalty ĐỐI XỨNG – bỏ qua recovery
+                # Lane penalty ĐỐI XỨNG – bỏ qua recovery VÀ turn commands
                 abs_lateral_y = torch.abs(pred_wp[..., 1])
+                rec_mask = recs.view(-1, 1) > 0.5
+                # FIX: exclude turn commands from lane penalty — this is the most impactful fix
+                # Without this, the model is punished for outputting large lateral WPs during turns,
+                # which completely suppresses FiLM conditioning (output capped at ±3.4m vs ±17m needed)
+                turn_mask = ((cmds == 1) | (cmds == 2)).view(-1, 1)
+                lane_threshold = torch.where(
+                    turn_mask.expand_as(abs_lateral_y),
+                    torch.full_like(abs_lateral_y, 99.0),   # turn: effectively no penalty
+                    torch.full_like(abs_lateral_y, 4.0),    # straight/follow: threshold 4m
+                )
                 lane_penalty = torch.where(
-                    abs_lateral_y > 3.0,
-                    (abs_lateral_y - 3.0).pow(2) * 2.0,
+                    abs_lateral_y > lane_threshold,
+                    (abs_lateral_y - lane_threshold).pow(2) * 1.5,
                     torch.zeros_like(abs_lateral_y),
                 )
-                rec_mask = recs.view(-1, 1) > 0.5
                 lane_penalty = lane_penalty * (~rec_mask).float()
                 loss_lane = lane_penalty.mean()
 
@@ -629,12 +645,19 @@ def main():
                     loss_wp = huber(pred_wp, tgt_wp)
 
                     abs_lateral_y = torch.abs(pred_wp[..., 1])
+                    rec_mask = recs.view(-1, 1) > 0.5
+                    # FIX: exclude turn commands from lane penalty (same as train loop)
+                    turn_mask = ((cmds == 1) | (cmds == 2)).view(-1, 1)
+                    lane_threshold = torch.where(
+                        turn_mask.expand_as(abs_lateral_y),
+                        torch.full_like(abs_lateral_y, 99.0),
+                        torch.full_like(abs_lateral_y, 4.0),
+                    )
                     lane_penalty = torch.where(
-                        abs_lateral_y > 3.0,
-                        (abs_lateral_y - 3.0).pow(2) * 2.0,
+                        abs_lateral_y > lane_threshold,
+                        (abs_lateral_y - lane_threshold).pow(2) * 1.5,
                         torch.zeros_like(abs_lateral_y),
                     )
-                    rec_mask = recs.view(-1, 1) > 0.5
                     lane_penalty = lane_penalty * (~rec_mask).float()
                     loss_lane = lane_penalty.mean()
 
@@ -682,7 +705,9 @@ def main():
             else:
                 scheduler.step(val_loss)
 
-        if val_loss < best_val:
+        # FIX: early stopping with min_delta to avoid stopping due to noise
+        min_delta = float(config.get("early_stopping_min_delta", 0.0))
+        if val_loss < best_val - min_delta:
             best_val = val_loss
             no_improve = 0
             torch.save({
