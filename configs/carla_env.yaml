@@ -7,7 +7,7 @@
   fixed_delta: 0.05
   no_rendering: false
 
-  map: "Town03"
+  map: "Town05"
 
 
 
@@ -46,7 +46,6 @@ cil:
   recovery_duration_frames: 10
   recovery_steer_offset: 0.3
   use_pure_pursuit: true
-  # true = pure-pursuit follows CARLA route waypoints; false = follows model-predicted waypoints.
   use_carla_waypoints: false
   lane_constrain_blended: false      # true = Bật, false = Tắt (Mặc định là false nếu không ghi gì)
   lane_constrain_strength: 0.2        # Điều chỉnh từ 0.0 đến 1.0 (20% can thiệp)
@@ -97,10 +96,10 @@ gtnet:
   draw_debug: false
 
 traffic_spawn:
-  vehicle_count: 0
-  bike_count: 0
-  motorbike_count: 0
-  pedestrian_count: 0
+  vehicle_count: 30
+  bike_count: 20
+  motorbike_count: 20
+  pedestrian_count: 10
   npc_enable_autopilot: true
 
 recording:

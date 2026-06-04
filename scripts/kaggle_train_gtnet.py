@@ -621,6 +621,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit-samples",  type=int,  default=0)
     p.add_argument("--town-filter",    type=str,  default="")
     p.add_argument("--quick-ablation", action="store_true")
+    p.add_argument("--resume",          type=str,  default="",
+                   help="Path to checkpoint .pt file to resume training from.")
     return p.parse_args()
 
 
@@ -1284,7 +1286,63 @@ def train_single(
     best_ade_metric = math.inf  # independent ADE tracker
     best_ade_record: dict = {}  # epoch record at best ADE
 
-    for epoch in range(1, epochs + 1):
+    start_epoch = 1
+    resume_path = getattr(args, "resume", "")
+    if resume_path:
+        resume_p = Path(resume_path).resolve()
+        if resume_p.exists():
+            print(f"  [Resume] Loading checkpoint from {resume_p}")
+            try:
+                ckpt_resume = torch.load(resume_p, map_location=device)
+            except Exception as e:
+                print(f"  [Resume] [WARN] Failed to load checkpoint: {e}")
+                ckpt_resume = None
+
+            if ckpt_resume is not None:
+                raw_model = model.module if hasattr(model, "module") else model
+                raw_model.load_state_dict(ckpt_resume["model_state_dict"])
+                
+                if "optimizer_state_dict" in ckpt_resume:
+                    try:
+                        optimizer.load_state_dict(ckpt_resume["optimizer_state_dict"])
+                        print("  [Resume] Loaded optimizer state.")
+                    except Exception as e:
+                        print(f"  [Resume] [WARN] Failed to load optimizer state: {e}")
+                
+                if "scheduler_state_dict" in ckpt_resume and not args.cosine_lr:
+                    try:
+                        scheduler.load_state_dict(ckpt_resume["scheduler_state_dict"])
+                        print("  [Resume] Loaded scheduler state.")
+                    except Exception as e:
+                        print(f"  [Resume] [WARN] Failed to load scheduler state: {e}")
+                
+                if "scaler_state_dict" in ckpt_resume and scaler is not None:
+                    try:
+                        scaler.load_state_dict(ckpt_resume["scaler_state_dict"])
+                        print("  [Resume] Loaded scaler state.")
+                    except Exception as e:
+                        print(f"  [Resume] [WARN] Failed to load scaler state: {e}")
+                
+                best_metric = ckpt_resume.get("best_metric", ckpt_resume.get("val_loss", math.inf))
+                best_ade_metric = ckpt_resume.get("best_ade_metric", ckpt_resume.get("val_ade", math.inf))
+                stale = ckpt_resume.get("stale", 0)
+                history = ckpt_resume.get("history", [])
+                start_epoch = ckpt_resume.get("epoch", 0) + 1
+                
+                if args.cosine_lr and scheduler is not None:
+                    scheduler._epoch = start_epoch - 1
+                    print(f"  [Resume] Fast-forwarded WarmupCosineScheduler to epoch {start_epoch - 1}.")
+                
+                if is_gat and start_epoch > freeze_epochs:
+                    gat_frozen = False
+                    _set_gat_frozen(False)
+                    print(f"  [Resume] Post-freeze phase detected (epoch {start_epoch} > {freeze_epochs}). GAT unfrozen.")
+                
+                print(f"  [Resume] Resuming from epoch {start_epoch} (best_metric={best_metric:.4f}, best_ade_metric={best_ade_metric:.4f})")
+        else:
+            print(f"  [Resume] [WARN] Checkpoint path '{resume_p}' does not exist. Starting from scratch.")
+
+    for epoch in range(start_epoch, epochs + 1):
         t0 = time.time()
 
         # [FIX-2/4] Unfreeze GAT at the designated epoch and reset early-stop.
@@ -1399,8 +1457,15 @@ def train_single(
         raw_model = model.module if hasattr(model, "module") else model
         ckpt = dict(
             model_state_dict=raw_model.state_dict(),
+            optimizer_state_dict=optimizer.state_dict(),
+            scheduler_state_dict=scheduler.state_dict() if not args.cosine_lr else None,
+            scaler_state_dict=scaler.state_dict() if scaler is not None else None,
             model_config=config_to_dict(cfg),
             epoch=epoch,
+            best_metric=best_metric,
+            best_ade_metric=best_ade_metric,
+            stale=stale,
+            history=history,
             val_loss=val_loss, val_ade=val_ade, val_fde=val_fde,
             val_miss=val_miss,
         )
@@ -1409,6 +1474,8 @@ def train_single(
         if improved:
             best_metric = current
             stale = 0
+            ckpt["best_metric"] = best_metric
+            ckpt["stale"] = stale
             torch.save(ckpt, best_path)
         else:
             stale += 1
