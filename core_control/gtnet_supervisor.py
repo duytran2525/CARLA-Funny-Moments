@@ -60,24 +60,10 @@ class GTNetSupervisorConfig:
     caution_brake: float = 0.35
     emergency_brake: float = 0.75
     corridor_base_half_width_m: float = 1.25
-    # BUG FIX: reduced from 0.035 → 0.025 → 0.018 and max from 3.0 → 2.5 → 2.2.
-    # At 35m forward with 0.018: half_width = 1.25 + 0.63 = 1.88m (total 3.76m).
-    # A CARLA lane is ~3.5-3.7m, so corridor stays within ego's own lane.
     corridor_growth_per_m: float = 0.018
     corridor_curve_gain: float = 0.55
     corridor_max_half_width_m: float = 2.2
-    # BUG FIX: mode consensus — require at least this many modes (out of K) to
-    # predict a corridor violation before treating as a real threat.
-    # With K=5 modes, setting min_threat_modes=2 filters out noisy single-mode
-    # false positives where 1 of 5 modes drifts into the ego corridor.
     min_threat_modes: int = 2
-    # Receding-vehicle filter: a leading vehicle is considered to be "pulling
-    # away" (and therefore safe) when its predicted forward position at the
-    # END of the danger horizon exceeds its current position by at least
-    # min_receding_gap_m.  The filter is bypassed for vehicles that are
-    # currently closer than receding_min_initial_fwd_m, because a close
-    # vehicle can still be dangerous even if it momentarily appears to be
-    # moving away (e.g., oscillating, about to cut back in).
     min_receding_gap_m: float = 2.0
     receding_min_initial_fwd_m: float = 5.0
     draw_debug: bool = False
@@ -465,11 +451,10 @@ class GTNetSupervisor:
         over the prediction horizon. This filters out vehicles in adjacent lanes
         that maintain a constant offset (parallel traffic).
         """
-        # Sample lateral distances at the start (25%) and end (75%) of the horizon
         t_early = max(0, max_t_idx // 4)
         t_late = min(max_t_idx - 1, max_t_idx * 3 // 4)
         if t_early >= t_late:
-            return True  # Too few steps to judge; assume approaching
+            return True
 
         right_early = float(pred_np[agent_idx, mode_idx, t_early, 0])
         fwd_early = float(pred_np[agent_idx, mode_idx, t_early, 1])
@@ -481,8 +466,6 @@ class GTNetSupervisor:
 
         lat_dist_early = abs(right_early - center_early)
         lat_dist_late = abs(right_late - center_late)
-
-        # Agent is approaching if lateral distance decreased by at least 0.3m
         return lat_dist_late < lat_dist_early - 0.3
 
     def _assess_predictions(
@@ -508,25 +491,8 @@ class GTNetSupervisor:
         )
         num_modes = int(pred_np.shape[1])
         min_threat_modes = min(int(self.config.min_threat_modes), num_modes)
-
-        # ── BUG FIX: Mode consensus + approach velocity filter ────────────────
-        # Old code triggered braking if ANY single mode at ANY timestep placed an
-        # agent inside the corridor.  With K=5 multimodal predictions, noisy modes
-        # frequently "drift" adjacent-lane vehicles or sidewalk pedestrians into
-        # the ego corridor, causing false braking.
-        #
-        # Fix:
-        #  1) For each agent, count how many modes predict a corridor violation.
-        #  2) Only treat as threat if >= min_threat_modes modes agree.
-        #  3) Verify the agent is actually APPROACHING the corridor (lateral
-        #     distance decreasing), not just passing parallel.
-
         best: Optional[Dict[str, Any]] = None
         rear_warnings: list[Dict[str, Any]] = []
-
-        # Build a lookup of current position, speed, lateral error, heading,
-        # and towards-corridor velocity per actor from the last observed frame
-        # (ground-truth ego-centric state).
         current_fwd_by_id: Dict[int, float] = {}
         current_speed_by_id: Dict[int, float] = {}
         current_lat_err_by_id: Dict[int, float] = {}
@@ -538,10 +504,6 @@ class GTNetSupervisor:
         if history:
             anchor = history[-1]
             for aid, actor_state in anchor.actors.items():
-                # actor_feature_in_anchor_frame returns:
-                #   [0] local_x (lateral/right), [1] local_y (forward),
-                #   [2] rel_vx (lateral vel), [3] rel_vy (forward vel),
-                #   [4] heading_x, [5] heading_y (heading unit vector in ego frame)
                 feat = actor_feature_in_anchor_frame(actor_state, anchor.ego)
                 if len(feat) >= 6:
                     fwd_m = float(feat[1])
@@ -569,37 +531,15 @@ class GTNetSupervisor:
                     current_v_towards_by_id[aid] = v_towards
 
         for agent_idx, actor_id in enumerate(actor_ids):
-            # ── BUG FIX: Euclidean distance pre-filter ─────────────────────────
-            # The corridor scan only checks forward_m ∈ [1, 35], but an actor
-            # at 70m Euclidean distance can still have forward_m=30 if it's
-            # mostly ahead.  Its predicted trajectory is unreliable at that
-            # range, so skip actors whose ACTUAL current distance exceeds the
-            # danger zone.
             if actor_id in current_fwd_by_id and actor_id in current_right_by_id:
                 _cur_fwd = current_fwd_by_id[actor_id]
                 _cur_right = current_right_by_id[actor_id]
                 _actual_dist = math.hypot(_cur_fwd, _cur_right)
                 if _actual_dist > float(self.config.danger_forward_max_m):
                     continue  # Actor is beyond danger range — skip entirely
-
-            # ── BUG FIX: Far same-direction same-lane vehicle filter ───────────
-            # A vehicle 20-35m ahead on the SAME lane, driving the SAME direction
-            # at similar speed, will have its entire predicted trajectory inside
-            # the corridor (because it IS in the same lane).  This is normal
-            # car-following, NOT a collision threat.  Without this filter, the
-            # supervisor triggers caution_brake continuously for any leading
-            # vehicle on the same lane.
-            #
-            # Conditions for filtering:
-            #  1. heading_y > 0.8 (within ~±37° of ego heading — same direction)
-            #  2. current forward distance > 15m (far enough to not be urgent)
-            #  3. relative forward velocity >= -1.0 m/s (not rapidly closing in;
-            #     rel_vy >= 0 means actor moves forward relative to ego,
-            #     rel_vy slightly negative means closing slowly — still safe
-            #     at 15m+)
             if (actor_id in current_heading_y_by_id
                     and actor_id in current_fwd_by_id
-                    and current_fwd_by_id[actor_id] > 15.0
+                    and current_fwd_by_id[actor_id] > 5.0
                     and current_heading_y_by_id[actor_id] > 0.8):
                 # Check relative forward velocity from ground-truth features
                 if history:
@@ -609,16 +549,19 @@ class GTNetSupervisor:
                         _feat = actor_feature_in_anchor_frame(_actor_st, _anchor.ego)
                         if len(_feat) >= 4:
                             _rel_vy = float(_feat[3])  # relative forward velocity
-                            if _rel_vy >= -1.0:
+                            _cur_fwd_m = current_fwd_by_id[actor_id]
+                            # Distance-dependent closing-speed threshold:
+                            #   > 12m: generous  — TTC > 8s  at 1.5 m/s closing
+                            #   8-12m: moderate  — TTC > 8s  at 1.0 m/s closing
+                            #   5-8m:  strict     — TTC > 10s at 0.5 m/s closing
+                            if _cur_fwd_m > 12.0:
+                                _close_thresh = -1.5
+                            elif _cur_fwd_m > 8.0:
+                                _close_thresh = -1.0
+                            else:
+                                _close_thresh = -0.5
+                            if _rel_vy >= _close_thresh:
                                 continue  # Same-lane leader, not closing fast — safe
-
-            # Stationary/Slow Adjacent Vehicle Filter & Parallel Motion Filter:
-            # 1. If the vehicle is currently stationary or moving extremely slowly (< 1.5 m/s)
-            #    AND its current position is OUTSIDE our corridor, ignore it.
-            # 2. If the vehicle is currently OUTSIDE our corridor AND its actual lateral
-            #    velocity directed towards our corridor is very small (< 0.35 m/s), meaning
-            #    it is driving parallel or moving away, then any predicted path that abruptly
-            #    cuts into our corridor is noise. We ignore it to prevent false-alarm stops.
             if actor_id in current_speed_by_id and actor_id in current_lat_err_by_id:
                 cur_speed = current_speed_by_id[actor_id]
                 cur_lat_err = current_lat_err_by_id[actor_id]
@@ -633,30 +576,12 @@ class GTNetSupervisor:
                     v_towards = current_v_towards_by_id[actor_id]
                     if v_towards < 0.35:
                         continue
-
-            # Stationary Vehicle Prediction Override:
-            # If the vehicle is currently stationary or moving extremely slowly (< 0.8 m/s),
-            # it cannot physically swerve or cut lanes abruptly, nor can it move backwards.
-            # However, because of relative velocity coordinate discrepancies when the ego vehicle
-            # is moving, the GTNet model routinely predicts that stationary vehicles will
-            # swerve 90 degrees left or run backwards in reverse.
-            # We override all modes and future timesteps of the prediction to stay exactly at the
-            # vehicle's current observed position, ensuring highly robust obstacle avoidance
-            # while preventing chaotic trajectory hallucinations.
             if actor_id in current_speed_by_id and current_speed_by_id[actor_id] < 0.8:
                 cur_right = current_right_by_id.get(actor_id, 0.0)
                 cur_fwd = current_fwd_by_id.get(actor_id, 0.0)
                 pred_np[agent_idx, :, :, 0] = cur_right
                 pred_np[agent_idx, :, :, 1] = cur_fwd
 
-            # Co-directional traffic filter (heading alignment):
-            # When ego is turning/merging, the corridor shifts and widens via
-            # curve bonus.  Vehicles in adjacent lanes driving the SAME DIRECTION
-            # get swallowed into the expanded corridor and falsely trigger braking.
-            # Fix: if the agent is heading roughly the same direction as ego
-            # (heading_y > 0.7, i.e. within ~±45°) AND would be OUTSIDE the
-            # STRAIGHT corridor (calculated with steer=0, no curve expansion),
-            # then it is co-directional adjacent-lane traffic — not a threat.
             if actor_id in current_heading_y_by_id and actor_id in current_right_by_id:
                 heading_y = current_heading_y_by_id[actor_id]
                 if heading_y > 0.7:
@@ -667,18 +592,9 @@ class GTNetSupervisor:
                     straight_lat_err = abs(right_m)
                     if straight_lat_err > straight_half_w:
                         continue  # Same-direction traffic outside straight corridor
-
-            # Phase 0: Classify agent direction — behind or in front of ego.
-            # Use the ground-truth current forward position from history (last frame),
-            # NOT the t=0 of the model prediction (which is the first future step).
-            # This is much more reliable for determining front vs behind.
             if actor_id in current_fwd_by_id:
                 current_fwd = current_fwd_by_id[actor_id]
             else:
-                # Fallback: median of t=0 prediction across modes.
-                # Log at DEBUG level so repeated fallbacks are traceable —
-                # this usually means the actor appeared mid-sequence or the
-                # history anchor frame is missing the actor (e.g., occluded).
                 initial_forwards = [
                     float(pred_np[agent_idx, m, 0, 1]) for m in range(num_modes)
                 ]
@@ -738,25 +654,6 @@ class GTNetSupervisor:
                 earliest["initial_fwd"] = median_initial_fwd
                 rear_warnings.append(earliest)
                 continue  # Do NOT affect front-threat braking decision
-
-            # Phase 3: Approach velocity filter — reject agents moving parallel
-            # OR agents that are RECEDING (pulling away forward from ego).
-            #
-            # KEY FIX: A vehicle driving straight AHEAD of ego, faster than ego,
-            # will have waypoints at increasing forward_m (5m → 10m → 15m…)
-            # all inside the narrow corridor.  Without this filter, GTNet would
-            # brake every time any leading vehicle's trajectory is visualised.
-            #
-            # "Receding" = median last predicted forward position across modes is
-            # substantially LARGER than the current observed position by at least
-            # min_receding_gap_m, meaning the gap is growing → vehicle is faster
-            # than ego → NOT a threat.
-            #
-            # Safety exception: if the vehicle is currently CLOSER than
-            # receding_min_initial_fwd_m (default 5m), the receding filter is
-            # DISABLED regardless — a close vehicle can still be dangerous even
-            # if it momentarily seems to be pulling away (e.g., oscillation,
-            # brake-then-cut, or short horizon noise).
             receding_gap_m = float(self.config.min_receding_gap_m)
             receding_min_fwd_m = float(self.config.receding_min_initial_fwd_m)
             last_t = max_t_idx - 1
@@ -771,15 +668,8 @@ class GTNetSupervisor:
             )
             if is_receding:
                 continue  # Vehicle ahead is pulling away — safe, no threat
-
-            # ── BUG FIX: Relative-velocity receding filter ─────────────────────
-            # The prediction-based receding filter above can miss vehicles that
-            # are driving at a similar speed to ego (gap barely grows in 3s).
-            # Use ground-truth relative forward velocity: if rel_vy >= 0
-            # (actor is moving forward in ego frame = same speed or faster)
-            # AND actor is far enough (> 10m), it's safe car-following.
             if (actor_id in current_fwd_by_id
-                    and median_initial_fwd > 10.0
+                    and median_initial_fwd > 5.0
                     and history):
                 _anchor_rv = history[-1]
                 _actor_rv = _anchor_rv.actors.get(actor_id)
@@ -787,11 +677,10 @@ class GTNetSupervisor:
                     _feat_rv = actor_feature_in_anchor_frame(_actor_rv, _anchor_rv.ego)
                     if len(_feat_rv) >= 4:
                         _rel_fwd_vel = float(_feat_rv[3])  # relative forward velocity
-                        if _rel_fwd_vel >= -0.5:  # not closing faster than 0.5 m/s
+                        # Stricter at close range: 5-10m needs near-zero closing
+                        _rv_safe = -0.3 if median_initial_fwd <= 10.0 else -0.5
+                        if _rel_fwd_vel >= _rv_safe:
                             continue  # Vehicle ahead at stable/growing gap — safe
-
-            # EXCEPTION: Skip approach check when agent is already at close
-            # range (forward_m < 3m) or deep inside corridor (lat_error < 0.5m).
             first_threat = min(threatening_modes, key=lambda m: float(m["time_s"]))
             already_close = (
                 float(first_threat["forward_m"]) < 3.0
@@ -819,12 +708,6 @@ class GTNetSupervisor:
                     new_key = (float(candidate["time_s"]), -float(candidate["severity"]))
                     if new_key < old_key:
                         best = candidate
-
-        # ── Build result dict ─────────────────────────────────────────────────
-        # rear_threat_info: expose rear agent data for debug + throttle hints.
-        # throttle_floor: when a rear vehicle is predicted to enter the
-        # corridor, suggest the caller NOT reduce throttle below this value
-        # (i.e. maintain speed instead of braking) to keep safe separation.
         has_rear_threat = len(rear_warnings) > 0
         rear_info: Dict[str, Any] = {}
         throttle_floor = 0.0
@@ -857,12 +740,6 @@ class GTNetSupervisor:
                 "latency_ms": 0.0,
                 **rear_info,
             }, pred_np
-
-        # BUG FIX: Changed from OR to AND with time guard.
-        # Old logic: emergency brake if TTC <= 1.2s OR forward <= 13m.
-        # This caused emergency braking for actors at 12m predicted forward
-        # even when TTC was 2.5s (plenty of time).  New logic: emergency
-        # brake only when the threat is BOTH close AND imminent.
         hard = (
             float(best["time_s"]) <= float(self.config.hard_brake_time_s)
             and float(best["forward_m"]) <= float(self.config.hard_brake_forward_m)

@@ -71,7 +71,9 @@ except Exception:
 
 # â”€â”€ AMP compatibility â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 try:
+    # pyrefly: ignore [missing-import]
     from torch.amp import GradScaler as _GradScaler
+    # pyrefly: ignore [missing-import]
     from torch.amp import autocast as _autocast
 
     def _make_scaler(enabled: bool) -> _GradScaler:

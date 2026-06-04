@@ -3841,7 +3841,7 @@ class CILAgent(BaseAgent):
 
         def project_to_overlay(pt_xy: tuple[float, float]) -> Any:
             u = clamp((pt_xy[0] - min_x) / span_x, 0.0, 1.0)
-            v = clamp((pt_xy[1] - min_y) / span_y, 0.0, 1.0)
+            v = clamp(1.0 - (pt_xy[1] - min_y) / span_y, 0.0, 1.0)
             return self._overlay_plane_location(
                 basis,
                 dist_s,
@@ -5093,12 +5093,16 @@ class CILAgent(BaseAgent):
                 steering_source = 0.0
                 logging.error("PurePursuitController chưa được khởi tạo!")
 
-        steering = self._stabilize_cil_steering(
-            steering_raw=steering_source,
-            speed_kmh=speed_kmh,
-            command=command,
-            command_phase=str(command_debug.get("phase", "cruise")),
-        )
+        if bool(self.config.cil_use_carla_waypoints):
+            # Bypass secondary smoothing/rate-limiting when using smooth CARLA route waypoints to prevent control lag
+            steering = float(steering_source)
+        else:
+            steering = self._stabilize_cil_steering(
+                steering_raw=steering_source,
+                speed_kmh=speed_kmh,
+                command=command,
+                command_phase=str(command_debug.get("phase", "cruise")),
+            )
         control = carla.VehicleControl(
             throttle=float(throttle),
             steer=float(clamp(steering, -1.0, 1.0)),

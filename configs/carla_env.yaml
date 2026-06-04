@@ -1,4 +1,4 @@
-﻿carla:
+carla:
   host: "127.0.0.1"
   port: 2000
   tm_port: 8000
@@ -7,7 +7,7 @@
   fixed_delta: 0.05
   no_rendering: false
 
-  map: "Town05"
+  map: "Town03"
 
 
 
@@ -46,7 +46,7 @@ cil:
   recovery_duration_frames: 10
   recovery_steer_offset: 0.3
   use_pure_pursuit: true
-  use_carla_waypoints: false
+  use_carla_waypoints: true
   lane_constrain_blended: false      # true = Bật, false = Tắt (Mặc định là false nếu không ghi gì)
   lane_constrain_strength: 0.2        # Điều chỉnh từ 0.0 đến 1.0 (20% can thiệp)
 
@@ -79,10 +79,10 @@ yolo:
 gtnet:
   # GTNet dùng như safety supervisor cho cil/cil_yolo.
   # Model này không thay CIL waypoint model; nó dự đoán quỹ đạo NPC và chỉ override phanh.
-  enabled: false
+  enabled: true
   # BUG FIX: gtnet_full_best.pt được train ở 20fps (dt=0.05) với history=40, future=60.
   # Phải dùng expected_dt=0.05 và history_frames=40 để khớp với training data.
-  model_path: "models/gtnet_full_best_ade.pt"
+  model_path: "models/gtnet_full_best_ade(1).pt"
   history_frames: 40
   expected_dt: 0.05
   # gtnet_full_best.pt được train với adaptive-radius dataset.
@@ -96,10 +96,10 @@ gtnet:
   draw_debug: false
 
 traffic_spawn:
-  vehicle_count: 30
-  bike_count: 20
-  motorbike_count: 20
-  pedestrian_count: 10
+  vehicle_count: 0
+  bike_count: 0
+  motorbike_count: 0
+  pedestrian_count: 0
   npc_enable_autopilot: true
 
 recording:
