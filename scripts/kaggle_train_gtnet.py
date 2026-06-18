@@ -502,11 +502,11 @@ ABLATION_VARIANTS: List[AblationVariant] = [
     AblationVariant("Baseline",   "000", False, False, False,
                     "GCN + unimodal + fixed radius (baseline)"),
     AblationVariant("GAT_only",   "100", True,  False, False,
-                    "Adds Graph Attention â€” learns edge weights between agents"),
+                    "Adds Graph Attention — learns edge weights between agents"),
     AblationVariant("Multi_only", "010", False, True,  False,
-                    "Adds multimodal output â€” K future trajectory hypotheses"),
+                    "Adds multimodal output — K future trajectory hypotheses"),
     AblationVariant("AdpR_only",  "001", False, False, True,
-                    "Adds adaptive radius â€” interaction range scales with speed"),
+                    "Adds adaptive radius — interaction range scales with speed"),
     AblationVariant("GAT_Multi",  "110", True,  True,  False,
                     "GAT + multimodal"),
     AblationVariant("GAT_AdpR",   "101", True,  False, True,
@@ -514,11 +514,11 @@ ABLATION_VARIANTS: List[AblationVariant] = [
     AblationVariant("Multi_AdpR", "011", False, True,  True,
                     "Multimodal + adaptive radius"),
     AblationVariant("GTNet_Full", "111", True,  True,  True,
-                    "All improvements enabled â€” full GTNet"),
+                    "All improvements enabled — full GTNet"),
 ]
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ═══════════════════════════════════════════════════════════════════════════════
 # CLI
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
@@ -543,17 +543,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-workers",         type=int,   default=2)
 
     # â”€â”€ Model architecture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    p.add_argument("--hidden-dim",           type=int,   default=256)
-    p.add_argument("--graph-layers",         type=int,   default=3)
-    p.add_argument("--dropout",              type=float, default=0.1)
-    p.add_argument("--num-modes",            type=int,   default=3)
+    p.add_argument("--hidden-dim",           type=int,   default=384)
+    p.add_argument("--graph-layers",         type=int,   default=4)
+    p.add_argument("--dropout",              type=float, default=0.15)
+    p.add_argument("--num-modes",            type=int,   default=5)
     p.add_argument("--num-attention-heads",  type=int,   default=4)
     # [IMP-F] New architecture flags
     p.add_argument("--use-temporal-attention", action="store_true",
                    help="[IMP-1] Apply self-attention over GRU history sequence.")
     p.add_argument("--mode-embed-dim",  type=int,   default=64,
                    help="[IMP-2] Mode embedding dim in shared-GRU decoder.")
-    p.add_argument("--encoder-dropout", type=float, default=0.0,
+    p.add_argument("--encoder-dropout", type=float, default=0.15,
                    help="[IMP-3] Dropout on GRU encoder output. Reduces train/val gap.")
     # [V4-B] GAT edge feature dimension
     p.add_argument("--gat-edge-dim", type=int, default=32,
@@ -584,10 +584,10 @@ def parse_args() -> argparse.Namespace:
                    help="[IMP-D] Metric to monitor for early stopping and "
                         "best-checkpoint selection.")
     # [IMP-B]
-    p.add_argument("--diversity-weight", type=float, default=0.0,
+    p.add_argument("--diversity-weight", type=float, default=0.08,
                    help="[IMP-B] Weight for mode diversity loss (0 = disabled). "
                         "Recommended: 0.05â€“0.1 when --enable-multimodal + K>=3.")
-    p.add_argument("--diversity-ramp-epochs", type=int, default=20,
+    p.add_argument("--diversity-ramp-epochs", type=int, default=15,
                    help="[IMP-D] Ramp diversity weight from 0 â†’ target over this "
                         "many epochs. Prevents diversity loss from destabilising "
                         "WTA training in early epochs. 0 = no ramp (full weight "

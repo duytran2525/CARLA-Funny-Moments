@@ -44,7 +44,7 @@ class GTNetSupervisorConfig:
     model_path: str
     enabled: bool = False
     inference_every_n_ticks: int = 3
-    history_frames: int = 20
+    history_frames: int = 40
     expected_dt: float = 0.1
     fixed_delta: float = 0.033333
     max_agents: int = 32

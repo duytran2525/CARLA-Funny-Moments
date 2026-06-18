@@ -1,7 +1,8 @@
-﻿
+
 from __future__ import annotations
 
 import logging
+import math
 import random
 import time
 from collections import deque
@@ -71,6 +72,9 @@ class CarlaManager:
         npc_pedestrian_count: int = 50,
         npc_enable_autopilot: bool = True,
         seed: Optional[int] = None,
+        traffic_light_red_time: float = 10.0,
+        traffic_light_green_time: float = 15.0,
+        traffic_light_yellow_time: float = 3.0,
     ) -> None:
         self.host = host
         self.port = port
@@ -89,6 +93,9 @@ class CarlaManager:
         self.npc_pedestrian_count = max(0, npc_pedestrian_count)
         self.npc_enable_autopilot = npc_enable_autopilot
         self.seed = seed
+        self.traffic_light_red_time = traffic_light_red_time
+        self.traffic_light_green_time = traffic_light_green_time
+        self.traffic_light_yellow_time = traffic_light_yellow_time
 
         self.client: Optional[CarlaClient] = None
         self.world: Optional[CarlaWorld] = None
@@ -101,6 +108,8 @@ class CarlaManager:
         self._walker_actors: List[CarlaActor] = []
         self._walker_controllers: List[CarlaActor] = []
         self._collision_frames: deque[int] = deque(maxlen=256)
+        self._last_spectator_transform: Optional[CarlaTransform] = None
+        self._spectator_follow_tick = 0
 
     def _retry_rpc_call(
         self,
@@ -176,6 +185,7 @@ class CarlaManager:
         self._spawn_requested_traffic()
         self._spawn_pedestrians()
         self._log_static_traffic_actors()
+        self._apply_traffic_light_timings()
         self.apply_spawn_locked_spectator(force=True)
 
     def _apply_random_seeds(self) -> None:
@@ -512,29 +522,95 @@ class CarlaManager:
             traffic_signs,
         )
 
+    def _apply_traffic_light_timings(self) -> None:
+        if self.world is None:
+            return
+        try:
+            traffic_lights = self.world.get_actors().filter("traffic.traffic_light*")
+            count = 0
+            for tl in traffic_lights:
+                tl.set_red_time(float(self.traffic_light_red_time))
+                tl.set_green_time(float(self.traffic_light_green_time))
+                tl.set_yellow_time(float(self.traffic_light_yellow_time))
+                count += 1
+            logging.info(
+                "Configured %d traffic lights: red=%.1fs, green=%.1fs, yellow=%.1fs",
+                count,
+                self.traffic_light_red_time,
+                self.traffic_light_green_time,
+                self.traffic_light_yellow_time,
+            )
+        except Exception as exc:
+            logging.warning("Failed to configure traffic light timings: %s", exc)
+
     def _spawn_spectator_transform(self) -> Optional[CarlaTransform]:
-        if self._spawn_transform is None:
+        if self.ego_vehicle is not None:
+            try:
+                ref_transform = self.ego_vehicle.get_transform()
+            except Exception as exc:
+                # Do not fall back to the original spawn transform here. During
+                # heavy rendering/RPC stalls that makes the spectator jump back
+                # to spawn and look like it is locked to the wrong object.
+                logging.debug("Skipping spectator follow update; ego transform unavailable: %s", exc)
+                return None
+        else:
+            ref_transform = self._spawn_transform
+
+        if ref_transform is None:
             return None
 
-        spawn = self._spawn_transform
-        forward = spawn.get_forward_vector()
-        loc = spawn.location
+        forward = ref_transform.get_forward_vector()
+        loc = ref_transform.location
         dist = self.spectator_cfg.follow_distance
         height = self.spectator_cfg.height
-        target = carla.Location(
+        camera_loc = carla.Location(
             x=loc.x - forward.x * dist,
             y=loc.y - forward.y * dist,
             z=loc.z + height,
         )
+        look_at = carla.Location(x=loc.x, y=loc.y, z=loc.z + 1.2)
+        dx = float(look_at.x - camera_loc.x)
+        dy = float(look_at.y - camera_loc.y)
+        dz = float(look_at.z - camera_loc.z)
+        yaw = math.degrees(math.atan2(dy, dx))
+        pitch = math.degrees(math.atan2(dz, max(1e-3, math.hypot(dx, dy))))
 
         return carla.Transform(
-            target,
+            camera_loc,
             carla.Rotation(
-                pitch=self.spectator_cfg.pitch,
-                yaw=spawn.rotation.yaw,
+                pitch=pitch,
+                yaw=yaw,
                 roll=0.0,
             ),
         )
+
+    @staticmethod
+    def _smooth_spectator_transform(
+        previous: CarlaTransform,
+        target: CarlaTransform,
+        alpha: float = 0.35,
+    ) -> CarlaTransform:
+        alpha = max(0.0, min(1.0, float(alpha)))
+        prev_loc = previous.location
+        target_loc = target.location
+        prev_rot = previous.rotation
+        target_rot = target.rotation
+        yaw_delta = ((float(target_rot.yaw) - float(prev_rot.yaw) + 180.0) % 360.0) - 180.0
+        return carla.Transform(
+            carla.Location(
+                x=float(prev_loc.x) + (float(target_loc.x) - float(prev_loc.x)) * alpha,
+                y=float(prev_loc.y) + (float(target_loc.y) - float(prev_loc.y)) * alpha,
+                z=float(prev_loc.z) + (float(target_loc.z) - float(prev_loc.z)) * alpha,
+            ),
+            carla.Rotation(
+                pitch=float(prev_rot.pitch) + (float(target_rot.pitch) - float(prev_rot.pitch)) * alpha,
+                yaw=float(prev_rot.yaw) + yaw_delta * alpha,
+                roll=0.0,
+            ),
+        )
+
+    def remember_spectator_transform(self, transform: CarlaTransform) -> None:
+        self._last_spectator_transform = transform
 
     def apply_spawn_locked_spectator(self, force: bool = False) -> None:
         if not self.spectator_cfg.lock_on_spawn and not force:
@@ -546,6 +622,25 @@ class CarlaManager:
             return
         spectator = self.world.get_spectator()
         spectator.set_transform(transform)
+        self._last_spectator_transform = transform
+        if not force:
+            self._spectator_follow_tick += 1
+            if self._spectator_follow_tick % 100 == 0 and self.ego_vehicle is not None:
+                try:
+                    ego_loc = self.ego_vehicle.get_location()
+                    spec_loc = transform.location
+                    dx = float(spec_loc.x - ego_loc.x)
+                    dy = float(spec_loc.y - ego_loc.y)
+                    dz = float(spec_loc.z - ego_loc.z)
+                    logging.info(
+                        "Spectator following ego id=%s type=%s distance=%.2fm yaw=%.1f",
+                        getattr(self.ego_vehicle, "id", "?"),
+                        getattr(self.ego_vehicle, "type_id", "?"),
+                        (dx * dx + dy * dy + dz * dz) ** 0.5,
+                        float(transform.rotation.yaw),
+                    )
+                except Exception:
+                    pass
         if force:
             loc = transform.location
             logging.info(
@@ -614,6 +709,7 @@ class CarlaManager:
                 pass
             self.ego_vehicle = None
             logging.info("Destroyed ego vehicle.")
+        self._last_spectator_transform = None
         if self.tm is not None:
             try:
                 self.tm.set_synchronous_mode(False)

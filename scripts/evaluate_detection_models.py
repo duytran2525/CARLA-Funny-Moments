@@ -489,6 +489,26 @@ def apply_weather_preset(world: Any, preset: str) -> None:
         "softrainsunset": carla.WeatherParameters.SoftRainSunset,
         "midrainsunset": carla.WeatherParameters.MidRainSunset,
         "hardrainsunset": carla.WeatherParameters.HardRainSunset,
+        # Night presets
+        "clearnight": carla.WeatherParameters.ClearNight,
+        "cloudynight": carla.WeatherParameters.CloudyNight,
+        "wetnight": carla.WeatherParameters.WetNight,
+        "wetcloudynight": carla.WeatherParameters.WetCloudyNight,
+        "softrainnight": carla.WeatherParameters.SoftRainNight,
+        "midrainnight": carla.WeatherParameters.MidRainyNight,
+        "hardrainnight": carla.WeatherParameters.HardRainNight,
+        "duststorm": carla.WeatherParameters.DustStorm,
+        # Custom foggy presets
+        "foggynoon": carla.WeatherParameters(
+            cloudiness=80.0, precipitation=0.0, precipitation_deposits=0.0,
+            wind_intensity=10.0, sun_azimuth_angle=0.0, sun_altitude_angle=45.0,
+            fog_density=80.0, fog_distance=5.0, fog_falloff=0.2, wetness=0.0
+        ),
+        "foggynight": carla.WeatherParameters(
+            cloudiness=80.0, precipitation=0.0, precipitation_deposits=0.0,
+            wind_intensity=10.0, sun_azimuth_angle=0.0, sun_altitude_angle=-20.0,
+            fog_density=80.0, fog_distance=5.0, fog_falloff=0.2, wetness=0.0
+        )
     }
     world.set_weather(presets.get(preset_lower, carla.WeatherParameters.ClearNoon))
     logging.info("Applied weather preset: %s", preset)

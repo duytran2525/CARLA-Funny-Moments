@@ -105,12 +105,18 @@ class YoloDetector:
         
         if self.device.type == "cuda":
             torch.backends.cudnn.benchmark = True
+        model_load_t0 = time.perf_counter()
         if "rtdetr" in model_path.lower():
             self.model = RTDETR(model_path)
         else:
             self.model = YOLO(model_path, task="detect")
         if not self._is_exported_model:
             self.model = self.model.to(self.device)
+        logging.info(
+            "YOLO/RT-DETR model object initialized in %.1f ms: %s",
+            (time.perf_counter() - model_load_t0) * 1000.0,
+            os.path.basename(model_path),
+        )
         self.class_names = self.model.names
 
         # ── Fix exported model class names (.engine/.onnx lose metadata) ──
@@ -182,21 +188,34 @@ class YoloDetector:
     def _restore_class_names_from_pt(exported_path: str) -> Optional[Dict[int, str]]:
         """Try to load class names from the matching .pt file next to the exported model."""
         exported = Path(exported_path)
-        # Try sibling .pt file with same stem
-        pt_path = exported.with_suffix(".pt")
-        if pt_path.exists():
-            try:
-                if "rtdetr" in str(pt_path).lower():
-                    ref_model = RTDETR(str(pt_path))
-                else:
-                    ref_model = YOLO(str(pt_path), task="detect")
-                names = ref_model.names
-                del ref_model
-                if isinstance(names, dict) and len(names) > 0:
-                    logging.info("Found matching .pt at %s with %d classes.", pt_path, len(names))
-                    return names
-            except Exception as exc:
-                logging.debug("Could not load .pt for class names: %s", exc)
+        restore_from_pt = str(os.environ.get("YOLO_RESTORE_NAMES_FROM_PT", "")).strip().lower()
+        if restore_from_pt in {"1", "true", "yes", "on"}:
+            pt_path = exported.with_suffix(".pt")
+            if pt_path.exists():
+                try:
+                    restore_t0 = time.perf_counter()
+                    if "rtdetr" in str(pt_path).lower():
+                        ref_model = RTDETR(str(pt_path))
+                    else:
+                        ref_model = YOLO(str(pt_path), task="detect")
+                    names = ref_model.names
+                    del ref_model
+                    if isinstance(names, dict) and len(names) > 0:
+                        logging.info(
+                            "Found matching .pt at %s with %d classes in %.1f ms.",
+                            pt_path,
+                            len(names),
+                            (time.perf_counter() - restore_t0) * 1000.0,
+                        )
+                        return names
+                except Exception as exc:
+                    logging.debug("Could not load .pt for class names: %s", exc)
+        else:
+            logging.info(
+                "Skipping sibling .pt class-name restore for exported model %s; "
+                "set YOLO_RESTORE_NAMES_FROM_PT=1 to force verification from .pt.",
+                exported.name,
+            )
 
         # Fallback: hardcoded class map for this project's custom-trained models
         _FALLBACK_NAMES = {

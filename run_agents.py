@@ -616,6 +616,26 @@ def apply_weather_preset(world, preset: str) -> None:
         "softrainsunset": carla.WeatherParameters.SoftRainSunset,
         "midrainsunset": carla.WeatherParameters.MidRainSunset,
         "hardrainsunset": carla.WeatherParameters.HardRainSunset,
+        # Night presets
+        "clearnight": getattr(carla.WeatherParameters, "ClearNight", carla.WeatherParameters.ClearNoon),
+        "cloudynight": getattr(carla.WeatherParameters, "CloudyNight", carla.WeatherParameters.CloudyNoon),
+        "wetnight": getattr(carla.WeatherParameters, "WetNight", carla.WeatherParameters.WetNoon),
+        "wetcloudynight": getattr(carla.WeatherParameters, "WetCloudyNight", carla.WeatherParameters.WetCloudyNoon),
+        "softrainnight": getattr(carla.WeatherParameters, "SoftRainNight", carla.WeatherParameters.SoftRainNoon),
+        "midrainnight": getattr(carla.WeatherParameters, "MidRainyNight", carla.WeatherParameters.MidRainyNoon),
+        "hardrainnight": getattr(carla.WeatherParameters, "HardRainNight", carla.WeatherParameters.HardRainNoon),
+        "duststorm": getattr(carla.WeatherParameters, "DustStorm", carla.WeatherParameters.ClearNoon),
+        # Custom foggy presets
+        "foggynoon": carla.WeatherParameters(
+            cloudiness=80.0, precipitation=0.0, precipitation_deposits=0.0,
+            wind_intensity=10.0, sun_azimuth_angle=0.0, sun_altitude_angle=45.0,
+            fog_density=80.0, fog_distance=5.0, fog_falloff=0.2, wetness=0.0
+        ),
+        "foggynight": carla.WeatherParameters(
+            cloudiness=65.0, precipitation=0.0, precipitation_deposits=0.0,
+            wind_intensity=6.0, sun_azimuth_angle=0.0, sun_altitude_angle=-18.0,
+            fog_density=45.0, fog_distance=35.0, fog_falloff=0.6, wetness=0.0
+        )
     }
     weather = presets.get(preset_lower, carla.WeatherParameters.ClearNoon)
     world.set_weather(weather)
@@ -814,6 +834,9 @@ class RunConfig:
     cil_use_carla_waypoints: bool
     cil_lane_constrain_blended: bool
     cil_lane_constrain_strength: float
+    traffic_light_red_time: float
+    traffic_light_green_time: float
+    traffic_light_yellow_time: float
 
 class BaseSession:
     """Shared interface for CARLA and dry-run sessions."""
@@ -954,6 +977,9 @@ class CarlaSession(BaseSession):
             npc_pedestrian_count=self.config.npc_pedestrian_count,
             npc_enable_autopilot=self.config.npc_enable_autopilot,
             seed=self.config.seed,
+            traffic_light_red_time=self.config.traffic_light_red_time,
+            traffic_light_green_time=self.config.traffic_light_green_time,
+            traffic_light_yellow_time=self.config.traffic_light_yellow_time,
         )
         self._manager.start()
         logging.info("CARLA session is ready.")
@@ -2469,6 +2495,8 @@ class CILAgent(BaseAgent):
         self._hud_ema_fps: Optional[float] = None
         self._hud_last_tick_time: Optional[float] = None
         self._route_overlay_bounds: Optional[tuple[float, float, float, float]] = None
+        self._spectator_follow_transform = None
+        self._spectator_follow_log_tick = 0
 
         # Command delay buffer: hold command N frames before feeding to model.
         # Reduced from 1.0 s → 0.3 s to avoid late turn commands at junctions.
@@ -2488,6 +2516,7 @@ class CILAgent(BaseAgent):
             self._pure_pursuit = PurePursuitController(dt=dt)
         else:
             self._pure_pursuit = None
+        self._wobble_noise = 0.0
 
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
@@ -2513,6 +2542,9 @@ class CILAgent(BaseAgent):
         self._init_navigation_agent(world, vehicle)
         self._command_oracle.reset()
         self._command_delay_buffer.clear()
+        self._wobble_noise = 0.0
+        self._spectator_follow_transform = None
+        self._spectator_follow_log_tick = 0
 
         self._collector = DataCollector(
             output_dir=self.config.collect_data_dir,
@@ -2594,6 +2626,7 @@ class CILAgent(BaseAgent):
 
         detector_imgsz = int(self.config.yolo_inference_imgsz)
         detector_imgsz_arg = detector_imgsz if detector_imgsz > 0 else None
+        load_t0 = time.perf_counter()
         self._yolo_detector = YoloDetector(
             str(model_path),
             display_classes=DETECTOR_DISPLAY_CLASSES,
@@ -2605,6 +2638,10 @@ class CILAgent(BaseAgent):
             camera_mount_z_m=2.2,
             camera_pitch_deg=-8.0,
             tracker_config=self.config.yolo_tracker_config,
+        )
+        logging.info(
+            "cil_yolo detector initialized in %.1f ms.",
+            (time.perf_counter() - load_t0) * 1000.0,
         )
 
         warmup_fn = getattr(self._yolo_detector, "warmup", None)
@@ -2636,6 +2673,9 @@ class CILAgent(BaseAgent):
     def _init_gtnet_supervisor(self) -> None:
         self._gtnet_supervisor = None
         self._last_gtnet_debug_info = {}
+        if not bool(self.config.gtnet_enabled):
+            logging.info("GTNet supervisor disabled in config; skipping checkpoint load.")
+            return
         if GTNetSupervisor is None or GTNetSupervisorConfig is None:
             logging.warning("GTNet supervisor unavailable; CIL/CIL+YOLO will run without trajectory prediction.")
             return
@@ -2663,31 +2703,23 @@ class CILAgent(BaseAgent):
                 fixed_adjacency_radius_m=float(self.config.gtnet_fixed_adjacency_radius_m),
                 draw_debug=bool(self.config.gtnet_draw_debug),
             )
-            # Always load the model and log it — the user can verify the
-            # checkpoint is valid and see its metadata regardless of enabled flag.
+            load_t0 = time.perf_counter()
             loaded_supervisor = GTNetSupervisor(cfg, device=self.config.model_device)
+            logging.info(
+                "GTNet supervisor checkpoint initialized in %.1f ms.",
+                (time.perf_counter() - load_t0) * 1000.0,
+            )
         except Exception as exc:
             self._gtnet_supervisor = None
             logging.warning("Failed to initialize GTNet supervisor: %s", exc)
             return
 
-        if bool(self.config.gtnet_enabled):
-            # enabled=true in YAML (or --enable-gtnet CLI) → supervisor is ACTIVE.
-            self._gtnet_supervisor = loaded_supervisor
-            logging.info(
-                "GTNet supervisor ACTIVE: model=%s enabled=true "
-                "(will override braking when trajectory conflicts are detected)",
-                model_path,
-            )
-        else:
-            # enabled=false in YAML → model loaded (log visible) but supervisor
-            # does NOT override vehicle control.  Flip to true in config to activate.
-            self._gtnet_supervisor = None
-            logging.info(
-                "GTNet supervisor LOADED but INACTIVE: model=%s enabled=false in config. "
-                "Set gtnet.enabled=true in carla_env.yaml to activate.",
-                model_path,
-            )
+        self._gtnet_supervisor = loaded_supervisor
+        logging.info(
+            "GTNet supervisor ACTIVE: model=%s enabled=true "
+            "(will override braking when trajectory conflicts are detected)",
+            model_path,
+        )
 
     def _annotate_cil_yolo_frame(
         self,
@@ -3015,27 +3047,38 @@ class CILAgent(BaseAgent):
         except Exception as exc:
             logging.warning("Could not tick world after CIL spawn alignment: %s", exc)
 
+    def _spectator_transform_for_vehicle(self, vehicle_transform) -> Any:
+        forward = vehicle_transform.get_forward_vector()
+        loc = vehicle_transform.location
+        follow_dist = float(self.config.spectator_follow_distance)
+        height = float(self.config.spectator_height)
+        camera_loc = carla.Location(
+            x=float(loc.x) - float(forward.x) * follow_dist,
+            y=float(loc.y) - float(forward.y) * follow_dist,
+            z=float(loc.z) + height,
+        )
+        look_at = carla.Location(x=float(loc.x), y=float(loc.y), z=float(loc.z) + 1.2)
+        dx = float(look_at.x - camera_loc.x)
+        dy = float(look_at.y - camera_loc.y)
+        dz = float(look_at.z - camera_loc.z)
+        yaw = math.degrees(math.atan2(dy, dx))
+        pitch = math.degrees(math.atan2(dz, max(1e-3, math.hypot(dx, dy))))
+        return carla.Transform(
+            camera_loc,
+            carla.Rotation(pitch=pitch, yaw=yaw, roll=0.0),
+        )
+
     def _apply_spawn_locked_spectator(self, world, spawn_transform) -> None:
         if carla is None or not self.config.lock_spectator_on_spawn:
             return
 
         try:
-            forward = spawn_transform.get_forward_vector()
-            loc = spawn_transform.location
-            spectator_loc = carla.Location(
-                x=float(loc.x) - float(forward.x) * float(self.config.spectator_follow_distance),
-                y=float(loc.y) - float(forward.y) * float(self.config.spectator_follow_distance),
-                z=float(loc.z) + float(self.config.spectator_height),
-            )
-            spectator_tf = carla.Transform(
-                spectator_loc,
-                carla.Rotation(
-                    pitch=float(self.config.spectator_pitch),
-                    yaw=float(spawn_transform.rotation.yaw),
-                    roll=0.0,
-                ),
-            )
+            spectator_tf = self._spectator_transform_for_vehicle(spawn_transform)
             world.get_spectator().set_transform(spectator_tf)
+            manager = getattr(self.session, "_manager", None) if self.session is not None else None
+            remember = getattr(manager, "remember_spectator_transform", None)
+            if callable(remember):
+                remember(spectator_tf)
         except Exception as exc:
             logging.debug("Could not update spectator after CIL spawn alignment: %s", exc)
 
@@ -4036,8 +4079,10 @@ class CILAgent(BaseAgent):
 
         self._device = torch.device(device_name)
 
+        load_t0 = time.perf_counter()
         checkpoint = torch.load(model_path, map_location=self._device, weights_only=True)
         state_dict = unwrap_state_dict(checkpoint)
+        checkpoint_load_ms = (time.perf_counter() - load_t0) * 1000.0
         model_kind = classify_checkpoint_state_dict(state_dict)
         if model_kind != "waypoint":
             raise RuntimeError(
@@ -4063,6 +4108,7 @@ class CILAgent(BaseAgent):
                     upgraded_state_dict[clean_key] = value
             state_dict = upgraded_state_dict
 
+        model_t0 = time.perf_counter()
         model = CIL_NvidiaCNN(pretrained_backbone=False).to(self._device)
         if uses_single_film_checkpoint:
             load_result = model.load_state_dict(state_dict, strict=False)
@@ -4085,7 +4131,13 @@ class CILAgent(BaseAgent):
         else:
             model.load_state_dict(state_dict, strict=True)
         model.eval()
-        logging.info("Loaded CIL model from %s on %s", model_path, self._device)
+        logging.info(
+            "Loaded CIL model from %s on %s (checkpoint=%.1f ms, model_init=%.1f ms)",
+            model_path,
+            self._device,
+            checkpoint_load_ms,
+            (time.perf_counter() - model_t0) * 1000.0,
+        )
         return model
 
     def _spawn_camera(self, world, vehicle):
@@ -4898,6 +4950,8 @@ class CILAgent(BaseAgent):
 
     def _update_spectator_follow(self) -> None:
         """Lock the spectator camera to follow behind the ego vehicle each tick."""
+        if not bool(self.config.spectator_reapply_each_tick):
+            return
         if self.session is None or self.session.world is None or self.session.ego_vehicle is None:
             return
         if carla is None:
@@ -4905,27 +4959,30 @@ class CILAgent(BaseAgent):
 
         vehicle = self.session.ego_vehicle
         transform = vehicle.get_transform()
-        forward = transform.get_forward_vector()
-        loc = transform.location
-
-        follow_dist = float(self.config.spectator_follow_distance)
-        height = float(self.config.spectator_height)
-        pitch = float(self.config.spectator_pitch)
-
-        spectator_loc = carla.Location(
-            x=float(loc.x) - float(forward.x) * follow_dist,
-            y=float(loc.y) - float(forward.y) * follow_dist,
-            z=float(loc.z) + height,
-        )
-        spectator_rot = carla.Rotation(
-            pitch=pitch,
-            yaw=float(transform.rotation.yaw),
-            roll=0.0,
-        )
+        target_tf = self._spectator_transform_for_vehicle(transform)
         try:
-            self.session.world.get_spectator().set_transform(
-                carla.Transform(spectator_loc, spectator_rot)
-            )
+            self.session.world.get_spectator().set_transform(target_tf)
+            self._spectator_follow_transform = target_tf
+            self._spectator_follow_log_tick += 1
+            if self._spectator_follow_log_tick % 100 == 0:
+                loc = transform.location
+                spec_loc = target_tf.location
+                logging.info(
+                    "CIL spectator follow ego id=%s ego=(%.1f, %.1f, %.1f) spec=(%.1f, %.1f, %.1f) yaw=%.1f pitch=%.1f",
+                    getattr(vehicle, "id", "?"),
+                    float(loc.x),
+                    float(loc.y),
+                    float(loc.z),
+                    float(spec_loc.x),
+                    float(spec_loc.y),
+                    float(spec_loc.z),
+                    float(target_tf.rotation.yaw),
+                    float(target_tf.rotation.pitch),
+                )
+            manager = getattr(self.session, "_manager", None)
+            remember = getattr(manager, "remember_spectator_transform", None)
+            if callable(remember):
+                remember(target_tf)
         except Exception:
             pass
 
@@ -5094,8 +5151,9 @@ class CILAgent(BaseAgent):
                 logging.error("PurePursuitController chưa được khởi tạo!")
 
         if bool(self.config.cil_use_carla_waypoints):
-            # Bypass secondary smoothing/rate-limiting when using smooth CARLA route waypoints to prevent control lag
-            steering = float(steering_source)
+            raw_noise = random.gauss(0.0, 0.09)
+            self._wobble_noise = 0.88 * self._wobble_noise + 0.12 * raw_noise
+            steering = float(steering_source) + self._wobble_noise
         else:
             steering = self._stabilize_cil_steering(
                 steering_raw=steering_source,
@@ -5154,10 +5212,15 @@ class CILAgent(BaseAgent):
                     control.throttle = 0.0
                     control.brake = float(clamp(gtnet_brake, 0.0, 1.0))
                     control.hand_brake = False
-                elif gtnet_throttle_floor > 0.0 and float(control.throttle) < gtnet_throttle_floor:
+                elif (gtnet_throttle_floor > 0.0
+                      and float(control.brake) == 0.0
+                      and float(control.throttle) < gtnet_throttle_floor):
                     # Rear threat approaching — maintain minimum speed to keep
                     # safe separation (don't slow down when vehicle behind is
                     # closing in, as that increases rear-end collision risk).
+                    # Only activate when no brake command from ANY source
+                    # (CIL, YOLO TrafficSupervisor, or GTNet front-threat),
+                    # ensuring Brake Fusion always takes priority.
                     control.throttle = float(clamp(gtnet_throttle_floor, 0.0, 1.0))
             except Exception as exc:
                 logging.warning("GTNet supervisor update failed: %s", exc)
@@ -6972,7 +7035,7 @@ def load_env_config(config_path: str) -> Dict[str, Any]:
         logging.warning("PyYAML is not installed; skipping config file %s", path)
         return {}
 
-    with path.open("r", encoding="utf-8") as fp:
+    with path.open("r", encoding="utf-8-sig") as fp:
         loaded = yaml.safe_load(fp) or {}
     if not isinstance(loaded, dict):
         raise RuntimeError(f"Invalid yaml root in {path}. Expected mapping/object.")
@@ -7700,7 +7763,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     )
     gtnet_history_frames = max(
         1,
-        int(pick(args.gtnet_history_frames, "gtnet", "history_frames", 20)),
+        int(pick(args.gtnet_history_frames, "gtnet", "history_frames", 40)),
     )
     gtnet_expected_dt = max(
         1e-3,
@@ -7729,6 +7792,9 @@ def build_config(args: argparse.Namespace) -> RunConfig:
     )
 
     weather_preset = str(_cfg_get(env_cfg, "weather", "preset", "ClearNoon"))
+    traffic_light_red_time = float(_cfg_get(env_cfg, "traffic_lights", "red_time", 10.0))
+    traffic_light_green_time = float(_cfg_get(env_cfg, "traffic_lights", "green_time", 15.0))
+    traffic_light_yellow_time = float(_cfg_get(env_cfg, "traffic_lights", "yellow_time", 3.0))
     yaml_random_weather = _to_bool(_cfg_get(env_cfg, "weather", "random", False), False)
     if yaml_random_weather and not _to_bool(args.no_random_weather, False):
         logging.warning(
@@ -7866,6 +7932,9 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         cil_use_carla_waypoints=cil_use_carla_waypoints,
         cil_lane_constrain_blended=cil_lane_constrain_blended,
         cil_lane_constrain_strength=cil_lane_constrain_strength,
+        traffic_light_red_time=traffic_light_red_time,
+        traffic_light_green_time=traffic_light_green_time,
+        traffic_light_yellow_time=traffic_light_yellow_time,
     )
 
 
