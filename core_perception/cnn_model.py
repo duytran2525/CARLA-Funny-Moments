@@ -210,33 +210,8 @@ class FiLM(nn.Module):
         return x * gamma + beta
 
 
-class FPN(nn.Module):
-    """Lightweight FPN with unified channel width."""
-
-    def __init__(self, in_channels: Tuple[int, int, int], out_channels: int = 128) -> None:
-        super().__init__()
-        c3, c4, c5 = in_channels
-        self.lateral3 = nn.Conv2d(c3, out_channels, kernel_size=1, bias=False)
-        self.lateral4 = nn.Conv2d(c4, out_channels, kernel_size=1, bias=False)
-        self.lateral5 = nn.Conv2d(c5, out_channels, kernel_size=1, bias=False)
-
-        self.smooth3 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.smooth4 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.smooth5 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
-
-    def forward(self, p3: torch.Tensor, p4: torch.Tensor, p5: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        p5 = self.lateral5(p5)
-        p4 = self.lateral4(p4) + F.interpolate(p5, size=p4.shape[-2:], mode="nearest")
-        p3 = self.lateral3(p3) + F.interpolate(p4, size=p3.shape[-2:], mode="nearest")
-
-        p5 = self.smooth5(p5)
-        p4 = self.smooth4(p4)
-        p3 = self.smooth3(p3)
-        return p3, p4, p5
-
-
 class WaypointPredictor(nn.Module):
-    """Spatial-Temporal Waypoint Predictor with RegNetY-400MF + CBAM + FiLM + FPN.
+    """Spatial-Temporal Waypoint Predictor with RegNetY-400MF + CBAM + FiLM (no FPN).
 
     Architecture:
         Input [B, 9, 66, 200]  (3 temporal YUV frames)
@@ -245,7 +220,7 @@ class WaypointPredictor(nn.Module):
           -> RegNetY-400MF stages   -> 48 / 104 / 208 / 440 channels
           -> FiLM(cmd, speed, 208) on stage 3
           -> CBAM(440) + FiLM(cmd, speed, 440) on stage 4
-          -> FPN(104, 208, 440 -> 128) + sum fusion
+          -> Neck (1x1 conv 440->128)
           -> Shared FC features (128-d)
           -> Waypoint head: 15 values (10 coords + 5 sigma)
           -> Speed head: 1 value (normalized speed prediction)
@@ -285,8 +260,12 @@ class WaypointPredictor(nn.Module):
         self.film_s3 = FiLM(num_commands=4, emb_dim=64, channels=c3)
         self.film_s4 = FiLM(num_commands=4, emb_dim=128, channels=c4)
 
-        # ── Multi-scale Feature Pyramid ──
-        self.fpn = FPN(in_channels=(c2, c3, c4), out_channels=128)
+        # ── Single-scale neck (replaces FPN) ──
+        self.neck = nn.Sequential(
+            nn.Conv2d(c4, 128, kernel_size=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ELU(inplace=True),
+        )
 
         # ── Shared feature extractor ──
         self.shared_features = nn.Sequential(
@@ -352,7 +331,7 @@ class WaypointPredictor(nn.Module):
         """Initialize only non-backbone weights; backbone keeps pretrained."""
         for parent in (
             self.stem, self.adapter, self.cbam, self.film_s3, self.film_s4,
-            self.fpn, self.shared_features, self.waypoint_head, self.speed_head,
+            self.neck, self.shared_features, self.waypoint_head, self.speed_head,
         ):
             for module in parent.modules():
                 if isinstance(module, nn.Conv2d):
@@ -402,13 +381,8 @@ class WaypointPredictor(nn.Module):
         s4 = self.cbam(s4)
         s4 = self.film_s4(s4, command, speed)
 
-        # ── FPN multi-scale fusion ──
-        f3, f4, f5 = self.fpn(s2, s3, s4)
-        fused = (
-            f3
-            + F.interpolate(f4, size=f3.shape[-2:], mode="nearest")
-            + F.interpolate(f5, size=f3.shape[-2:], mode="nearest")
-        )
+        # ── Single-scale feature projection (replaces FPN) ──
+        fused = self.neck(s4)
 
         # ── Shared features ──
         features = self.shared_features(fused)  # [B, 128]
