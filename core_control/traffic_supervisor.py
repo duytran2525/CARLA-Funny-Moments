@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import math
 from enum import Enum
@@ -65,12 +65,12 @@ class TrafficSupervisor:
         # Obstacle brake profile.
         self.config.setdefault("obstacle_linear_full_brake_distance_m", 6.0)
         self.config.setdefault("obstacle_linear_max_brake", 0.5)
-        self.config.setdefault("obstacle_linear_zero_brake_distance_m", 18.0)
+        self.config.setdefault("obstacle_linear_zero_brake_distance_m", 30.0)
 
         # Dynamic obstacle threshold model.
         self.obstacle_base_distance_m = 8.0
         self.obstacle_stop_min_distance_m = 5.5
-        self.obstacle_stop_max_distance_m = 18.0
+        self.obstacle_stop_max_distance_m = 30.0
         self.obstacle_reaction_time_s = 0.45
         self.obstacle_assumed_decel_mps2 = 5.5
         self.obstacle_stop_margin_m = 1.5
