@@ -72,8 +72,8 @@ class FrameData:
 
 @dataclass(frozen=True)
 class WindowBuildConfig:
-    history_frames: int = 20
-    future_frames: int = 30
+    history_frames: int = 40
+    future_frames: int = 60
     stride: int = 2
     adjacency_radius_m: float = 40.0
     require_complete_tracks: bool = True
@@ -83,8 +83,8 @@ class WindowBuildConfig:
     max_step_m: float = 6.0
     min_valid_ratio: float = 0.5
     adaptive_radius_enabled: bool = False
-    radius_base: float = 20.0
-    radius_alpha: float = 0.5
+    radius_base: float = 40.0
+    radius_alpha: float = 1.0
 
 
 def write_raw_header(csv_path: Path) -> None:
@@ -252,8 +252,8 @@ def _select_actor_ids(
 
 def compute_adaptive_radius(
     velocities: Any,
-    r_base: float = 20.0,
-    alpha: float = 0.5,
+    r_base: float = 40.0,
+    alpha: float = 1.0,
 ) -> Any:
     """Compute per-agent interaction radius based on velocity magnitude.
     
@@ -261,8 +261,8 @@ def compute_adaptive_radius(
     
     Args:
         velocities: Agent velocities in m/s with shape (num_agents, 2) containing (vx, vy)
-        r_base: Base radius in meters (default 20.0)
-        alpha: Velocity scaling factor (default 0.5)
+        r_base: Base radius in meters (default 40.0)
+        alpha: Velocity scaling factor (default 1.0)
     
     Returns:
         Per-agent radius in meters as numpy array with shape (num_agents,)
@@ -285,8 +285,8 @@ def compute_adaptive_radius(
 def build_adaptive_adjacency(
     positions: Any,
     velocities: Any,
-    r_base: float = 20.0,
-    alpha: float = 0.5,
+    r_base: float = 40.0,
+    alpha: float = 1.0,
 ) -> Any:
     """Build adjacency matrix with adaptive radius based on agent velocities.
     
@@ -300,8 +300,8 @@ def build_adaptive_adjacency(
         positions: Agent positions in global (world) coordinates with shape (num_agents, 2)
                   stored as float64 for precise distance computation
         velocities: Agent velocities in m/s with shape (num_agents, 2) containing (vx, vy)
-        r_base: Base radius in meters (default 20.0)
-        alpha: Velocity scaling factor (default 0.5)
+        r_base: Base radius in meters (default 40.0)
+        alpha: Velocity scaling factor (default 1.0)
     
     Returns:
         Symmetric adjacency matrix with shape (num_agents, num_agents) as float32

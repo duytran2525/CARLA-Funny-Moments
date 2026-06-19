@@ -37,8 +37,8 @@ def parse_args() -> argparse.Namespace:
         default="data/multi_agent/processed",
         help="Directory where sample_XXXXXX.pt and manifest.csv will be written.",
     )
-    parser.add_argument("--history-frames", type=int, default=20)
-    parser.add_argument("--future-frames", type=int, default=30)
+    parser.add_argument("--history-frames", type=int, default=40)
+    parser.add_argument("--future-frames", type=int, default=60)
     # BUG FIX #4: stride default changed from 2 → 1 to match ps1 and avoid
     # inconsistent sample counts when running directly vs via build_all_datasets.ps1.
     parser.add_argument("--stride", type=int, default=1, help="Sliding window stride in frames.")

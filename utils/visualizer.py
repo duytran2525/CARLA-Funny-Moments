@@ -475,7 +475,7 @@ class RouteMapVisualizer:
 		def project(pt: tuple[float, float]) -> tuple[int, int]:
 			x, y = pt
 			u = int(round(padding + offset_x + (x - min_x) * scale))
-			v = int(round(canvas_size - (padding + offset_y + (y - min_y) * scale)))
+			v = int(round(padding + offset_y + (y - min_y) * scale))
 			return (u, v)
 
 		return project

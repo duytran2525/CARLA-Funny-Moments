@@ -3,7 +3,7 @@ param(
     [string]$Config = "D:\AI\CARLA-Funny-Moments\configs\carla_env.yaml",
     [ValidateSet("cil", "cil_yolo")]
     [string]$Agent = "cil_yolo",
-    [string]$Model = "D:\AI\CARLA-Funny-Moments\models\waypoint_predictor (1).pth",
+    [string]$Model = "D:\AI\CARLA-Funny-Moments\models\waypoint_predictor_csv.pth",
     [string]$YoloModel = "D:\AI\CARLA-Funny-Moments\models\rtdetr-l.engine",
     [Nullable[double]]$TargetSpeedKmh = $null,
     [Nullable[double]]$MaxThrottle = $null,
@@ -12,8 +12,9 @@ param(
     [Nullable[double]]$Fps = $null,
     [string]$Device = "auto",
     [Nullable[int]]$YoloEveryNTicks = $null,
-    [string]$GTNetModel = "D:\AI\CARLA-Funny-Moments\models\gtnet_full_best_ade.pt",
+    [string]$GTNetModel = "D:\AI\CARLA-Funny-Moments\models\gtnet_full_best_ade(1).pt",
     [Nullable[int]]$GTNetEveryNTicks = $null,
+    [switch]$EnableGTNet,
     [switch]$DisableGTNet,
     [switch]$GTNetDrawDebug,
     [switch]$NoYoloVisualize,
@@ -29,6 +30,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($EnableGTNet -and $DisableGTNet) {
+    throw "Use only one of -EnableGTNet or -DisableGTNet."
+}
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
@@ -136,8 +141,14 @@ else {
 }
 Write-Host "YOLO  : $yoloModelPath"
 Write-Host "GTNet : $gtnetModelPath"
+if ($EnableGTNet) {
+    Write-Host "GTNet : FORCE-ENABLED via -EnableGTNet switch (overrides YAML)"
+}
 if ($DisableGTNet) {
     Write-Host "GTNet : FORCE-DISABLED via -DisableGTNet switch (overrides YAML)"
+}
+if (-not $EnableGTNet -and -not $DisableGTNet) {
+    Write-Host "GTNet : YAML controls enabled/disabled (use -EnableGTNet to load supervisor)"
 }
 Write-Host "Agent : $Agent"
 if ($null -ne $Fps) {
@@ -156,7 +167,10 @@ $runnerArgs = @(
 
 
 $runnerArgs += @("--gtnet-model-path", $gtnetModelPath)
-if ($DisableGTNet) {
+if ($EnableGTNet) {
+    $runnerArgs += "--enable-gtnet"
+}
+elseif ($DisableGTNet) {
     $runnerArgs += "--disable-gtnet"
 }
 

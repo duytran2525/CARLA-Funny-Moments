@@ -585,16 +585,16 @@ def main() -> int:
     targets_met  = minADE_met and minFDE_met and missRate_met and latency_met
 
     print(f"minADE:    {overall_metrics['minADE']:.4f} < {TARGET_MIN_ADE:.4f} m  "
-          f"{'✓ PASS' if minADE_met else '✗ FAIL'}")
+          f"{'[PASS]' if minADE_met else '[FAIL]'}")
     print(f"minFDE:    {overall_metrics['minFDE']:.4f} < {TARGET_MIN_FDE:.4f} m  "
-          f"{'✓ PASS' if minFDE_met else '✗ FAIL'}")
+          f"{'[PASS]' if minFDE_met else '[FAIL]'}")
     print(f"MissRate:  {overall_metrics['MissRate']:.4f} < {TARGET_MISS_RATE:.4f}     "
-          f"{'✓ PASS' if missRate_met else '✗ FAIL'}")
+          f"{'[PASS]' if missRate_met else '[FAIL]'}")
     print(f"Latency:   {primary_lat:.3f} < {TARGET_LATENCY_MS:.1f} ms/sample  "
-          f"{'✓ PASS' if latency_met else '✗ FAIL'}")
+          f"{'[PASS]' if latency_met else '[FAIL]'}")
     print("=" * 80)
-    print("\n✓ All target metrics achieved!" if targets_met
-          else "\n✗ Some target metrics not achieved")
+    print("\n[OK] All target metrics achieved!" if targets_met
+          else "\n[FAIL] Some target metrics not achieved")
 
     # Report -------------------------------------------------------------------
     # BUG FIX B2: all optional model_config fields use getattr

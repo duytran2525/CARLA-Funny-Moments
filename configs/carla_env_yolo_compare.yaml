@@ -47,7 +47,7 @@ cil:
   recovery_steer_offset: 0.3
   use_pure_pursuit: true
   # true = pure-pursuit follows CARLA route waypoints; false = follows model-predicted waypoints.
-  use_carla_waypoints: false
+  use_carla_waypoints: true
 
 yolo:
   # backend:

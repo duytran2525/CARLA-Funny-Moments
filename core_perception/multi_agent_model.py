@@ -1,29 +1,4 @@
-"""
-multi_agent_model.py  — GTNet v4
-═══════════════════════════════════════════════════════════════════════════════
-
-CẢI TIẾN so với v3:
-
-[V4-A] Adaptive Radius thực sự hoạt động
-    Implement _compute_adaptive_adj() trong forward() của MultiAgentTrajectoryPredictor.
-    Khi config.enable_adaptive_radius = True, ma trận adj gốc từ dataset
-    sẽ bị ghi đè bằng ma trận vật lý mới: bán kính tương tác mở rộng dựa
-    trên vận tốc của từng xe.
-
-[V4-B] Edge-aware GATLayer (RelativeEdgeEncoder)
-    GATLayer v4 nhận thêm edge_feat [B, N, N, edge_dim] từ RelativeEdgeEncoder.
-    Thêm thông tin không gian tương đối (dx, dy, distance) vào Attention.
-    Nếu config.gat_edge_dim = 0 → backward-compatible với v3 (mù không gian).
-
-CẢI TIẾN TỪ v3:
-[IMP-1] TemporalSelfAttention
-[IMP-2] MultimodalDecoder (shared GRU + mode embeddings)
-[IMP-3] Encoder dropout
-[IMP-4] Config backward-compatible (Strict=False loading)
-"""
-
 from __future__ import annotations
-
 import math
 from dataclasses import dataclass, fields
 from typing import Optional, Tuple
@@ -41,10 +16,10 @@ import torch.nn.functional as F
 class MultiAgentModelConfig:
     # ── Baseline ─────────────────────────────────────────────────────────────
     input_dim: int = 6
-    hidden_dim: int = 256
-    graph_layers: int = 3
-    future_steps: int = 30
-    dropout: float = 0.1
+    hidden_dim: int = 384
+    graph_layers: int = 4
+    future_steps: int = 60
+    dropout: float = 0.15
 
     # ── GAT ──────────────────────────────────────────────────────────────────
     enable_gat: bool = False
@@ -57,12 +32,12 @@ class MultiAgentModelConfig:
 
     # ── Multimodal ───────────────────────────────────────────────────────────
     enable_multimodal: bool = False
-    num_modes: int = 3
+    num_modes: int = 5
 
     # ── Adaptive radius ──────────────────────────────────────────────────────
     enable_adaptive_radius: bool = False
-    radius_base: float = 20.0
-    radius_alpha: float = 0.5
+    radius_base: float = 40.0
+    radius_alpha: float = 1.0
 
     # ── [IMP-1] Temporal self-attention ──────────────────────────────────────
     use_temporal_attention: bool = False   # Apply after GRU encoder
@@ -71,7 +46,7 @@ class MultiAgentModelConfig:
     mode_embed_dim: int = 64              # Shared GRU input: 2 + mode_embed_dim
 
     # ── [IMP-3] Encoder output dropout ───────────────────────────────────────
-    encoder_dropout: float = 0.0          # 0 = disabled (safe default)
+    encoder_dropout: float = 0.15          # 0 = disabled (safe default)
 
     def __post_init__(self) -> None:
         if self.num_attention_heads < 1:
@@ -99,15 +74,15 @@ class MultiAgentModelConfig:
         return cls(**filtered)
 
     @classmethod
-    def gat_config(cls, hidden_dim: int = 256) -> "MultiAgentModelConfig":
+    def gat_config(cls, hidden_dim: int = 384) -> "MultiAgentModelConfig":
         return cls(hidden_dim=hidden_dim, enable_gat=True)
 
     @classmethod
-    def multimodal_config(cls, hidden_dim: int = 256) -> "MultiAgentModelConfig":
+    def multimodal_config(cls, hidden_dim: int = 384) -> "MultiAgentModelConfig":
         return cls(hidden_dim=hidden_dim, enable_multimodal=True)
 
     @classmethod
-    def full_config(cls, hidden_dim: int = 256) -> "MultiAgentModelConfig":
+    def full_config(cls, hidden_dim: int = 384) -> "MultiAgentModelConfig":
         return cls(
             hidden_dim=hidden_dim,
             enable_gat=True,

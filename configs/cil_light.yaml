@@ -28,10 +28,14 @@ camera:
   width: 640
   height: 360
   fov: 90.0
-
 weather:
   random: false
   preset: "ClearNoon"
+
+traffic_lights:
+  red_time: 10.0
+  green_time: 15.0
+  yellow_time: 3.0
 
 cil:
   target_speed_kmh: 50

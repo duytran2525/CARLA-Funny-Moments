@@ -484,13 +484,13 @@ class MultiAgentModelConfigMultimodalTests(unittest.TestCase):
         """Default configuration should have multimodal disabled."""
         config = MultiAgentModelConfig()
         self.assertFalse(config.enable_multimodal)
-        self.assertEqual(config.num_modes, 3)
+        self.assertEqual(config.num_modes, 5)
 
     def test_multimodal_config_factory_enables_multimodal(self) -> None:
         """multimodal_config() factory method should enable multimodal."""
         config = MultiAgentModelConfig.multimodal_config()
         self.assertTrue(config.enable_multimodal)
-        self.assertEqual(config.num_modes, 3)
+        self.assertEqual(config.num_modes, 5)
 
     def test_validation_rejects_invalid_num_modes(self) -> None:
         """num_modes must be >= 1."""
@@ -1294,8 +1294,8 @@ class MultiAgentModelConfigAdaptiveRadiusTests(unittest.TestCase):
         config = MultiAgentModelConfig()
         
         self.assertFalse(config.enable_adaptive_radius)
-        self.assertEqual(config.radius_base, 20.0)
-        self.assertEqual(config.radius_alpha, 0.5)
+        self.assertEqual(config.radius_base, 40.0)
+        self.assertEqual(config.radius_alpha, 1.0)
 
     def test_adaptive_radius_config_with_custom_params(self) -> None:
         """Configuration should accept custom adaptive radius parameters."""
@@ -1410,9 +1410,9 @@ class MultiAgentModelConfigAdaptiveRadiusTests(unittest.TestCase):
         self.assertTrue(config.enable_adaptive_radius)
         # Verify default values for other parameters
         self.assertEqual(config.num_attention_heads, 4)
-        self.assertEqual(config.num_modes, 3)
-        self.assertEqual(config.radius_base, 20.0)
-        self.assertEqual(config.radius_alpha, 0.5)
+        self.assertEqual(config.num_modes, 5)
+        self.assertEqual(config.radius_base, 40.0)
+        self.assertEqual(config.radius_alpha, 1.0)
 
     def test_combined_all_improvements_config(self) -> None:
         """Configuration should support all improvements enabled with custom params."""

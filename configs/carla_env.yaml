@@ -7,19 +7,19 @@
   fixed_delta: 0.05
   no_rendering: false
 
-  map: "Town05"
+  map: "Town03"
 
 
 
 vehicle:
   filter: "vehicle.tesla.model3"
   spawn_point: 1
-  destination_point: 50
+  destination_point: 30 
   role_name: "hero"
 
 spectator:
   lock_on_spawn: true
-  keep_reapply_each_tick: false
+  keep_reapply_each_tick: true
   follow_distance: 9.0
   height: 4.5
   pitch: -18.0
@@ -32,6 +32,11 @@ camera:
 weather:
   random: false
   preset: "ClearNoon"
+
+traffic_lights:
+  red_time: 10.0
+  green_time: 15.0
+  yellow_time: 3.0
 
 cil:
   target_speed_kmh: 30
@@ -46,7 +51,7 @@ cil:
   recovery_duration_frames: 10
   recovery_steer_offset: 0.3
   use_pure_pursuit: true
-  use_carla_waypoints: false
+  use_carla_waypoints: true
   lane_constrain_blended: false      # true = Bật, false = Tắt (Mặc định là false nếu không ghi gì)
   lane_constrain_strength: 0.2        # Điều chỉnh từ 0.0 đến 1.0 (20% can thiệp)
 
@@ -82,7 +87,7 @@ gtnet:
   enabled: false
   # BUG FIX: gtnet_full_best.pt được train ở 20fps (dt=0.05) với history=40, future=60.
   # Phải dùng expected_dt=0.05 và history_frames=40 để khớp với training data.
-  model_path: "models/gtnet_full_best_ade.pt"
+  model_path: "models/gtnet_full_best_ade(1).pt"
   history_frames: 40
   expected_dt: 0.05
   # gtnet_full_best.pt được train với adaptive-radius dataset.
@@ -96,9 +101,9 @@ gtnet:
   draw_debug: false
 
 traffic_spawn:
-  vehicle_count: 30
-  bike_count: 20
-  motorbike_count: 20
+  vehicle_count: 20
+  bike_count: 10
+  motorbike_count: 10
   pedestrian_count: 10
   npc_enable_autopilot: true
 
@@ -119,7 +124,7 @@ runtime:
   # 1) YOLO: bật/tắt lúc start qua yolo.debug_window; khi chạy bấm 'y' (xem comment ở khối yolo:).
   # 2) Route map: cửa sổ "CIL Route Map", tách khỏi vẽ route trong world (cil_enable_route_map).
   #    Bật/tắt lúc start: cil_opencv_route_map. Khi chạy: phím 'r'.
-  cil_opencv_route_map: true
+  cil_opencv_route_map: false
   # Vẽ waypoint dự đoán trong world (debug CARLA). Tắt để bớt RPC debug → FPS ổn định hơn.
   cil_world_waypoint_debug: false
   cil_enable_telemetry_csv: false
