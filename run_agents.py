@@ -1728,6 +1728,7 @@ class LaneFollowAgent(BaseAgent):
         self._latest_rgb = None
         self._latest_depth_m = None
         self._frame_lock = threading.Lock()
+        self._frame_history = deque(maxlen=3)  # FIX: prevent AttributeError in callback
         self._last_steer = 0.0
         self._waiting_frame_logged = False
         self._collector: Optional[DataCollector] = None
@@ -2489,6 +2490,13 @@ class CILAgent(BaseAgent):
         else:
             self._pure_pursuit = None
 
+        # FIX: initialize eval_online metric accumulators
+        self._metric_total_frames: int = 0
+        self._metric_cnn_inference_count: int = 0
+        self._metric_cnn_latency_sum: float = 0.0
+        self._metric_min_ttc: float = float("inf")
+        self._metric_initial_route_distance: float = 0.0
+
     def setup(self, session: BaseSession) -> None:
         super().setup(session)
         self._route_overlay_bounds = None
@@ -2692,6 +2700,7 @@ class CILAgent(BaseAgent):
     def _annotate_cil_yolo_frame(
         self,
         frame_bgr: Any,
+        detections: list,
         debug_info: Dict[str, Any],
         sup_debug: Dict[str, Any],
         speed_kmh: float,
@@ -3293,11 +3302,29 @@ class CILAgent(BaseAgent):
         if reference_route or force:
             self._reference_route_plan = list(reference_route)
         if reference_route:
+            # FIX: diagnostic logging for route map navigation debugging
+            cmd_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+            junction_count = 0
+            for item in reference_route:
+                cmd = int(item.get("command", 0))
+                cmd_counts[cmd] = cmd_counts.get(cmd, 0) + 1
+                if bool(item.get("is_junction", False)):
+                    junction_count += 1
             logging.info(
-                "CIL cached fixed route plan with %d points from %s.",
+                "CIL cached fixed route plan with %d points from %s. "
+                "Commands: FOLLOW=%d LEFT=%d RIGHT=%d STRAIGHT=%d | Junctions=%d",
                 len(reference_route),
                 route_source,
+                cmd_counts[0], cmd_counts[1], cmd_counts[2], cmd_counts[3],
+                junction_count,
             )
+            if cmd_counts[1] == 0 and cmd_counts[2] == 0 and cmd_counts[3] == 0:
+                logging.warning(
+                    "⚠️ ROUTE MAP BUG: All commands are FOLLOW(0)! The route appears to be a straight "
+                    "line from S to D with no turns. Possible causes: (1) destination_point is too close "
+                    "or on the same road as spawn_point, (2) GlobalRoutePlanner could not find junctions. "
+                    "Try setting destination_point to a spawn index that requires turning."
+                )
         return int(len(self._reference_route_plan))
 
     def _maybe_replan_route(self, step_idx: int, vehicle) -> None:
@@ -4166,6 +4193,7 @@ class CILAgent(BaseAgent):
         rgb = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGB)
         with self._frame_lock:
             self._latest_rgb = rgb
+            self._frame_history.append(rgb)  # FIX: populate temporal buffer
 
     def _read_latest_frame(self):
         with self._frame_lock:
@@ -4962,6 +4990,9 @@ class CILAgent(BaseAgent):
         if vehicle is None:
             return
 
+        # FIX: increment eval_online metric counter
+        self._metric_total_frames += 1
+
         speed_kmh = self._current_speed_kmh()
         self._last_speed_kmh = speed_kmh
         hud_fps = self._update_hud_fps()
@@ -4973,6 +5004,9 @@ class CILAgent(BaseAgent):
             return
 
         destination_distance_m = self._distance_to_destination(vehicle.get_location())
+        # FIX: capture initial route distance for eval_online metrics
+        if self._metric_initial_route_distance <= 0.0 and destination_distance_m is not None:
+            self._metric_initial_route_distance = float(destination_distance_m)
         if destination_distance_m is not None and destination_distance_m <= self._arrival_distance_m:
             self._request_stop_at_destination("distance_threshold", destination_distance_m)
             return
@@ -5047,7 +5081,10 @@ class CILAgent(BaseAgent):
 
         model_t0 = time.perf_counter()
         frame_triplet = self._read_latest_triplet() or [frame, frame, frame]
+        _cnn_t0 = time.perf_counter()
         model_waypoints, mean_uncertainty = self._predict_cil_waypoints(frame_triplet, speed_kmh, command)
+        self._metric_cnn_latency_sum += time.perf_counter() - _cnn_t0
+        self._metric_cnn_inference_count += 1
         stage_times["model"] = time.perf_counter() - model_t0
 
         control_t0 = time.perf_counter()
