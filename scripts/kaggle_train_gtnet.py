@@ -69,11 +69,11 @@ try:
 except Exception:
     pass
 
-# â”€â”€ AMP compatibility â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
 try:
-    # pyrefly: ignore [missing-import]
+
     from torch.amp import GradScaler as _GradScaler
-    # pyrefly: ignore [missing-import]
+
     from torch.amp import autocast as _autocast
 
     def _make_scaler(enabled: bool) -> _GradScaler:
@@ -83,17 +83,17 @@ try:
         return _autocast("cuda", enabled=enabled)
 
 except (ImportError, TypeError):
-    from torch.cuda.amp import GradScaler as _LegacyScaler       # type: ignore
-    from torch.cuda.amp import autocast as _LegacyAutocast        # type: ignore
+    from torch.cuda.amp import GradScaler as _LegacyScaler
+    from torch.cuda.amp import autocast as _LegacyAutocast
 
-    def _make_scaler(enabled: bool) -> _LegacyScaler:             # type: ignore
+    def _make_scaler(enabled: bool) -> _LegacyScaler:
         return _LegacyScaler(enabled=enabled, init_scale=2.0 ** 12)
 
-    def _make_autocast(enabled: bool) -> _LegacyAutocast:         # type: ignore
+    def _make_autocast(enabled: bool) -> _LegacyAutocast:
         return _LegacyAutocast(enabled=enabled)
 
 
-# â”€â”€ sys.path setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -124,12 +124,12 @@ for _root in _candidate_project_roots():
     if root_text not in sys.path:
         sys.path.insert(0, root_text)
 
-from core_perception.multi_agent_dataset import (  # noqa: E402
+from core_perception.multi_agent_dataset import (
     MultiAgentTrajectoryDataset,
     collate_multi_agent_trajectory,
     split_sample_paths,
 )
-from core_perception.multi_agent_model import (  # noqa: E402
+from core_perception.multi_agent_model import (
     MultiAgentModelConfig,
     MultiAgentTrajectoryPredictor,
     masked_ade_fde,
@@ -137,9 +137,9 @@ from core_perception.multi_agent_model import (  # noqa: E402
 )
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# Multimodal-aware loss & metrics (unchanged from v2)
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+
+
 
 def _compute_loss(
     pred: torch.Tensor,
@@ -165,7 +165,7 @@ def _compute_loss(
     if pred.dim() == 4:
         return masked_smooth_l1_loss(pred, target, y_mask, agent_mask), 0.0
 
-    # â”€â”€ Multimodal WTA â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
     B, A, K, T, C = pred.shape
     target_exp = target.unsqueeze(2).expand(B, A, K, T, C)
 
@@ -252,9 +252,9 @@ def _compute_metrics(
     return (min_ade * mask).sum() / n_valid, (min_fde * mask).sum() / n_valid, miss
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# [IMP-B] Mode diversity loss
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+
+
 
 def _diversity_loss(
     pred: torch.Tensor,
@@ -287,18 +287,18 @@ def _diversity_loss(
     if K <= 1:
         return pred.new_tensor(0.0)
 
-    valid = (agent_mask & y_mask.any(dim=-1)).float()  # [B, A]
+    valid = (agent_mask & y_mask.any(dim=-1)).float()
     n_valid = valid.sum().clamp_min(1.0)
 
-    # [FIX-3] Use last *valid* timestep per agent (not always index -1).
-    # y_mask: [B, A, T] â€” True = valid future step.
-    # For agents with all-False mask, last_idx falls back to T-1 (harmless,
-    # they are excluded from the loss via the valid weight).
-    valid_counts = y_mask.long().sum(dim=-1).clamp_min(1)   # [B, A]
-    last_idx = (valid_counts - 1)                            # [B, A]
-    # Expand to [B, A, K, 1, 2] for gather on pred [B, A, K, T, 2]
+
+
+
+
+    valid_counts = y_mask.long().sum(dim=-1).clamp_min(1)
+    last_idx = (valid_counts - 1)
+
     last_idx_exp = last_idx.view(B, A, 1, 1, 1).expand(B, A, K, 1, C)
-    endpoints = pred.gather(3, last_idx_exp).squeeze(3)      # [B, A, K, 2]
+    endpoints = pred.gather(3, last_idx_exp).squeeze(3)
 
     total = pred.new_tensor(0.0)
     n_pairs = 0
@@ -306,7 +306,7 @@ def _diversity_loss(
         for j in range(i + 1, K):
             dist = torch.norm(
                 endpoints[:, :, i] - endpoints[:, :, j], dim=-1
-            )  # [B, A]
+            )
             repulsion = F.relu(margin - dist)
             total = total + (repulsion * valid).sum() / n_valid
             n_pairs += 1
@@ -314,9 +314,9 @@ def _diversity_loss(
     return total / max(1, n_pairs)
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# [IMP-C] Data augmentation
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+
+
 
 def _augment_batch(
     batch: Dict,
@@ -351,20 +351,20 @@ def _augment_batch(
     Returns:
         Augmented batch dict (shallow copy, tensors cloned as needed)
     """
-    batch = dict(batch)  # shallow copy so we can replace keys
+    batch = dict(batch)
     B = batch["x"].shape[0]
     device = batch["x"].device
 
-    # â”€â”€ Random rotation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
     if rot_std_deg > 0.0:
         angles = torch.randn(B, device=device) * math.radians(rot_std_deg)
-        cos_a = angles.cos()  # [B]
+        cos_a = angles.cos()
         sin_a = angles.sin()
 
         def _rot2d(t: torch.Tensor, ch: int) -> torch.Tensor:
             """Rotate 2D channels (ch, ch+1) of tensor t. Returns clone."""
             t = t.clone()
-            shape = (-1,) + (1,) * (t.dim() - 2)  # broadcast to leading dims
+            shape = (-1,) + (1,) * (t.dim() - 2)
             c = cos_a.view(shape)
             s = sin_a.view(shape)
             x_ch = t[..., ch].clone()
@@ -375,33 +375,33 @@ def _augment_batch(
 
         feat_dim = batch["x"].shape[-1]
         x = batch["x"].clone()
-        x = _rot2d(x, 0)           # channels 0-1: local position (always present)
+        x = _rot2d(x, 0)
         if feat_dim >= 4:
-            # channels 2-3: local velocity (vx, vy) in new 6-ch format, OR
-            # heading unit vector (hx, hy) in legacy 4-ch format.
-            # Both are 2D vectors in ego-frame â†’ rotation applies identically.
+
+
+
             x = _rot2d(x, 2)
         if feat_dim >= 6:
-            x = _rot2d(x, 4)       # channels 4-5: heading unit vector (new 6-ch format)
+            x = _rot2d(x, 4)
         batch["x"] = x
 
-        # Rotate targets (always 2D position)
+
         batch["y"] = _rot2d(batch["y"].clone(), 0)
 
-    # â”€â”€ History frame dropout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
     if hist_dropout > 0.0 and batch["x_mask"].shape[-1] > 1:
         x_mask = batch["x_mask"].clone()
-        # Bernoulli dropout on currently-valid frames, but NEVER drop t=-1
+
         drop = (torch.rand_like(x_mask.float()) < hist_dropout) & x_mask
-        drop[..., -1] = False       # protect anchor frame
+        drop[..., -1] = False
         batch["x_mask"] = x_mask & ~drop
 
     return batch
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# [IMP-A] Warmup + Cosine scheduler
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+
+
 
 class WarmupCosineScheduler:
     """
@@ -445,7 +445,7 @@ class WarmupCosineScheduler:
         self.total_epochs       = total_epochs
         self.min_lr_ratio       = min_lr_ratio
         self.group_start_epochs = group_start_epochs or {}
-        # Snapshot initial LRs for each group at construction time.
+
         self.base_lrs = [float(pg["lr"]) for pg in optimizer.param_groups]
         self._epoch   = 0
 
@@ -462,17 +462,17 @@ class WarmupCosineScheduler:
             start_ep   = self._group_start(pg)
 
             if e <= start_ep:
-                # Group not yet active â€” keep LR at 0 (params are frozen anyway,
-                # but setting it makes logs correct after unfreeze).
+
+
                 pg["lr"] = 0.0
                 continue
 
-            # Local epoch relative to this group's start
+
             local_e = e - start_ep
             if self.warmup_epochs > 0 and local_e <= self.warmup_epochs:
                 lr = base_lr * local_e / self.warmup_epochs
             else:
-                # Cosine decays from start_ep to total_epochs
+
                 cos_e   = local_e - self.warmup_epochs
                 cos_max = max(1, self.total_epochs - start_ep - self.warmup_epochs)
                 progress = cos_e / cos_max
@@ -485,9 +485,9 @@ class WarmupCosineScheduler:
         return [float(pg["lr"]) for pg in self.optimizer.param_groups]
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# Ablation variant definitions
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+
+
 
 class AblationVariant(NamedTuple):
     name: str
@@ -518,9 +518,9 @@ ABLATION_VARIANTS: List[AblationVariant] = [
 ]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CLI
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -532,7 +532,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["baseline", "full", "ablation", "per-town"],
                    default="full")
 
-    # â”€â”€ Hyper-params â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
     p.add_argument("--epochs",              type=int,   default=50)
     p.add_argument("--batch-size",          type=int,   default=64)
     p.add_argument("--accum-steps",         type=int,   default=1)
@@ -542,25 +542,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed",                type=int,   default=42)
     p.add_argument("--num-workers",         type=int,   default=2)
 
-    # â”€â”€ Model architecture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
     p.add_argument("--hidden-dim",           type=int,   default=384)
     p.add_argument("--graph-layers",         type=int,   default=4)
     p.add_argument("--dropout",              type=float, default=0.15)
     p.add_argument("--num-modes",            type=int,   default=5)
     p.add_argument("--num-attention-heads",  type=int,   default=4)
-    # [IMP-F] New architecture flags
+
     p.add_argument("--use-temporal-attention", action="store_true",
                    help="[IMP-1] Apply self-attention over GRU history sequence.")
     p.add_argument("--mode-embed-dim",  type=int,   default=64,
                    help="[IMP-2] Mode embedding dim in shared-GRU decoder.")
     p.add_argument("--encoder-dropout", type=float, default=0.15,
                    help="[IMP-3] Dropout on GRU encoder output. Reduces train/val gap.")
-    # [V4-B] GAT edge feature dimension
+
     p.add_argument("--gat-edge-dim", type=int, default=32,
                    help="[V4-B] GAT edge feature dimension (0 = disable). "
                         "Enables RelativeEdgeEncoder for spatial awareness.")
 
-    # â”€â”€ Feature flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
     p.add_argument("--enable-gat",             action="store_true")
     p.add_argument("--enable-multimodal",      action="store_true")
     p.add_argument("--enable-adaptive-radius", action="store_true")
@@ -569,21 +569,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--radius-alpha",           type=float, default=1.0,
                    help="[V4-A] Velocity scaling factor for adaptive radius (default: 1.0).")
 
-    # â”€â”€ Training config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
     p.add_argument("--grad-clip",                type=float, default=1.0)
     p.add_argument("--early-stopping-patience",  type=int,   default=10)
     p.add_argument("--lr-patience",              type=int,   default=4)
     p.add_argument("--cosine-lr",                action="store_true",
                    help="Use WarmupCosineScheduler instead of ReduceLROnPlateau.")
-    # [IMP-A]
+
     p.add_argument("--warmup-epochs",  type=int,   default=5,
                    help="[IMP-A] Linear LR warmup epochs (0 = no warmup). "
                         "Only effective when --cosine-lr is set.")
-    # [IMP-D]
+
     p.add_argument("--early-stop-metric", choices=["loss", "ade"], default="ade",
                    help="[IMP-D] Metric to monitor for early stopping and "
                         "best-checkpoint selection.")
-    # [IMP-B]
+
     p.add_argument("--diversity-weight", type=float, default=0.08,
                    help="[IMP-B] Weight for mode diversity loss (0 = disabled). "
                         "Recommended: 0.05â€“0.1 when --enable-multimodal + K>=3.")
@@ -592,7 +592,7 @@ def parse_args() -> argparse.Namespace:
                         "many epochs. Prevents diversity loss from destabilising "
                         "WTA training in early epochs. 0 = no ramp (full weight "
                         "from epoch 1).")
-    # [IMP-C]
+
     p.add_argument("--augment",          action="store_true",
                    help="[IMP-C] Enable online data augmentation (rotation + "
                         "history dropout).")
@@ -603,9 +603,9 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--log-every",   type=int,   default=50)
     p.add_argument("--no-amp",      action="store_true")
-    # GAT stability
-    # [FIX-1] gat_lr_scale 0.1â†’0.5 so GAT actually moves during 30-epoch runs.
-    # [FIX-1] gat_clip_scale 0.5â†’1.0 so the backbone is no longer clipped at 0.4.
+
+
+
     p.add_argument("--gat-lr-scale",   type=float, default=0.5,
                    help="GAT param-group LR = base_lr Ă— gat_lr_scale.")
     p.add_argument("--gat-clip-scale", type=float, default=1.0,
@@ -613,13 +613,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gat-per-group-clip", action="store_true",
                    help="[FIX-1] Clip backbone and GAT params separately "
                         "(backbone=grad_clip, GAT=grad_clipĂ—0.5 post-unfreeze).")
-    # [FIX-2] Freeze GAT for first N epochs so backbone stabilises first.
+
     p.add_argument("--gat-freeze-epochs", type=int, default=5,
                    help="[FIX-2] Freeze GAT graph_blocks for this many epochs "
                         "before unfreezing with its own LR warmup. 0 = disabled.")
     p.add_argument("--nan-patience",   type=int,   default=3)
     p.add_argument("--debug-gat",      action="store_true")
-    # Misc
+
     p.add_argument("--limit-samples",  type=int,  default=0)
     p.add_argument("--town-filter",    type=str,  default="")
     p.add_argument("--quick-ablation", action="store_true")
@@ -628,9 +628,9 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# Helpers
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -642,7 +642,7 @@ def set_seed(seed: int) -> None:
 def _to_float(v: object) -> float:
     if isinstance(v, torch.Tensor):
         return float(v.detach().cpu().item())
-    return float(v)  # type: ignore[arg-type]
+    return float(v)
 
 
 def make_target_metrics(
@@ -705,9 +705,9 @@ def _print_separator(title: str = "", width: int = 72) -> None:
         print("─" * width)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Dataset helpers
-# ═══════════════════════════════════════════════════════════════════════════════
+
+
+
 
 def load_all_sample_paths(data_dirs: List[Path], limit: int = 0) -> List[Path]:
     all_paths: List[Path] = []
@@ -774,9 +774,9 @@ def build_loaders(
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Model factory
-# ═══════════════════════════════════════════════════════════════════════════════
+
+
+
 
 def build_model(
     input_dim: int,
@@ -802,7 +802,7 @@ def build_model(
         num_modes=args.num_modes,
         num_attention_heads=args.num_attention_heads,
     )
-    # [IMP-F] Forward new architecture params if the model supports them
+
     new_kwargs = {}
     if hasattr(MultiAgentModelConfig, "use_temporal_attention"):
         new_kwargs["use_temporal_attention"] = getattr(
@@ -812,10 +812,10 @@ def build_model(
         new_kwargs["mode_embed_dim"] = getattr(args, "mode_embed_dim", 64)
     if hasattr(MultiAgentModelConfig, "encoder_dropout"):
         new_kwargs["encoder_dropout"] = getattr(args, "encoder_dropout", 0.0)
-    # [V4-B] Forward GAT edge dimension
+
     if hasattr(MultiAgentModelConfig, "gat_edge_dim"):
         new_kwargs["gat_edge_dim"] = getattr(args, "gat_edge_dim", 32)
-    # [V4-A] Forward adaptive radius hyperparameters
+
     if hasattr(MultiAgentModelConfig, "radius_base"):
         new_kwargs["radius_base"] = getattr(args, "radius_base", 40.0)
     if hasattr(MultiAgentModelConfig, "radius_alpha"):
@@ -895,9 +895,9 @@ def _clip_gradients(
             nn.utils.clip_grad_norm_(params, clip)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Inference latency measurement
-# ═══════════════════════════════════════════════════════════════════════════════
+
+
+
 
 def measure_inference_latency(
     model: nn.Module,
@@ -923,7 +923,7 @@ def measure_inference_latency(
             batch = move_batch(raw_batch, device)
             actual_batch_size = batch["x"].shape[0]
 
-            # Warm-up (first batch only)
+
             if device.type == "cuda" and batch_idx == 0:
                 for _ in range(5):
                     _ = model(
@@ -949,9 +949,9 @@ def measure_inference_latency(
     return sum(latencies) / len(latencies) if latencies else 0.0
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Training epoch
-# ═══════════════════════════════════════════════════════════════════════════════
+
+
+
 
 def run_epoch(
     model: nn.Module,
@@ -964,13 +964,13 @@ def run_epoch(
     log_every: int = 0,
     use_amp: bool = True,
     debug_gat: bool = False,
-    per_group_clip: bool = False,       # [FIX-1] per-group gradient clipping
-    # [IMP-B, IMP-C]
+    per_group_clip: bool = False,
+
     diversity_weight: float = 0.0,
     augment: bool = False,
     aug_rot_std: float = 10.0,
     aug_hist_dropout: float = 0.1,
-    # [IMP-D] Progressive diversity weight annealing
+
     current_epoch: int = 0,
     total_epochs: int = 1,
     diversity_ramp_epochs: int = 20,
@@ -987,8 +987,8 @@ def run_epoch(
     training = optimizer is not None
     model.train(training)
 
-    # [IMP-D] Anneal diversity weight: ramp from 0 → target over ramp_epochs
-    # so early epochs focus on WTA loss before mode separation is enforced.
+
+
     if training and diversity_weight > 0.0 and diversity_ramp_epochs > 0:
         ramp_frac = min(1.0, float(max(1, current_epoch)) / float(diversity_ramp_epochs))
         effective_div_weight = diversity_weight * ramp_frac
@@ -997,10 +997,10 @@ def run_epoch(
 
     total_loss = total_ade = total_fde = total_div_loss = total_miss = 0.0
     n_valid = nan_batches = nonfinite_preds = 0
-    # [BUG-6 FIX] Track accumulation position explicitly so a NaN batch in the
-    # middle of an accumulation window doesn't silently mix a reset gradient with
-    # gradients from the previous (valid) mini-batches in the same window.
-    accum_pos = 0  # counts valid backward steps in the current window
+
+
+
+    accum_pos = 0
 
     if training:
         optimizer.zero_grad(set_to_none=True)
@@ -1008,7 +1008,7 @@ def run_epoch(
     for idx, raw_batch in enumerate(loader, start=1):
         batch = move_batch(raw_batch, device)
 
-        # [IMP-C] Augmentation (training only)
+
         if training and augment:
             batch = _augment_batch(batch, aug_rot_std, aug_hist_dropout)
 
@@ -1021,7 +1021,7 @@ def run_epoch(
                 agent_mask=batch["agent_mask"],
             )
 
-            # NaN safety
+
             pred_finite = torch.isfinite(pred)
             if not bool(pred_finite.all().detach().cpu().item()):
                 nonfinite_preds += 1
@@ -1036,7 +1036,7 @@ def run_epoch(
 
             pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
 
-            # [IMP-B] Pass effective (ramped) diversity_weight into loss
+
             loss, div_loss_val = _compute_loss(
                 pred=pred,
                 target=batch["y"],
@@ -1055,16 +1055,16 @@ def run_epoch(
                     f"    [WARN] step={idx}/{len(loader)}: "
                     f"loss={loss_val} — skipping, resetting scaler"
                 )
-            # [BUG-6 FIX] Reset the entire accumulation window: discard any
-            # gradients accumulated from valid batches earlier in this window,
-            # then reset the position counter so the next batch starts fresh.
-            # This is safer than letting a partial window reach optimizer.step().
+
+
+
+
             optimizer.zero_grad(set_to_none=True)
             accum_pos = 0
-            # [SCALER FIX] Do NOT touch scaler._scale (private API). The
-            # GradScaler will reduce its scale automatically via scaler.update()
-            # the next time scaler.step() encounters inf/NaN gradients. No
-            # manual intervention needed here; just skip this batch cleanly.
+
+
+
+
             continue
 
         if training:
@@ -1074,9 +1074,9 @@ def run_epoch(
                 loss_scaled.backward()
 
             accum_pos += 1
-            # [BUG-6 FIX] Step only when the accumulation window is full (based
-            # on valid-batch count, not raw batch index). This ensures NaN-skipped
-            # batches don't shift the optimizer step off-boundary.
+
+
+
             if accum_pos >= accum_steps:
                 accum_pos = 0
                 if scaler is not None:
@@ -1155,9 +1155,9 @@ def run_epoch(
     return avg_loss, avg_ade, avg_fde, avg_div_loss, avg_miss
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Single training run
-# ═══════════════════════════════════════════════════════════════════════════════
+
+
+
 
 def train_single(
     *,
@@ -1197,23 +1197,23 @@ def train_single(
     is_gat  = variant.enable_gat if variant else args.enable_gat
     base_lr = args.learning_rate
     gat_lr  = base_lr * (args.gat_lr_scale if is_gat else 1.0)
-    # [FIX-1] eff_clip = grad_clip always (gat_clip_scale removed from global clip).
-    # Per-group clip is handled inside _clip_gradients when --gat-per-group-clip.
+
+
     eff_clip     = args.grad_clip
     per_grp_clip = getattr(args, "gat_per_group_clip", False) and is_gat
 
-    # [CRITICAL FIX] Build optimizer BEFORE freezing so GAT params are
-    # registered in AdamW's state. If we froze first, build_optimizer would
-    # skip requires_grad=False params → GAT never gets Adam moments → never
-    # updated after unfreeze. Frozen params with grad=None are safely skipped
-    # by AdamW internally, so having them in the group is harmless.
+
+
+
+
+
     optimizer = build_optimizer(
         model, base_lr=base_lr, gat_lr=gat_lr,
         weight_decay=args.weight_decay, is_gat_variant=is_gat,
     )
 
-    # [FIX-2] Freeze GAT graph_blocks for the first gat_freeze_epochs epochs.
-    # Must happen AFTER build_optimizer (see above).
+
+
     freeze_epochs = int(getattr(args, "gat_freeze_epochs", 0)) if is_gat else 0
     gat_frozen    = freeze_epochs > 0
 
@@ -1237,12 +1237,12 @@ def train_single(
             f"({args.gat_lr_scale:g}×) | clip={clip_desc}"
         )
 
-    # [FIX-3] Build scheduler with GAT group_start_epochs so the GAT group's
-    # cosine budget is measured from unfreeze_epoch, not from epoch 0.
+
+
     warmup_ep = getattr(args, "warmup_epochs", 0)
     if args.cosine_lr:
-        # GAT group starts its warmup AFTER freeze phase ends.
-        gat_start  = freeze_epochs  # epoch at which GAT unfreezes
+
+        gat_start  = freeze_epochs
         group_starts: Optional[Dict[str, int]] = (
             {"gat": gat_start} if (is_gat and gat_start > 0) else None
         )
@@ -1250,7 +1250,7 @@ def train_single(
             optimizer,
             warmup_epochs=warmup_ep,
             total_epochs=epochs,
-            min_lr_ratio=0.001,  # [IMP-F] 0.01→0.001: exploit cosine tail better
+            min_lr_ratio=0.001,
             group_start_epochs=group_starts,
         )
         sched_mode = f"warmup({warmup_ep})+cosine"
@@ -1265,7 +1265,7 @@ def train_single(
     use_amp = not args.no_amp and device.type == "cuda"
     scaler  = _make_scaler(enabled=use_amp)
 
-    # [IMP-D] Early-stop metric choice
+
     stop_metric = getattr(args, "early_stop_metric", "ade")
     print(
         f"  AMP={'ON' if use_amp else 'OFF'} | GPUs={n_gpus} | "
@@ -1277,16 +1277,16 @@ def train_single(
         f"augment={getattr(args, 'augment', False)}"
     )
 
-    best_metric  = math.inf  # tracks the monitored metric
+    best_metric  = math.inf
     stale        = 0
     nan_epochs   = 0
-    best_path    = out_dir / f"{run_tag}_best.pt"       # best by monitored metric
-    best_ade_path = out_dir / f"{run_tag}_best_ade.pt"  # always track best ADE
+    best_path    = out_dir / f"{run_tag}_best.pt"
+    best_ade_path = out_dir / f"{run_tag}_best_ade.pt"
     last_path    = out_dir / f"{run_tag}_last.pt"
     history: List[dict] = []
 
-    best_ade_metric = math.inf  # independent ADE tracker
-    best_ade_record: dict = {}  # epoch record at best ADE
+    best_ade_metric = math.inf
+    best_ade_record: dict = {}
 
     start_epoch = 1
     resume_path = getattr(args, "resume", "")
@@ -1303,43 +1303,43 @@ def train_single(
             if ckpt_resume is not None:
                 raw_model = model.module if hasattr(model, "module") else model
                 raw_model.load_state_dict(ckpt_resume["model_state_dict"])
-                
+
                 if "optimizer_state_dict" in ckpt_resume:
                     try:
                         optimizer.load_state_dict(ckpt_resume["optimizer_state_dict"])
                         print("  [Resume] Loaded optimizer state.")
                     except Exception as e:
                         print(f"  [Resume] [WARN] Failed to load optimizer state: {e}")
-                
+
                 if "scheduler_state_dict" in ckpt_resume and not args.cosine_lr:
                     try:
                         scheduler.load_state_dict(ckpt_resume["scheduler_state_dict"])
                         print("  [Resume] Loaded scheduler state.")
                     except Exception as e:
                         print(f"  [Resume] [WARN] Failed to load scheduler state: {e}")
-                
+
                 if "scaler_state_dict" in ckpt_resume and scaler is not None:
                     try:
                         scaler.load_state_dict(ckpt_resume["scaler_state_dict"])
                         print("  [Resume] Loaded scaler state.")
                     except Exception as e:
                         print(f"  [Resume] [WARN] Failed to load scaler state: {e}")
-                
+
                 best_metric = ckpt_resume.get("best_metric", ckpt_resume.get("val_loss", math.inf))
                 best_ade_metric = ckpt_resume.get("best_ade_metric", ckpt_resume.get("val_ade", math.inf))
                 stale = ckpt_resume.get("stale", 0)
                 history = ckpt_resume.get("history", [])
                 start_epoch = ckpt_resume.get("epoch", 0) + 1
-                
+
                 if args.cosine_lr and scheduler is not None:
                     scheduler._epoch = start_epoch - 1
                     print(f"  [Resume] Fast-forwarded WarmupCosineScheduler to epoch {start_epoch - 1}.")
-                
+
                 if is_gat and start_epoch > freeze_epochs:
                     gat_frozen = False
                     _set_gat_frozen(False)
                     print(f"  [Resume] Post-freeze phase detected (epoch {start_epoch} > {freeze_epochs}). GAT unfrozen.")
-                
+
                 print(f"  [Resume] Resuming from epoch {start_epoch} (best_metric={best_metric:.4f}, best_ade_metric={best_ade_metric:.4f})")
         else:
             print(f"  [Resume] [WARN] Checkpoint path '{resume_p}' does not exist. Starting from scratch.")
@@ -1347,20 +1347,20 @@ def train_single(
     for epoch in range(start_epoch, epochs + 1):
         t0 = time.time()
 
-        # [FIX-2/4] Unfreeze GAT at the designated epoch and reset early-stop.
+
         if gat_frozen and epoch > freeze_epochs:
             gat_frozen = False
             _set_gat_frozen(False)
-            # Reset early-stop so the post-unfreeze phase gets a full budget.
+
             stale = 0
-            # [FIX-5] Reset best_metric so the frozen-phase checkpoint (with
-            # random GAT weights) doesn't block saving the real best after unfreeze.
+
+
             best_metric = math.inf
-            # [BUG-4 FIX] Also reset best_ade_metric and best_ade_record so the
-            # independent ADE tracker doesn't keep a frozen-phase checkpoint
-            # (which has untrained GAT) as the "best ADE" model after unfreeze.
-            # Before wiping, archive the frozen-best checkpoint under a distinct
-            # name so it remains retrievable for comparison.
+
+
+
+
+
             if best_ade_record:
                 frozen_best_path = out_dir / f"{run_tag}_frozen_best_ade.pt"
                 if best_ade_path.exists():
@@ -1391,7 +1391,7 @@ def train_single(
             augment=getattr(args, "augment", False),
             aug_rot_std=getattr(args, "aug_rot_std", 10.0),
             aug_hist_dropout=getattr(args, "aug_hist_dropout", 0.1),
-            # [IMP-D] Pass epoch info so diversity weight ramps gradually
+
             current_epoch=epoch,
             total_epochs=epochs,
             diversity_ramp_epochs=getattr(args, "diversity_ramp_epochs", 20),
@@ -1400,7 +1400,7 @@ def train_single(
             model, val_loader, device, use_amp=use_amp
         )
 
-        # Scheduler step
+
         if args.cosine_lr:
             scheduler.step()
         else:
@@ -1424,7 +1424,7 @@ def train_single(
         )
         history.append(record)
 
-        # NaN early stop
+
         if math.isnan(tr_loss) or math.isnan(val_loss):
             nan_epochs += 1
         else:
@@ -1436,14 +1436,14 @@ def train_single(
             )
             break
 
-        # [IMP-D] Determine the metric we're optimizing
+
         if stop_metric == "ade":
             current = val_ade
         else:
             current = val_loss
         improved = (not math.isnan(current)) and current < best_metric
 
-        # [IMP-I] Log diversity loss when active
+
         div_info = (
             f" div={tr_div:.4f}" if tr_div > 0.0 else ""
         )
@@ -1489,7 +1489,7 @@ def train_single(
                 )
                 break
 
-        # [IMP-E] Always track best ADE independently (saved separately)
+
         if not math.isnan(val_ade) and val_ade < best_ade_metric:
             best_ade_metric = val_ade
             best_ade_record = record.copy()
@@ -1499,12 +1499,12 @@ def train_single(
         json.dumps(history, indent=2), encoding="utf-8"
     )
 
-    # [IMP-E] Report best ADE/FDE from the SAME epoch as best_ade checkpoint
+
     best_ade_ep = best_ade_record.get("val_ade", float("nan"))
     best_fde_ep = best_ade_record.get("val_fde", float("nan"))
     best_miss_ep = best_ade_record.get("val_miss", float("nan"))
 
-    # Measure inference latency on the best checkpoint
+
     inference_latency_ms = 0.0
     try:
         raw_model = model.module if hasattr(model, "module") else model
@@ -1552,9 +1552,9 @@ def train_single(
     return results
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# Ablation runner
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+
+
 
 def run_ablation(
     *,
@@ -1589,9 +1589,9 @@ def run_ablation(
     for i, variant in enumerate(ABLATION_VARIANTS, start=1):
         _print_separator(f"Variant {i}/8 â€” {variant.name} [{variant.code}]")
         variant_dir = out_dir / f"ablation_{variant.code}_{variant.name}"
-        # [FIX] Reset RNG so every variant gets the same random model init.
-        # Without this, the 8 variants receive progressively different weight
-        # initialisations, making ADE comparisons unfair.
+
+
+
         set_seed(args.seed)
         try:
             result = train_single(
@@ -1658,9 +1658,9 @@ def run_ablation(
     print(f"\n  [OK] Summary: {summary_path}")
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# Per-town runner
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+
+
 
 TOWNS = ["Town01", "Town02", "Town03", "Town04", "Town05", "Town06", "Town07"]
 
@@ -1700,7 +1700,7 @@ def run_per_town(
             future_steps=int(first["y"].shape[1]),
             data_dirs=data_dirs, device=device, args=args,
             epochs=args.epochs,
-            variant=ABLATION_VARIANTS[-1],  # GTNet_Full
+            variant=ABLATION_VARIANTS[-1],
             run_tag=town,
         )
         result["town"] = town
@@ -1722,9 +1722,9 @@ def run_per_town(
     print(f"\n  [OK] Summary: {summary_path}")
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# main
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+
+
 
 def main() -> int:
     args = parse_args()
@@ -1794,7 +1794,7 @@ def main() -> int:
 
     variant: Optional[AblationVariant] = None
     if args.mode == "full":
-        variant = ABLATION_VARIANTS[-1]  # GTNet_Full (111)
+        variant = ABLATION_VARIANTS[-1]
 
     run_tag = f"gtnet_{args.mode}"
     result  = train_single(

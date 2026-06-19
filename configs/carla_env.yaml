@@ -52,52 +52,28 @@ cil:
   recovery_steer_offset: 0.3
   use_pure_pursuit: true
   use_carla_waypoints: true
-  lane_constrain_blended: false      # true = Bật, false = Tắt (Mặc định là false nếu không ghi gì)
-  lane_constrain_strength: 0.2        # Điều chỉnh từ 0.0 đến 1.0 (20% can thiệp)
+  lane_constrain_blended: false     
+  lane_constrain_strength: 0.2
 
 yolo:
-  # backend:
-  # - "tm": native CARLA Traffic Manager autopilot
-  # - "planner": BasicAgent/BehaviorAgent route planner
-  # - ignored by agent=cil_yolo; CIL drives and YOLO/TrafficSupervisor only overrides braking
   backend: "tm"
-  # Chỉ dùng khi backend="planner"
   nav_agent_type: "basic"
   disable_autopilot_red_light: true
-  # Tracker dùng bởi Ultralytics model.track().
   tracker: "botsort.yaml"
-  # 1 = mỗi tick chạy YOLO (nặng nhất). Đặt 2 hoặc 3 để tăng FPS cil_yolo (dùng lại detection giữa các tick).
   inference_every_n_ticks: 3
   inference_imgsz: 0
-  # Cửa sổ OpenCV hiển thị kết quả detect (bbox / HUD tùy debug_overlay).
-  # - agent=yolo_detect: bật/tắt màn hình debug YOLO.
-  # - agent=cil_yolo: bật/tắt cửa sổ "CARLA CIL + YOLO" lúc khởi động; khi đang chạy bấm phím 'y' để bật/tắt lại.
-  # false = không mở cửa sổ, tiết kiệm FPS (CLI: --no-yolo-visualize).
   debug_window: false
-  # Khi debug_window=true:
-  # true  = vẽ box, HUD, corridor như giao diện debug cũ.
-  # false = chỉ hiện raw camera feed.
   debug_overlay: true
-  # Chỉ ẩn 2 vùng ROI đèn đỏ trên màn hình debug; logic dừng đèn đỏ vẫn giữ nguyên.
   show_red_light_rois: true
 
 gtnet:
-  # GTNet dùng như safety supervisor cho cil/cil_yolo.
-  # Model này không thay CIL waypoint model; nó dự đoán quỹ đạo NPC và chỉ override phanh.
-  enabled: false
-  # BUG FIX: gtnet_full_best.pt được train ở 20fps (dt=0.05) với history=40, future=60.
-  # Phải dùng expected_dt=0.05 và history_frames=40 để khớp với training data.
-  model_path: "models/gtnet_full_best_ade(1).pt"
+  model_path: "models/gtnet_full.pt"
   history_frames: 40
   expected_dt: 0.05
-  # gtnet_full_best.pt được train với adaptive-radius dataset.
-  # Dùng "checkpoint" để tự động dùng adaptive adjacency từ checkpoint config.
   adjacency_mode: "checkpoint"
   fixed_adjacency_radius_m: 100.0
   max_actor_distance_m: 100.0
-  # 20 FPS runtime, expected_dt=0.05 => stride=1, infer every 2 ticks.
   inference_every_n_ticks: 2
-  # Vẽ quỹ đạo threat trong CARLA world debug; bật khi cần kiểm tra trực quan.
   draw_debug: false
 
 traffic_spawn:
@@ -120,18 +96,9 @@ runtime:
   fps_log_interval_ticks: 20
   cil_enable_hud: false
   cil_enable_route_map: false
-  # --- OpenCV khi agent=cil_yolo (hai cửa sổ độc lập) ---
-  # 1) YOLO: bật/tắt lúc start qua yolo.debug_window; khi chạy bấm 'y' (xem comment ở khối yolo:).
-  # 2) Route map: cửa sổ "CIL Route Map", tách khỏi vẽ route trong world (cil_enable_route_map).
-  #    Bật/tắt lúc start: cil_opencv_route_map. Khi chạy: phím 'r'.
   cil_opencv_route_map: false
-  # Vẽ waypoint dự đoán trong world (debug CARLA). Tắt để bớt RPC debug → FPS ổn định hơn.
   cil_world_waypoint_debug: false
   cil_enable_telemetry_csv: false
   cil_profile_tick_timing: false
   cil_profile_log_interval_ticks: 60
-  # Bật/tắt đánh giá online metrics (Route Completion, TTC, CNN Latency) khi chạy trong CARLA.
-  # false = không hiện bảng tổng kết metrics khi kết thúc (mặc định).
-  # true  = hiện bảng "CIL AGENT ONLINE EVALUATION SUMMARY" sau khi teardown.
-  # Cũng có thể bật bằng CLI: --eval-online (trong run_cil.ps1 dùng -EvalOnline).
   eval_online: false

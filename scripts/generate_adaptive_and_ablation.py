@@ -76,7 +76,7 @@ def generate_adaptive_radius():
                                facecolor='white', edgecolor=COLORS['blue'], 
                                linewidth=1.5, zorder=10)
     ax_left.add_patch(label_box)
-    ax_left.text(5, 8.5, 'r_i = 2.5m', ha='center', va='center', fontsize=12, 
+    ax_left.text(5, 8.5, 'r_i = 60m', ha='center', va='center', fontsize=12, 
                 fontweight='bold', color=COLORS['blue'], zorder=11)
     
     # Ego vehicle
@@ -145,7 +145,7 @@ def generate_adaptive_radius():
                                  facecolor='white', edgecolor=COLORS['blue'], 
                                  linewidth=1.5, zorder=10)
     ax_right.add_patch(label_box_r)
-    ax_right.text(7.6, 7.75, 'r_i = 1.0m', ha='center', va='center', fontsize=12, 
+    ax_right.text(7.6, 7.75, 'r_i = 45m', ha='center', va='center', fontsize=12, 
                  fontweight='bold', color=COLORS['blue'], zorder=11)
     
     # Ego vehicle

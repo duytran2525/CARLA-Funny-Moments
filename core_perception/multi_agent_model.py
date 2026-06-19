@@ -8,45 +8,45 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Configuration
-# ══════════════════════════════════════════════════════════════════════════════
+
+
+
 
 @dataclass(frozen=True)
 class MultiAgentModelConfig:
-    # ── Baseline ─────────────────────────────────────────────────────────────
+
     input_dim: int = 6
     hidden_dim: int = 384
     graph_layers: int = 4
     future_steps: int = 60
     dropout: float = 0.15
 
-    # ── GAT ──────────────────────────────────────────────────────────────────
+
     enable_gat: bool = False
     num_attention_heads: int = 4
     attention_dropout: float = 0.1
-    attention_concat_mode: str = "concat"  # "concat" or "average"
-    
-    # [V4-B] GAT Edge Feature Dim (0 = disable)
+    attention_concat_mode: str = "concat"
+
+
     gat_edge_dim: int = 32
 
-    # ── Multimodal ───────────────────────────────────────────────────────────
+
     enable_multimodal: bool = False
     num_modes: int = 5
 
-    # ── Adaptive radius ──────────────────────────────────────────────────────
+
     enable_adaptive_radius: bool = False
     radius_base: float = 40.0
     radius_alpha: float = 1.0
 
-    # ── [IMP-1] Temporal self-attention ──────────────────────────────────────
-    use_temporal_attention: bool = False   # Apply after GRU encoder
 
-    # ── [IMP-2] Mode embedding dim in MultimodalDecoder ──────────────────────
-    mode_embed_dim: int = 64              # Shared GRU input: 2 + mode_embed_dim
+    use_temporal_attention: bool = False
 
-    # ── [IMP-3] Encoder output dropout ───────────────────────────────────────
-    encoder_dropout: float = 0.15          # 0 = disabled (safe default)
+
+    mode_embed_dim: int = 64
+
+
+    encoder_dropout: float = 0.15
 
     def __post_init__(self) -> None:
         if self.num_attention_heads < 1:
@@ -91,9 +91,9 @@ class MultiAgentModelConfig:
         )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# [IMP-1] Temporal Self-Attention
-# ══════════════════════════════════════════════════════════════════════════════
+
+
+
 
 class TemporalSelfAttention(nn.Module):
     def __init__(self, hidden_dim: int, dropout: float = 0.1) -> None:
@@ -130,9 +130,9 @@ class TemporalSelfAttention(nn.Module):
         return self.norm(anchor + self.proj(ctx))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# [V4-B] Edge Feature Encoder
-# ══════════════════════════════════════════════════════════════════════════════
+
+
+
 
 class RelativeEdgeEncoder(nn.Module):
     """
@@ -143,7 +143,7 @@ class RelativeEdgeEncoder(nn.Module):
     def __init__(self, edge_dim: int):
         super().__init__()
         self.edge_dim = edge_dim
-        # input dim = 3: dx, dy, Euclidean distance
+
         self.mlp = nn.Sequential(
             nn.Linear(3, edge_dim),
             nn.ReLU(inplace=True),
@@ -152,30 +152,30 @@ class RelativeEdgeEncoder(nn.Module):
 
     def forward(self, pos: torch.Tensor, agent_mask: torch.Tensor) -> torch.Tensor:
         B, N, _ = pos.shape
-        # Create [B, N, N, 2] distance vectors
+
         pos_i = pos.unsqueeze(2).expand(B, N, N, 2)
         pos_j = pos.unsqueeze(1).expand(B, N, N, 2)
-        diff = pos_j - pos_i  # relative vector from i to j (dx, dy)
-        
-        # Calculate Euclidean distance [B, N, N, 1]
+        diff = pos_j - pos_i
+
+
         dist = torch.norm(diff, dim=-1, keepdim=True)
-        
-        # Combine [B, N, N, 3]
+
+
         inputs = torch.cat([diff, dist], dim=-1)
-        
-        # Apply MLP to get edge features [B, N, N, edge_dim]
+
+
         edge_feat = self.mlp(inputs)
-        
-        # Mask out invalid pairs
+
+
         mask_bool = agent_mask.to(torch.bool)
-        valid_pair = mask_bool.unsqueeze(1) & mask_bool.unsqueeze(2) # [B, N, N]
-        
+        valid_pair = mask_bool.unsqueeze(1) & mask_bool.unsqueeze(2)
+
         return edge_feat * valid_pair.unsqueeze(-1).to(edge_feat.dtype)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Graph interaction blocks (GCN & GAT v4)
-# ══════════════════════════════════════════════════════════════════════════════
+
+
+
 
 class GraphInteractionBlock(nn.Module):
     def __init__(self, hidden_dim: int, dropout: float = 0.1) -> None:
@@ -193,7 +193,7 @@ class GraphInteractionBlock(nn.Module):
         h: torch.Tensor,
         adj: torch.Tensor,
         agent_mask: torch.Tensor,
-        edge_feat: Optional[torch.Tensor] = None, # Ignore edge_feat for baseline GCN
+        edge_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         mask = agent_mask.to(dtype=h.dtype)
         adj = adj.to(dtype=h.dtype) * mask.unsqueeze(1) * mask.unsqueeze(2)
@@ -238,8 +238,8 @@ class GATLayer(nn.Module):
         self.W = nn.ModuleList(
             [nn.Linear(hidden_dim, self.head_dim, bias=False) for _ in range(num_heads)]
         )
-        
-        # Attention now takes (2 * head_dim + edge_dim)
+
+
         self.attention = nn.ModuleList(
             [nn.Linear(2 * self.head_dim + edge_dim, 1, bias=False) for _ in range(num_heads)]
         )
@@ -268,17 +268,17 @@ class GATLayer(nn.Module):
 
         head_outputs = []
         for head_idx in range(self.num_heads):
-            h_t = self.W[head_idx](h)  # [B, N, head_dim]
+            h_t = self.W[head_idx](h)
             h_i = h_t.unsqueeze(2).expand(B, N, N, self.head_dim)
             h_j = h_t.unsqueeze(1).expand(B, N, N, self.head_dim)
-            
-            # [V4-B] Concat edge features if enabled
-            if self.edge_dim > 0 and edge_feat is not None:
-                h_cat = torch.cat([h_i, h_j, edge_feat], dim=-1)  # [B, N, N, 2*head_dim + edge_dim]
-            else:
-                h_cat = torch.cat([h_i, h_j], dim=-1)  # [B, N, N, 2*head_dim] (Backward compatible v3)
 
-            e = self.attention[head_idx](h_cat).squeeze(-1)  # [B, N, N]
+
+            if self.edge_dim > 0 and edge_feat is not None:
+                h_cat = torch.cat([h_i, h_j, edge_feat], dim=-1)
+            else:
+                h_cat = torch.cat([h_i, h_j], dim=-1)
+
+            e = self.attention[head_idx](h_cat).squeeze(-1)
             e = self.leaky_relu(e)
 
             mask_val = torch.finfo(e.dtype).min
@@ -293,7 +293,7 @@ class GATLayer(nn.Module):
                 torch.zeros_like(alpha),
             )
             alpha = self.dropout_layer(alpha)
-            h_prime = torch.bmm(alpha, h_t)  # [B, N, head_dim]
+            h_prime = torch.bmm(alpha, h_t)
             head_outputs.append(h_prime)
 
         if self.concat_heads:
@@ -306,9 +306,9 @@ class GATLayer(nn.Module):
         return torch.where(mask_bool.unsqueeze(-1), h_out, torch.zeros_like(h_out))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# [IMP-2] Multimodal Decoder — shared GRU + mode embeddings
-# ══════════════════════════════════════════════════════════════════════════════
+
+
+
 
 class MultimodalDecoder(nn.Module):
     def __init__(
@@ -385,9 +385,9 @@ class MultimodalDecoder(nn.Module):
         return all_modes.reshape(B, N, self.num_modes, self.future_steps, 2)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Top-level predictor
-# ══════════════════════════════════════════════════════════════════════════════
+
+
+
 
 class MultiAgentTrajectoryPredictor(nn.Module):
     def __init__(self, config: Optional[MultiAgentModelConfig] = None) -> None:
@@ -395,14 +395,14 @@ class MultiAgentTrajectoryPredictor(nn.Module):
         self.config = config or MultiAgentModelConfig()
         cfg = self.config
 
-        # ── GRU encoder ──────────────────────────────────────────────────────
+
         self.encoder = nn.GRU(
             input_size=int(cfg.input_dim),
             hidden_size=int(cfg.hidden_dim),
             batch_first=True,
         )
 
-        # [IMP-1] Temporal self-attention
+
         if cfg.use_temporal_attention:
             self.temporal_attn = TemporalSelfAttention(
                 hidden_dim=int(cfg.hidden_dim),
@@ -411,20 +411,20 @@ class MultiAgentTrajectoryPredictor(nn.Module):
         else:
             self.temporal_attn = None
 
-        # [IMP-3] Encoder output dropout
+
         self.enc_dropout = (
             nn.Dropout(p=float(cfg.encoder_dropout))
             if cfg.encoder_dropout > 0.0
             else nn.Identity()
         )
 
-        # ── [V4-B] Edge Feature Encoder ─────────────────────────────────────────
+
         if cfg.enable_gat and cfg.gat_edge_dim > 0:
             self.edge_encoder = RelativeEdgeEncoder(edge_dim=int(cfg.gat_edge_dim))
         else:
             self.edge_encoder = None
 
-        # ── Graph interaction blocks ──────────────────────────────────────────
+
         if cfg.enable_gat:
             self.graph_blocks = nn.ModuleList([
                 GATLayer(
@@ -432,7 +432,7 @@ class MultiAgentTrajectoryPredictor(nn.Module):
                     num_heads=int(cfg.num_attention_heads),
                     dropout=float(cfg.attention_dropout),
                     concat_heads=(cfg.attention_concat_mode == "concat"),
-                    edge_dim=int(cfg.gat_edge_dim),  # [V4-B]
+                    edge_dim=int(cfg.gat_edge_dim),
                 )
                 for _ in range(max(0, int(cfg.graph_layers)))
             ])
@@ -445,7 +445,7 @@ class MultiAgentTrajectoryPredictor(nn.Module):
                 for _ in range(max(0, int(cfg.graph_layers)))
             ])
 
-        # ── Decoder ──────────────────────────────────────────────────────────
+
         if cfg.enable_multimodal:
             self.multimodal_decoder = MultimodalDecoder(
                 hidden_dim=int(cfg.hidden_dim),
@@ -474,16 +474,16 @@ class MultiAgentTrajectoryPredictor(nn.Module):
             x.shape[0], x.shape[1], 1, 1
         ).expand(-1, -1, 1, 2)
         return torch.gather(x[..., :2], dim=2, index=last_idx).squeeze(2)
-        
+
     @staticmethod
     def _last_valid_velocities(
         x: torch.Tensor, x_mask: torch.Tensor
     ) -> torch.Tensor:
         """Extract last valid (vx, vy) velocity from history for each agent."""
-        # Assuming feature dim 2 and 3 are vx and vy
+
         if x.shape[-1] < 4:
             return torch.zeros((x.shape[0], x.shape[1], 2), dtype=x.dtype, device=x.device)
-            
+
         valid_counts = x_mask.long().sum(dim=-1).clamp_min(1)
         last_idx = (valid_counts - 1).view(
             x.shape[0], x.shape[1], 1, 1
@@ -502,28 +502,28 @@ class MultiAgentTrajectoryPredictor(nn.Module):
         """
         B, N, _ = last_pos.shape
         device, dtype = last_pos.device, last_pos.dtype
-        
-        # Calculate speed for each agent [B, N]
+
+
         speed = torch.norm(last_vel, dim=-1)
-        
-        # Calculate dynamic radius [B, N]
+
+
         radius = self.config.radius_base + speed * self.config.radius_alpha
-        
-        # Create distance matrix [B, N, N]
+
+
         pos_i = last_pos.unsqueeze(2).expand(B, N, N, 2)
         pos_j = last_pos.unsqueeze(1).expand(B, N, N, 2)
         dist = torch.norm(pos_j - pos_i, dim=-1)
-        
-        # Check if distance is within radius (using min(r_i, r_j) to ensure symmetric adjacency)
-        radius_i = radius.unsqueeze(2)  # [B, N, 1]
-        radius_j = radius.unsqueeze(1)  # [B, 1, N]
-        radius_min = torch.min(radius_i, radius_j)  # [B, N, N]
+
+
+        radius_i = radius.unsqueeze(2)
+        radius_j = radius.unsqueeze(1)
+        radius_min = torch.min(radius_i, radius_j)
         adj_dynamic = (dist <= radius_min).to(dtype)
-        
-        # Mask out invalid agents
+
+
         mask_float = agent_mask.to(dtype)
         valid_pair = mask_float.unsqueeze(1) * mask_float.unsqueeze(2)
-        
+
         return adj_dynamic * valid_pair
 
     def forward(
@@ -542,7 +542,7 @@ class MultiAgentTrajectoryPredictor(nn.Module):
         BN = B * N
         H = int(self.config.hidden_dim)
 
-        # ── Encode history ─────────────────────────────────────────────────────
+
         flat_x    = x.reshape(BN, T_hist, input_dim)
         flat_mask = x_mask.reshape(BN, T_hist).to(dtype=flat_x.dtype)
         flat_x    = flat_x * flat_mask.unsqueeze(-1)
@@ -559,25 +559,25 @@ class MultiAgentTrajectoryPredictor(nn.Module):
 
         h = h_flat.reshape(B, N, H)
         h = h * agent_mask.to(dtype=h.dtype).unsqueeze(-1)
-        
-        # Get final position and velocity for spatial logic
-        last_pos = self._last_valid_positions(x, x_mask)  # [B, N, 2]
-        last_vel = self._last_valid_velocities(x, x_mask) # [B, N, 2]
-        
-        # ── [V4-A] Adaptive Radius Logic ───────────────────────────────────────
+
+
+        last_pos = self._last_valid_positions(x, x_mask)
+        last_vel = self._last_valid_velocities(x, x_mask)
+
+
         if self.config.enable_adaptive_radius:
             adj = self._compute_adaptive_adj(last_pos, last_vel, agent_mask)
-            
-        # ── [V4-B] Edge Feature Encoding ───────────────────────────────────────
+
+
         edge_feat = None
         if self.edge_encoder is not None:
             edge_feat = self.edge_encoder(last_pos, agent_mask)
 
-        # ── Graph interaction ──────────────────────────────────────────────────
+
         for block in self.graph_blocks:
             h = block(h, adj=adj, agent_mask=agent_mask, edge_feat=edge_feat)
 
-        # ── Decode future trajectory ───────────────────────────────────────────
+
         if self.config.enable_multimodal:
             return self.multimodal_decoder(h, last_pos, agent_mask)
 
@@ -599,9 +599,9 @@ class MultiAgentTrajectoryPredictor(nn.Module):
         return torch.stack(preds, dim=2)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Loss & metrics (unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
+
+
+
 
 def masked_smooth_l1_loss(
     pred: torch.Tensor,
@@ -662,9 +662,9 @@ def masked_ade_fde(
     return float(ade.detach().cpu().item()), float(fde.detach().cpu().item())
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Checkpoint I/O
-# ══════════════════════════════════════════════════════════════════════════════
+
+
+
 
 def load_checkpoint_with_compatibility(
     checkpoint_path: str,

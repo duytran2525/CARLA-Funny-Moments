@@ -21,17 +21,17 @@ class MultiAgentTrajectoryDataset(Dataset):
         self.manifest_path = Path(manifest_path) if manifest_path is not None else self.root_dir / "manifest.csv"
 
         if sample_files is not None:
-            # Normalize path separators immediately when sample_files is provided
+
             self.sample_paths = []
             for path in sample_files:
-                # Convert to string, replace backslashes, then convert to Path
+
                 clean_path = str(path).replace('\\', '/')
                 p = Path(clean_path)
                 self.sample_paths.append(p if p.is_absolute() else self.root_dir / p)
         else:
             self.sample_paths = self._read_manifest(self.manifest_path)
 
-        # Final normalization: resolve and ensure forward slashes
+
         self.sample_paths = [Path(str(path).replace('\\', '/')) for path in self.sample_paths]
         if not self.sample_paths:
             raise RuntimeError(f"No multi-agent .pt samples found under: {self.root_dir}")
@@ -48,7 +48,7 @@ class MultiAgentTrajectoryDataset(Dataset):
             for row in reader:
                 sample_file = str(row.get("sample_file") or "").strip()
                 if sample_file:
-                    # Normalize path separators for cross-platform compatibility
+
                     sample_file = sample_file.replace('\\', '/')
                     rows.append(path.parent / sample_file)
         return rows
@@ -57,15 +57,15 @@ class MultiAgentTrajectoryDataset(Dataset):
         return len(self.sample_paths)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor | str | int | float]:
-        # Force string conversion and normalize path separators for cross-platform compatibility
+
         clean_path_str = str(self.sample_paths[int(index)]).replace('\\', '/')
         sample_path = Path(clean_path_str)
         sample = torch.load(sample_path, map_location="cpu", weights_only=True)
-        
-        # Load and detect format
+
+
         x = torch.as_tensor(sample["x"], dtype=torch.float32)
         x = self._ensure_6d_features(x)
-        
+
         return {
             "x": x,
             "y": torch.as_tensor(sample["y"], dtype=torch.float32),
@@ -80,7 +80,7 @@ class MultiAgentTrajectoryDataset(Dataset):
             "run_id": str(sample.get("run_id", "")),
             "sample_path": str(sample_path),
         }
-    
+
     @staticmethod
     def _ensure_6d_features(x: torch.Tensor) -> torch.Tensor:
         """
@@ -90,16 +90,16 @@ class MultiAgentTrajectoryDataset(Dataset):
             Features tensor with 6D features [num_agents, history_steps, 6]
         """
         if x.shape[-1] == 6:
-            # New format with velocity features - return as-is
+
             return x
         elif x.shape[-1] == 4:
-            # Old format without velocity features - pad with zeros
+
             num_agents, history_steps, _ = x.shape
-            # Create 6D tensor: (local_x, local_y, local_vx=0, local_vy=0, heading_x, heading_y)
+
             x_6d = torch.zeros((num_agents, history_steps, 6), dtype=x.dtype)
-            x_6d[:, :, 0:2] = x[:, :, 0:2]  # local_x, local_y
-            # x_6d[:, :, 2:4] already zeros (local_vx=0, local_vy=0)
-            x_6d[:, :, 4:6] = x[:, :, 2:4]  # heading_x, heading_y
+            x_6d[:, :, 0:2] = x[:, :, 0:2]
+
+            x_6d[:, :, 4:6] = x[:, :, 2:4]
             return x_6d
         else:
             raise ValueError(
@@ -136,7 +136,7 @@ def split_sample_paths(
         split_idx = min(max(1, int(round(train_ratio * len(ordered)))), len(ordered) - 1)
         return ordered[:split_idx], ordered[split_idx:]
 
-    # Multiple runs — shuffle at the run level.
+
     rng = random.Random(int(seed))
     rng.shuffle(runs)
 

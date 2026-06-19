@@ -23,12 +23,12 @@ except ImportError:
     carla = None
 
 try:
-    from agents.navigation.basic_agent import BasicAgent  # type: ignore[import-not-found]
+    from agents.navigation.basic_agent import BasicAgent
 except Exception:
     BasicAgent = None
 
 try:
-    from agents.navigation.behavior_agent import BehaviorAgent  # type: ignore[import-not-found]
+    from agents.navigation.behavior_agent import BehaviorAgent
 except Exception:
     BehaviorAgent = None
 
@@ -313,44 +313,44 @@ def _draw_yellow_danger_corridor(
 ) -> bool:
     """
     Vẽ Yellow Danger Corridor từ Traffic Supervisor
-    
+
     Input:
     - supervisor_debug: từ traffic_supervisor.get_debug_info()
     - debug_info: từ yolo_detector.get_last_debug_info()
-    
+
     Output:
     - bool: True nếu vẽ thành công, False nếu không có polygon
     """
     if np is None or cv2 is None:
         return False
-    
-    # Lấy polygon từ supervisor (ưu tiên)
+
+
     danger_polygon = supervisor_debug.get("danger_polygon")
     if danger_polygon is None or len(danger_polygon) < 3:
-        # Fallback: thử lấy từ YOLO debug info
+
         obstacle_roi = debug_info.get("obstacle_danger_roi", {})
         danger_polygon = obstacle_roi.get("polygon", [])
         if not danger_polygon or len(danger_polygon) < 3:
             return False
-    
-    # Vẽ polygon
+
+
     try:
         points = np.array(danger_polygon, dtype=np.int32).reshape((-1, 1, 2))
-        
-        # Màu vàng
-        corridor_color = (0, 255, 255)  # BGR: Yellow
-        
-        # Vẽ fill nhạt
+
+
+        corridor_color = (0, 255, 255)
+
+
         overlay = frame_bgr.copy()
-        cv2.fillPoly(overlay, [points], (30, 200, 255))  # Fill màu cam nhạt
+        cv2.fillPoly(overlay, [points], (30, 200, 255))
         cv2.addWeighted(overlay, 0.25, frame_bgr, 0.75, 0.0, frame_bgr)
-        
-        # Vẽ edge đậm
+
+
         cv2.polylines(frame_bgr, [points], True, corridor_color, 3)
-        
-        # Vẽ center line (trắng)
+
+
         center_color = (255, 255, 255)
-        # Tính center points (trung bình của left + right)
+
         center_indices = len(danger_polygon) // 2
         center_pts = []
         for i in range(center_indices):
@@ -360,12 +360,12 @@ def _draw_yellow_danger_corridor(
                 center_x = (danger_polygon[left_idx][0] + danger_polygon[right_idx][0]) // 2
                 center_y = (danger_polygon[left_idx][1] + danger_polygon[right_idx][1]) // 2
                 center_pts.append([center_x, center_y])
-        
+
         if len(center_pts) >= 2:
             center_arr = np.array(center_pts, dtype=np.int32).reshape((-1, 1, 2))
             cv2.polylines(frame_bgr, [center_arr], False, center_color, 2)
-        
-        # Vẽ label
+
+
         if len(danger_polygon) >= 2:
             label_x = int(danger_polygon[0][0])
             label_y = max(20, int(danger_polygon[0][1]) - 15)
@@ -378,7 +378,7 @@ def _draw_yellow_danger_corridor(
                 corridor_color,
                 2,
             )
-        
+
         return True
     except Exception as exc:
         logging.warning("Failed to draw yellow corridor: %s", exc)
@@ -402,7 +402,7 @@ def _draw_red_light_zone_rois(
     if frame_h <= 0 or frame_w <= 0:
         return False
 
-    # Keep aligned with TrafficSupervisor._classify_traffic_light_zone().
+
     urban_x1 = int(round(0.35 * frame_w))
     urban_x2 = int(round(0.65 * frame_w))
     rural_x1 = int(round(0.65 * frame_w))
@@ -463,9 +463,9 @@ def set_navigation_destination(nav_agent: Any, current_location: Any, destinatio
     except (TypeError, ValueError):
         param_names = []
 
-    # API variants:
-    # - set_destination(start_location, end_location)
-    # - set_destination(end_location, start_location=None)
+
+
+
     if len(param_names) >= 2:
         first, second = param_names[0], param_names[1]
         if "start" in first and ("end" in second or "dest" in second):
@@ -486,7 +486,7 @@ def set_navigation_destination(nav_agent: Any, current_location: Any, destinatio
         except TypeError:
             continue
 
-    # Final fallback for unusual signatures.
+
     setter(destination_location)
 
 
@@ -541,7 +541,7 @@ def score_reference_route_balance(
 
 
 def apply_random_weather(world) -> str:
-    # 40% clear day, 20% sunset, 20% night, 20% rain.
+
     roll = random.random()
     if roll < 0.40:
         preset_name = "clear_day"
@@ -616,7 +616,7 @@ def apply_weather_preset(world, preset: str) -> None:
         "softrainsunset": carla.WeatherParameters.SoftRainSunset,
         "midrainsunset": carla.WeatherParameters.MidRainSunset,
         "hardrainsunset": carla.WeatherParameters.HardRainSunset,
-        # Night presets
+
         "clearnight": getattr(carla.WeatherParameters, "ClearNight", carla.WeatherParameters.ClearNoon),
         "cloudynight": getattr(carla.WeatherParameters, "CloudyNight", carla.WeatherParameters.CloudyNoon),
         "wetnight": getattr(carla.WeatherParameters, "WetNight", carla.WeatherParameters.WetNoon),
@@ -625,7 +625,7 @@ def apply_weather_preset(world, preset: str) -> None:
         "midrainnight": getattr(carla.WeatherParameters, "MidRainyNight", carla.WeatherParameters.MidRainyNoon),
         "hardrainnight": getattr(carla.WeatherParameters, "HardRainNight", carla.WeatherParameters.HardRainNoon),
         "duststorm": getattr(carla.WeatherParameters, "DustStorm", carla.WeatherParameters.ClearNoon),
-        # Custom foggy presets
+
         "foggynoon": carla.WeatherParameters(
             cloudiness=80.0, precipitation=0.0, precipitation_deposits=0.0,
             wind_intensity=10.0, sun_azimuth_angle=0.0, sun_altitude_angle=45.0,
@@ -746,42 +746,42 @@ def resolve_yolo_model_path(model_path: str) -> Path:
 
 @dataclass
 class RunConfig:
-    env_config_path: str  # Path to environment config file (.env, .json, .yaml)
-    host: str  # CARLA server host (for example: 127.0.0.1)
-    port: int  # CARLA RPC port (default: 2000)
-    tm_port: int  # Traffic Manager port (default: 8000)
-    timeout: float  # RPC timeout in seconds
-    sync: bool  # Use synchronous mode to avoid frame drops
-    fixed_delta: float  # Fixed step duration per frame (e.g. 0.05 = 20 FPS)
-    no_rendering: bool  # Disable rendering on server for higher simulation speed
-    map_name: str  # CARLA map name (for example: Town01, Town04)
-    vehicle_filter: str  # Ego vehicle blueprint filter
-    spawn_point: int  # Ego spawn point index
-    destination_point: int  # Destination spawn index for route target (negative means random)
-    ticks: int  # Max simulation steps to run
-    tick_interval: float  # Sleep interval between ticks in dry-run mode
-    dry_run: bool  # Run without connecting to CARLA
-    seed: Optional[int]  # Random seed for reproducibility
-    model_path: str  # Path to model weights (.pth, .pt)
-    cil_model_path: str  # Path to CIL model weights (.pth)
-    yolo_model_path: str  # Path to YOLO weights (.pt)
-    model_device: str  # Inference device (cpu or cuda)
-    target_speed_kmh: float  # Target ego speed in km/h
-    max_throttle: float  # Max throttle command in range [0.0, 1.0]
-    max_brake: float  # Max brake command in range [0.0, 1.0]
-    steer_smoothing: float  # Steering smoothing factor
-    camera_width: int  # Camera capture width in pixels
-    camera_height: int  # Camera capture height in pixels
-    camera_fov: float  # Camera field of view in degrees
-    eval_online: bool  # Print online evaluation metrics
-    lock_spectator_on_spawn: bool  # Lock spectator near ego on spawn
-    spectator_reapply_each_tick: bool  # Re-apply spectator transform each tick
-    spectator_follow_distance: float  # Spectator follow distance from ego
-    spectator_height: float  # Spectator height relative to ego
-    spectator_pitch: float  # Spectator camera pitch in degrees
-    collect_data: bool  # Enable synchronized dataset collection
-    collect_data_dir: str  # Dataset output folder
-    save_every_n: int  # Keep one sample every N frames
+    env_config_path: str
+    host: str
+    port: int
+    tm_port: int
+    timeout: float
+    sync: bool
+    fixed_delta: float
+    no_rendering: bool
+    map_name: str
+    vehicle_filter: str
+    spawn_point: int
+    destination_point: int
+    ticks: int
+    tick_interval: float
+    dry_run: bool
+    seed: Optional[int]
+    model_path: str
+    cil_model_path: str
+    yolo_model_path: str
+    model_device: str
+    target_speed_kmh: float
+    max_throttle: float
+    max_brake: float
+    steer_smoothing: float
+    camera_width: int
+    camera_height: int
+    camera_fov: float
+    eval_online: bool
+    lock_spectator_on_spawn: bool
+    spectator_reapply_each_tick: bool
+    spectator_follow_distance: float
+    spectator_height: float
+    spectator_pitch: float
+    collect_data: bool
+    collect_data_dir: str
+    save_every_n: int
     image_prefix: str
     npc_vehicle_count: int
     npc_bike_count: int
@@ -794,7 +794,7 @@ class RunConfig:
     video_duration_sec: int
     video_codec: str
     random_weather: bool
-    weather_preset: str  # Weather preset from config (e.g., ClearNoon)
+    weather_preset: str
     fps_log_interval_ticks: int
     cil_enable_hud: bool
     cil_enable_route_map: bool
@@ -1496,7 +1496,7 @@ class AutopilotAgent(BaseAgent):
         if not self.config.collect_data:
             return 0.0
         if self._tm_fallback_mode:
-            # Keep TM autopilot untouched when navigation agent API is unavailable.
+
             return 0.0
 
         interval = max(1, self.config.recovery_interval_frames)
@@ -1764,13 +1764,13 @@ class LaneFollowAgent(BaseAgent):
         self._video_max_frames = 0
         self._stop_requested = False
         self._visualizer = None
-        # YOLO integration
+
         self._yolo_detector = None
         self._traffic_supervisor = None
         self._last_supervisor_ts: Optional[float] = None
         self._yolo_window_name = "Lane Follow + YOLO Detection"
         self._yolo_enabled = False
-        # Speed control (PID)
+
         self._speed_controller = SpeedPIDController(
             target_speed_kmh=config.target_speed_kmh,
             max_throttle=config.max_throttle,
@@ -1813,7 +1813,7 @@ class LaneFollowAgent(BaseAgent):
         self._start_data_collection_cameras(session.world, vehicle)
         self._init_video_writer()
 
-        # Load YOLO detector if model path is provided
+
         self._load_yolo_detector()
         if DrivingVisualizer is not None:
             window_name = self._yolo_window_name if self._yolo_enabled else "Lane Follow HUD"
@@ -2043,7 +2043,7 @@ class LaneFollowAgent(BaseAgent):
         cropped = rgb_frame[int(height * 0.45) :, :, :]
         resized = cv2.resize(cropped, (200, 66), interpolation=cv2.INTER_AREA)
 
-        # Keep inference color space identical to training (RGB -> YUV).
+
         yuv_image = cv2.cvtColor(resized, cv2.COLOR_RGB2YUV)
         tensor = torch.from_numpy(yuv_image).permute(2, 0, 1).float().div_(255.0)
         tensor.sub_(0.5).div_(0.5)
@@ -2080,7 +2080,7 @@ class LaneFollowAgent(BaseAgent):
     ) -> tuple[bool, Dict[str, Any], Any]:
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-        # distance_threshold applies to dynamic obstacles (pedestrian/vehicle/two_wheeler).
+
         detections, detector_emergency = self._yolo_detector.detect_and_evaluate(
             frame_bgr,
             distance_threshold=None,
@@ -2151,7 +2151,7 @@ class LaneFollowAgent(BaseAgent):
                 obstacle_roi["polygon"] = polygon_list
                 debug_info["obstacle_danger_roi"] = obstacle_roi
 
-        # In lane-follow, prefer supervisor as primary brake source when available.
+
         hard_supervisor_emergency = (
             supervisor_brake >= 0.60 and supervisor_target_type == "obstacle"
         )
@@ -2236,7 +2236,7 @@ class LaneFollowAgent(BaseAgent):
 
         speed_kmh = self._current_speed_kmh()
 
-        # Run YOLO detection and display if enabled
+
         is_emergency = False
         supervisor_brake = 0.0
         yolo_debug_info: Dict[str, Any] = {}
@@ -2271,7 +2271,7 @@ class LaneFollowAgent(BaseAgent):
             and float(speed_kmh) <= 2.0
         )
 
-        # Apply emergency/supervisor braking if YOLO detects danger.
+
         if is_emergency or supervisor_brake > 0.0:
             throttle = 0.0
             emergency_floor = self.config.max_brake if is_emergency else 0.0
@@ -2385,7 +2385,7 @@ class LaneFollowAgent(BaseAgent):
         if self._visualizer is not None:
             self._visualizer.close()
             self._visualizer = None
-        # Clean up YOLO window
+
         if self._yolo_enabled:
             try:
                 cv2.destroyWindow(self._yolo_window_name)
@@ -2491,25 +2491,25 @@ class CILAgent(BaseAgent):
             "telemetry": 0.0,
             "total": 0.0,
         }
-        # HUD debug drawing
+
         self._hud_ema_fps: Optional[float] = None
         self._hud_last_tick_time: Optional[float] = None
         self._route_overlay_bounds: Optional[tuple[float, float, float, float]] = None
         self._spectator_follow_transform = None
         self._spectator_follow_log_tick = 0
 
-        # Command delay buffer: hold command N frames before feeding to model.
-        # Reduced from 1.0 s → 0.3 s to avoid late turn commands at junctions.
+
+
         self._command_delay_buffer: deque = deque()
         self._command_delay_n_frames: int = max(1, round(0.3 / max(1e-3, float(config.fixed_delta))))
-        # Speed control (PID)
+
         self._speed_controller = SpeedPIDController(
             target_speed_kmh=config.target_speed_kmh,
             max_throttle=config.max_throttle,
             max_brake=config.max_brake,
         )
 
-        # Pure pursuit steering controller
+
         self._use_pure_pursuit = bool(config.cil_use_pure_pursuit)
         if self._use_pure_pursuit and PurePursuitController is not None and np is not None:
             dt = max(float(config.fixed_delta), 1e-3)
@@ -2557,7 +2557,7 @@ class CILAgent(BaseAgent):
         if self.config.cil_enable_telemetry_csv:
             self._init_telemetry_logger()
 
-        # Separate OpenCV route-map window (CARLA world route overlay uses cil_enable_route_map).
+
         if RouteMapVisualizer is not None and self._opencv_route_visible:
             self._route_map = RouteMapVisualizer(
                 window_name="CIL Route Map",
@@ -3193,7 +3193,7 @@ class CILAgent(BaseAgent):
         lateral_dist = math.hypot(float(current_loc.x - wp_loc.x), float(current_loc.y - wp_loc.y))
         has_fixed_spawn = int(self.config.spawn_point) >= 0
         if has_fixed_spawn:
-            # Respect fixed spawn point exactly; do not relocate ego after spawn.
+
             should_snap = False
         else:
             should_snap = (not lane_is_driving) or lateral_dist > 4.0
@@ -3470,7 +3470,7 @@ class CILAgent(BaseAgent):
         try:
             numeric_value = int(raw_value)
             if numeric_value in (5, 6):
-                # Ignore lane-change hints for CIL command injection.
+
                 return 0
         except (TypeError, ValueError):
             pass
@@ -4099,10 +4099,10 @@ class CILAgent(BaseAgent):
             for key, value in state_dict.items():
                 clean_key = str(key)
                 if clean_key.startswith("film."):
-                    # Remap film.* -> film_s4.* only.
-                    # film_s3 has different dimensions (emb_dim=64, channels=208 vs
-                    # film_s4 emb_dim=128, channels=440) so it cannot be copied.
-                    # film_s3 uses FiLM._init_identity() → gamma=1/beta=0 passthrough.
+
+
+
+
                     upgraded_state_dict[f"film_s4.{clean_key[len('film.'):]}"] = value
                 else:
                     upgraded_state_dict[clean_key] = value
@@ -4112,9 +4112,9 @@ class CILAgent(BaseAgent):
         model = CIL_NvidiaCNN(pretrained_backbone=False).to(self._device)
         if uses_single_film_checkpoint:
             load_result = model.load_state_dict(state_dict, strict=False)
-            # film_s3.* keys are intentionally absent in single-FiLM checkpoints.
-            # They are initialised as identity (gamma=1, beta=0) by FiLM._init_identity(),
-            # which is a safe passthrough — no retraining needed.
+
+
+
             allowed_missing = {k for k in load_result.missing_keys if k.startswith("film_s3.")}
             real_missing = set(load_result.missing_keys) - allowed_missing
             unexpected = set(load_result.unexpected_keys)
@@ -4293,8 +4293,8 @@ class CILAgent(BaseAgent):
             if phase == "in_junction":
                 adaptive_target_kmh = min(adaptive_target_kmh, float(entry_speed_kmh) + 2.0)
 
-        # Speed shaping should follow route geometry, not tiny steering noise on
-        # straight roads. Route curvature gives a stable slowdown signal.
+
+
         if route_curve_strength > 0.12:
             if int(command) == 0 and phase == "cruise":
                 curve_cap_kmh = 50.0 - 26.0 * route_curve_strength
@@ -4368,7 +4368,7 @@ class CILAgent(BaseAgent):
         if waypoints_2d is None or len(waypoints_2d) < 3:
             return float(min_speed)
 
-        # Measure max turning angle across consecutive segments
+
         n = len(waypoints_2d)
         max_angle_deg = 0.0
         for i in range(n - 2):
@@ -4542,25 +4542,25 @@ class CILAgent(BaseAgent):
                     return lane_projected.astype(np.float32)
                 return waypoints
 
-            # Control points for smooth transfer (ego-frame)
+
             n_points = int(waypoints.shape[0])
             idx_mid = min(2, n_points - 1)
             idx_far = min(4, n_points - 1)
-            
-            # Inertia anchor (keep near-term steering stable)
+
+
             forward_hint = max(2.0, float(waypoints[1, 0]) if n_points > 1 else 2.0)
             inertia_x = float(np.clip(forward_hint, 2.0, 8.0))
 
-            # --- LOGIC XỬ LÝ LÚC RẼ (softened to avoid oversharp turns) ---
+
             a2_idx = idx_mid
-            # Khi turn command, giảm nhẹ quán tính nhưng KHÔNG ép quá mức
+
             if int(command) in (1, 2):
-                inertia_x = max(2.0, inertia_x * 0.8)  # Softened: 0.6→0.8, min 1.5→2.0
-                # Không kéo a2_idx gần lại nữa — giữ nguyên idx_mid
+                inertia_x = max(2.0, inertia_x * 0.8)
+
 
             a2 = lane_projected[a2_idx]
             a4 = lane_projected[idx_far]
-            # -------------------------------
+
 
             c0 = np.array([0.0, 0.0], dtype=np.float32)
             c1 = np.array([inertia_x, 0.0], dtype=np.float32)
@@ -4579,19 +4579,19 @@ class CILAgent(BaseAgent):
             ts = np.linspace(0.0, 1.0, n_points, dtype=np.float32)
             smooth_curve = np.stack([_bezier_point(float(t)) for t in ts], axis=0).astype(np.float32)
 
-            # Progressive blending: keep near points close to model, far points
-            # align stronger to map/lane curve.
-            alphas = np.linspace(0.20, 0.90, n_points, dtype=np.float32)  # Max 0.95→0.90
+
+
+            alphas = np.linspace(0.20, 0.90, n_points, dtype=np.float32)
             if int(command) in (1, 2, 3):
-                alphas = np.clip(alphas + 0.01, 0.0, 0.92)  # Reduced: +0.03→+0.01, cap 0.98→0.92
-            
-            # Apply strength modifier (0.0 = no intervention, 1.0 = full intervention)
+                alphas = np.clip(alphas + 0.01, 0.0, 0.92)
+
+
             strength = float(getattr(self.config, "cil_lane_constrain_strength", 1.0))
             alphas = alphas * strength
-            
+
             blended = (1.0 - alphas[:, None]) * waypoints + alphas[:, None] * smooth_curve
 
-            # Keep forward progression stable for pure-pursuit.
+
             blended[:, 0] = np.maximum.accumulate(np.maximum(blended[:, 0], 0.2))
             return blended.astype(np.float32)
         except Exception as exc:
@@ -4605,31 +4605,31 @@ class CILAgent(BaseAgent):
         command: int,
         command_phase: str,
     ) -> float:
-        # ──────────────────────────────────────────────────────────────
-        # EMA smoothing + rate limiter to prevent jerky steering.
-        # Speed-adaptive: more responsive at low speed, smoother at high.
-        # Turn-aware: slightly higher alpha during active turns.
-        # ──────────────────────────────────────────────────────────────
+
+
+
+
+
         speed_ms = float(speed_kmh) / 3.6
         is_turning = int(command) in (1, 2)
 
-        # Base EMA alpha (higher = more responsive to new input)
-        if speed_ms < 3.0:       # < ~11 km/h
+
+        if speed_ms < 3.0:
             alpha = 0.70
-        elif speed_ms < 6.0:     # < ~22 km/h
+        elif speed_ms < 6.0:
             alpha = 0.55
-        elif speed_ms < 9.0:     # < ~32 km/h
+        elif speed_ms < 9.0:
             alpha = 0.45
         else:
             alpha = 0.35
 
-        # Boost alpha slightly during active turns for responsiveness
+
         if is_turning:
             alpha = min(alpha + 0.10, 0.75)
 
         smoothed = alpha * float(steering_raw) + (1.0 - alpha) * self._last_steer
 
-        # Rate limiter: max steering change per frame
+
         max_change = 0.10 if is_turning else 0.06
         final = clamp(smoothed, self._last_steer - max_change, self._last_steer + max_change)
         self._last_steer = clamp(float(final), -1.0, 1.0)
@@ -4789,10 +4789,10 @@ class CILAgent(BaseAgent):
         dx = float(vehicle_location.x - ref_loc.x)
         dy = float(vehicle_location.y - ref_loc.y)
 
-        # CARLA/UE uses +Y to the vehicle's right. We expose telemetry in a more
-        # intuitive frame here: positive lateral/heading error means the vehicle
-        # sits or points to the route's left, which requires a positive (right)
-        # steering correction.
+
+
+
+
         lateral_error_m = math.sin(yaw_rad) * dx - math.cos(yaw_rad) * dy
         heading_error_deg = self._normalize_angle_deg(float(ref_yaw_deg) - float(vehicle_yaw_deg))
         speed_mps = max(0.5, float(speed_kmh) / 3.6)
@@ -4911,7 +4911,7 @@ class CILAgent(BaseAgent):
                     False,
                 )
 
-        # ── Route visualization (3D lines in the world) ──
+
         if show_route_map and route_locations and len(route_locations) >= 2:
             lift = 0.40
             step = max(1, len(route_locations) // 40)
@@ -4939,7 +4939,7 @@ class CILAgent(BaseAgent):
                 life_time=hud_life_time,
             )
 
-        # Draw destination marker
+
         if show_route_map and self._route_destination_location is not None:
             d_loc = self._route_destination_location
             d_point = carla.Location(
@@ -5091,14 +5091,14 @@ class CILAgent(BaseAgent):
             step_idx=step_idx,
         )
 
-        # ── 1-second command delay: push current command, consume the one from
-        # ~1 s ago so the CIL model receives the command slightly later than
-        # the oracle fires it (avoids premature steering before the junction).
+
+
+
         self._command_delay_buffer.append(command)
         if len(self._command_delay_buffer) > self._command_delay_n_frames:
             command = self._command_delay_buffer.popleft()
         else:
-            command = self._command_delay_buffer[0]  # still warming up → use oldest
+            command = self._command_delay_buffer[0]
 
         stage_times["nav"] = time.perf_counter() - nav_t0
 
@@ -5124,7 +5124,7 @@ class CILAgent(BaseAgent):
         else:
             pred_waypoints = model_waypoints
 
-        # NOTE: Huber-only model has no valid uncertainty head → disable VETO
+
         ai_is_confused = float(mean_uncertainty) > 1e9
 
         if ai_is_confused:
@@ -5208,19 +5208,12 @@ class CILAgent(BaseAgent):
                 gtnet_brake = float(gtnet_debug_info.get("brake", 0.0))
                 gtnet_throttle_floor = float(gtnet_debug_info.get("throttle_floor", 0.0))
                 if gtnet_brake > float(control.brake):
-                    # Front threat detected — brake and zero throttle
                     control.throttle = 0.0
                     control.brake = float(clamp(gtnet_brake, 0.0, 1.0))
                     control.hand_brake = False
                 elif (gtnet_throttle_floor > 0.0
                       and float(control.brake) == 0.0
                       and float(control.throttle) < gtnet_throttle_floor):
-                    # Rear threat approaching — maintain minimum speed to keep
-                    # safe separation (don't slow down when vehicle behind is
-                    # closing in, as that increases rear-end collision risk).
-                    # Only activate when no brake command from ANY source
-                    # (CIL, YOLO TrafficSupervisor, or GTNet front-threat),
-                    # ensuring Brake Fusion always takes priority.
                     control.throttle = float(clamp(gtnet_throttle_floor, 0.0, 1.0))
             except Exception as exc:
                 logging.warning("GTNet supervisor update failed: %s", exc)
@@ -5230,8 +5223,8 @@ class CILAgent(BaseAgent):
         rotation = vehicle.get_transform().rotation
         self._update_route_history(vehicle_location)
 
-        # ── Debug: draw MODEL-predicted waypoints in CARLA world ──
-        # (Vehicle follows CARLA route waypoints; debug draws model predictions for comparison)
+
+
         if self.config.cil_world_waypoint_debug and step_idx % 3 == 0 and np is not None:
             _yaw_r = math.radians(float(rotation.yaw))
             _cos_y, _sin_y = math.cos(_yaw_r), math.sin(_yaw_r)
@@ -5288,7 +5281,7 @@ class CILAgent(BaseAgent):
             command, hud_fps, destination_distance_m, route_draw_locations,
         )
 
-        # ── Separate OpenCV route-map window + cil_yolo OpenCV hotkeys (single waitKey) ──
+
         opencv_key = -1
         if cv2 is not None and self._enabled:
             if (
@@ -5323,7 +5316,7 @@ class CILAgent(BaseAgent):
         stage_times["viz"] = time.perf_counter() - viz_t0
 
         telemetry_t0 = time.perf_counter()
-        
+
         if step_idx % 20 == 0:
             logging.info(
                 "cil tick=%d speed=%.1f km/h target=%.1f cmd=%d phase=%s next=%d src=%s reset=%s s_from_start=%.1f d_turn=%.1f d_junc=%.1f trigger=%.1f pass_delta=%.2f rise=%d best_turn=%.2f steer=%.3f source=%.3f unc=%.3f veto=%s throttle=%.2f brake=%.2f yolo=%s yolo_brake=%.2f yolo_reason=%s gtnet=%s gtnet_brake=%.2f gtnet_reason=%s",
@@ -5388,10 +5381,10 @@ class CILAgent(BaseAgent):
 
     def teardown(self) -> None:
         if self.config.eval_online:
-            # ---- PRINT METRICS SUMMARY ----
-            # Write to stderr (same stream as logging) so subprocess.run()
-            # captures it reliably even if the process crashes on exit
-            # during TensorRT/CUDA cleanup (exit code 0xC0000409).
+
+
+
+
             _out = sys.stderr
             print("\n" + "="*60, file=_out)
             print(" 📊 CIL AGENT ONLINE EVALUATION SUMMARY", file=_out)
@@ -5424,12 +5417,12 @@ class CILAgent(BaseAgent):
                             route_completion = max(0.0, 100.0 * (1.0 - dist_remaining / self._metric_initial_route_distance))
                             route_completion = min(100.0, route_completion)
             except Exception:
-                pass  # vehicle may already be destroyed during teardown
+                pass
 
             print(f" Route Completion:       {route_completion:.1f}%", file=_out)
             print("="*60 + "\n", file=_out)
             _out.flush()
-            # -------------------------------
+
 
         self._route_overlay_bounds = None
         if self._collector is not None:
@@ -6209,7 +6202,7 @@ class YoloDetectAgent(BaseAgent):
             dtype=np.float64,
         )
         point_camera = world_to_camera @ point_world
-        # UE -> camera convention.
+
         point_camera = np.array(
             [point_camera[1], -point_camera[2], point_camera[0]],
             dtype=np.float64,
@@ -6233,13 +6226,13 @@ class YoloDetectAgent(BaseAgent):
         if type_id.startswith("walker."):
             return "pedestrian"
         if type_id.startswith("vehicle."):
-            # Match detector's two_wheeler class for bikes/motorbikes.
-            # Includes both generic tokens and known CARLA vehicle brand names
-            # for bicycles (diamondback, gazelle, bh, crossbike) and
-            # motorcycles (vespa, yamaha, harley, kawasaki).
-            # Model-specific names (yzf, ninja, zx125, low_rider, century,
-            # omafiets) are also listed explicitly for self-documentation
-            # even though the brand tokens already cover them.
+
+
+
+
+
+
+
             two_wheel_tokens = (
                 "bike",
                 "bicycle",
@@ -6254,13 +6247,13 @@ class YoloDetectAgent(BaseAgent):
                 "bh",
                 "crossbike",
                 "cyclist",
-                # Explicit CARLA model names (redundant but self-documenting)
-                "yzf",          # vehicle.yamaha.yzf
-                "ninja",        # vehicle.kawasaki.ninja
-                "zx125",        # vehicle.vespa.zx125
-                "low_rider",    # vehicle.harley-davidson.low_rider
-                "century",      # vehicle.diamondback.century
-                "omafiets",     # vehicle.gazelle.omafiets
+
+                "yzf",
+                "ninja",
+                "zx125",
+                "low_rider",
+                "century",
+                "omafiets",
             )
             if any(token in type_id for token in two_wheel_tokens):
                 return "two_wheeler"
@@ -6362,28 +6355,28 @@ class YoloDetectAgent(BaseAgent):
         except Exception:
             return
 
-        # ── GT quality filters ──────────────────────────────────────
-        # Only include actors within the effective camera detection range.
-        # Reduced from 50m to 40m because 3D→2D projected bboxes for
-        # objects at 40-50m are unreliably small and create false
-        # negatives when the detector can barely see them.
+
+
+
+
+
         MAX_GT_DISTANCE_M = 40.0
-        # Minimum projected bbox dimensions (pixels).  Objects smaller
-        # than this are invisible to any trained detector.
+
+
         MIN_GT_BBOX_DIM = 10
-        # Minimum projected bbox area (pixels²).  Tightened from 400 to
-        # 600 to filter tiny GT that detectors cannot reliably match.
+
+
         MIN_GT_BBOX_AREA = 600
-        # Minimum fraction of the raw 3D projection that must be visible
-        # inside the image frame.  Tightened from 0.35 to 0.50 to
-        # reduce phantom GT from 3D → 2D projection artifacts where
-        # most of the 3D bbox is off-screen.
+
+
+
+
         MIN_VISIBLE_AREA_RATIO = 0.50
-        # Maximum bbox aspect ratio (width/height or height/width).
-        # 3D projections of objects viewed at extreme angles can produce
-        # very elongated bboxes that no 2D detector would generate.
+
+
+
         MAX_GT_BBOX_ASPECT_RATIO = 6.0
-        # ────────────────────────────────────────────────────────────
+
 
         try:
             ego_location = ego_vehicle.get_location()
@@ -6402,7 +6395,7 @@ class YoloDetectAgent(BaseAgent):
             if class_name is None:
                 continue
 
-            # ── Distance filter: skip actors beyond effective camera range ──
+
             if ego_location is not None:
                 try:
                     actor_location = actor.get_location()
@@ -6462,17 +6455,17 @@ class YoloDetectAgent(BaseAgent):
             width = max(0.0, x2 - x1)
             height = max(0.0, y2 - y1)
 
-            # ── Minimum bbox dimension filter ──
+
             if width < MIN_GT_BBOX_DIM or height < MIN_GT_BBOX_DIM:
                 continue
-            # ── Minimum bbox area filter ──
+
             if width * height < MIN_GT_BBOX_AREA:
                 continue
-            # ── Aspect ratio filter: reject extreme 3D projection artifacts ──
+
             aspect = max(width, height) / max(min(width, height), 1.0)
             if aspect > MAX_GT_BBOX_ASPECT_RATIO:
                 continue
-            # ── Center-point visibility: reject GT whose center is off-screen ──
+
             cx = x1 + width / 2.0
             cy = y1 + height / 2.0
             if cx < 0.0 or cx >= float(image_w) or cy < 0.0 or cy >= float(image_h):
@@ -6492,9 +6485,9 @@ class YoloDetectAgent(BaseAgent):
             if depth_visibility is not None and depth_visibility < 0.20:
                 continue
 
-            # MOTChallenge GT format plus a repo-local class column:
-            # <frame>,<id>,<bb_left>,<bb_top>,<bb_width>,<bb_height>,<conf>,<x>,<y>,<z>,<class>
-            # conf=1 marks valid GT object.
+
+
+
             gt_line = (
                 f"{frame_id},{actor_id},"
                 f"{x1:.2f},{y1:.2f},{width:.2f},{height:.2f},1,-1,-1,-1,{class_name}"
@@ -6562,7 +6555,7 @@ class YoloDetectAgent(BaseAgent):
     def run_step(self, step_idx: int) -> None:
         """
         Main detection & control loop for YOLO agent.
-        
+
         Workflow:
         1. Read frame + depth from camera
         2. Run YOLO detection
@@ -6577,9 +6570,9 @@ class YoloDetectAgent(BaseAgent):
                 logging.info("YOLO agent waiting for CARLA runtime.")
             return
 
-        # ─────────────────────────────────────────────────────────
-        # Step 1: Read Camera Frames
-        # ─────────────────────────────────────────────────────────
+
+
+
         frame_bgr, depth_map_m = self._read_latest_frame()
         if frame_bgr is None:
             if not self._waiting_frame_logged:
@@ -6587,19 +6580,19 @@ class YoloDetectAgent(BaseAgent):
                 self._waiting_frame_logged = True
             return
 
-        # ─────────────────────────────────────────────────────────
-        # Step 2: Get Vehicle State
-        # ─────────────────────────────────────────────────────────
+
+
+
         vehicle = self.session.ego_vehicle if self.session is not None else None
         current_steer = None
         speed_kmh = None
         display_steer = 0.0
         display_throttle = 0.0
         display_brake = 0.0
-        
+
         if vehicle is not None:
             try:
-                # Smooth raw autopilot steer command to avoid corridor jitter between frames.
+
                 control_snapshot = vehicle.get_control()
                 raw_steer = float(control_snapshot.steer)
                 display_throttle = float(control_snapshot.throttle)
@@ -6623,9 +6616,9 @@ class YoloDetectAgent(BaseAgent):
             except Exception:
                 speed_kmh = None
 
-        # ─────────────────────────────────────────────────────────
-        # Step 3: Run YOLO Detection
-        # ─────────────────────────────────────────────────────────
+
+
+
         detect_every_n = max(1, int(self.config.yolo_inference_every_n_ticks))
         should_run_detector = (
             self._last_detection_step is None
@@ -6675,16 +6668,16 @@ class YoloDetectAgent(BaseAgent):
             )
             debug_info["detector_last_run_ms"] = self._last_detection_runtime_ms
 
-        # ─────────────────────────────────────────────────────────
-        # Step 4: Build Danger Polygon & Compute Supervisor Advisory
-        # ─────────────────────────────────────────────────────────
+
+
+
         supervisor_brake = 0.0
         supervisor_state = "n/a"
         supervisor_reason = "n/a"
         hard_supervisor_emergency = False
         red_hard_stop_active = False
         sup_debug = {}
-        
+
         if self._traffic_supervisor is not None:
             now_ts = time.time()
             if self._last_control_ts is None:
@@ -6701,7 +6694,7 @@ class YoloDetectAgent(BaseAgent):
                 if speed_kmh is None:
                     speed_kmh = 0.0
 
-                # Compute supervisor advisory signal for downstream code/debug only.
+
                 sup_dets = to_supervisor_detections(detections)
                 supervisor_brake = float(
                     self._traffic_supervisor.compute(
@@ -6722,7 +6715,7 @@ class YoloDetectAgent(BaseAgent):
                 hard_supervisor_emergency = (
                     supervisor_brake >= 0.60 and supervisor_reason == "obstacle"
                 )
-                
+
             except Exception as exc:
                 sup_debug = {}
                 self._last_supervisor_debug_info = {}
@@ -6731,9 +6724,9 @@ class YoloDetectAgent(BaseAgent):
 
         is_emergency = bool(detector_emergency or hard_supervisor_emergency)
 
-        # ─────────────────────────────────────────────────────────
-        # Step 5: Pass Through Control (Navigation Agent or TM Autopilot)
-        # ─────────────────────────────────────────────────────────
+
+
+
         if vehicle is not None and self._nav_agent is not None:
             try:
                 if self._nav_agent.done():
@@ -6758,7 +6751,7 @@ class YoloDetectAgent(BaseAgent):
                 and float(speed_kmh) <= 2.0
             )
 
-            # Autopilot contributes steering/throttle only; braking belongs to YOLO/supervisor.
+
             if is_emergency or supervisor_brake > 0.0:
                 emergency_floor = 0.6 if is_emergency else 0.0
                 final_control = _control_without_autopilot_brake(nav_control)
@@ -6840,9 +6833,9 @@ class YoloDetectAgent(BaseAgent):
             display_throttle = float(final_control.throttle)
             display_brake = float(final_control.brake)
 
-        # ─────────────────────────────────────────────────────────
-        # Step 6: Prepare Annotation Frame
-        # ─────────────────────────────────────────────────────────
+
+
+
         hud_fps = self._update_hud_fps()
         steer_angle_deg = self._steer_to_angle_deg(vehicle, display_steer)
         speed_text = f"{float(speed_kmh):.1f} km/h" if speed_kmh is not None else "n/a"
@@ -6939,9 +6932,9 @@ class YoloDetectAgent(BaseAgent):
             cv2.imshow(self._window_name, annotated_frame)
             cv2.waitKey(1)
 
-        # ─────────────────────────────────────────────────────────
-        # Step 8: Log Information
-        # ─────────────────────────────────────────────────────────
+
+
+
         if step_idx % 20 == 0:
             logging.info(
                 "yolo_detect tick=%d fps=%.1f speed=%s steer=%.3f angle=%s throttle=%.2f brake=%.2f "

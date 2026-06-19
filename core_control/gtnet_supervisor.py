@@ -9,21 +9,21 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 try:
-    # pyrefly: ignore [missing-import]
+
     import numpy as np
-except ImportError:  # pragma: no cover
+except ImportError:
     np = None
 
 try:
-    # pyrefly: ignore [missing-import]
+
     import torch
-except ImportError:  # pragma: no cover
+except ImportError:
     torch = None
 
 try:
-    # pyrefly: ignore [missing-import]
+
     import carla
-except ImportError:  # pragma: no cover
+except ImportError:
     carla = None
 
 from core_perception.multi_agent_model import (
@@ -99,11 +99,11 @@ class GTNetSupervisor:
         self._last_inference_step: Optional[int] = None
         self._cached_result = self._empty_result("not_started")
 
-        # ── BUG FIX: Detect dt / future_steps mismatches ──────────────────────
-        # The model was trained with a specific future_steps (e.g. 60 at 20fps
-        # = 3s horizon).  If runtime expected_dt doesn't match the training dt,
-        # the supervisor will misinterpret prediction timestamps and corridor
-        # time-to-collision calculations.
+
+
+
+
+
         ckpt_future_steps = int(self._model_config.future_steps)
         runtime_dt = float(config.expected_dt)
         carla_dt = float(config.fixed_delta)
@@ -477,7 +477,7 @@ class GTNetSupervisor:
     ) -> tuple[Dict[str, Any], np.ndarray]:
         pred_np = pred.detach().squeeze(0).float().cpu().numpy()
         if pred_np.ndim == 4:
-            # [N, K, T, 2]
+
             pass
         elif pred_np.ndim == 3:
             pred_np = pred_np[:, None, :, :]
@@ -521,12 +521,12 @@ class GTNetSupervisor:
                     current_lat_err_by_id[aid] = abs(right_m - center_right)
                     current_half_width_by_id[aid] = half_width
 
-                    # Determine speed component heading TOWARDS the corridor center
+
                     if right_m > center_right:
-                        # Actor is on the right, moving left (-lat_vx) is moving towards center
+
                         v_towards = -lat_vx
                     else:
-                        # Actor is on the left, moving right (+lat_vx) is moving towards center
+
                         v_towards = lat_vx
                     current_v_towards_by_id[aid] = v_towards
 
@@ -536,24 +536,24 @@ class GTNetSupervisor:
                 _cur_right = current_right_by_id[actor_id]
                 _actual_dist = math.hypot(_cur_fwd, _cur_right)
                 if _actual_dist > float(self.config.danger_forward_max_m):
-                    continue  # Actor is beyond danger range — skip entirely
+                    continue
             if (actor_id in current_heading_y_by_id
                     and actor_id in current_fwd_by_id
                     and current_fwd_by_id[actor_id] > 5.0
                     and current_heading_y_by_id[actor_id] > 0.8):
-                # Check relative forward velocity from ground-truth features
+
                 if history:
                     _anchor = history[-1]
                     _actor_st = _anchor.actors.get(actor_id)
                     if _actor_st is not None:
                         _feat = actor_feature_in_anchor_frame(_actor_st, _anchor.ego)
                         if len(_feat) >= 4:
-                            _rel_vy = float(_feat[3])  # relative forward velocity
+                            _rel_vy = float(_feat[3])
                             _cur_fwd_m = current_fwd_by_id[actor_id]
-                            # Distance-dependent closing-speed threshold:
-                            #   > 12m: generous  — TTC > 8s  at 1.5 m/s closing
-                            #   8-12m: moderate  — TTC > 8s  at 1.0 m/s closing
-                            #   5-8m:  strict     — TTC > 10s at 0.5 m/s closing
+
+
+
+
                             if _cur_fwd_m > 12.0:
                                 _close_thresh = -1.5
                             elif _cur_fwd_m > 8.0:
@@ -561,17 +561,17 @@ class GTNetSupervisor:
                             else:
                                 _close_thresh = -0.5
                             if _rel_vy >= _close_thresh:
-                                continue  # Same-lane leader, not closing fast — safe
+                                continue
             if actor_id in current_speed_by_id and actor_id in current_lat_err_by_id:
                 cur_speed = current_speed_by_id[actor_id]
                 cur_lat_err = current_lat_err_by_id[actor_id]
                 cur_half_w = current_half_width_by_id[actor_id]
-                
-                # Stationary adjacent filter
+
+
                 if cur_speed < 1.5 and cur_lat_err > cur_half_w:
                     continue
-                    
-                # Parallel / Away motion filter
+
+
                 if cur_lat_err > cur_half_w and actor_id in current_v_towards_by_id:
                     v_towards = current_v_towards_by_id[actor_id]
                     if v_towards < 0.35:
@@ -587,11 +587,11 @@ class GTNetSupervisor:
                 if heading_y > 0.7:
                     right_m = current_right_by_id[actor_id]
                     fwd_m = current_fwd_by_id.get(actor_id, 0.0)
-                    # Corridor with steer=0: center_right=0, no curve bonus
+
                     straight_half_w = self._corridor_half_width(fwd_m, 0.0)
                     straight_lat_err = abs(right_m)
                     if straight_lat_err > straight_half_w:
-                        continue  # Same-direction traffic outside straight corridor
+                        continue
             if actor_id in current_fwd_by_id:
                 current_fwd = current_fwd_by_id[actor_id]
             else:
@@ -610,7 +610,7 @@ class GTNetSupervisor:
             median_initial_fwd = current_fwd
             is_from_behind = current_fwd < 0.0
 
-            # Phase 1: Per-mode scan — find earliest corridor violation per mode.
+
             mode_threats: list[Optional[Dict[str, Any]]] = [None] * num_modes
             for mode_idx in range(num_modes):
                 for t_idx in range(max_t_idx):
@@ -638,22 +638,22 @@ class GTNetSupervisor:
                         "lateral_error_m": lateral_error,
                         "severity": float(severity),
                     }
-                    # Keep earliest violation for this mode
+
                     if mode_threats[mode_idx] is None:
                         mode_threats[mode_idx] = candidate
-                    break  # first violation per mode is enough
+                    break
 
-            # Phase 2: Mode consensus — count how many modes flagged a violation.
+
             threatening_modes = [m for m in mode_threats if m is not None]
             if len(threatening_modes) < min_threat_modes:
-                continue  # Not enough modes agree — skip this agent
+                continue
 
-            # Phase 2b: Behind-ego agents → record as rear warning, skip braking.
+
             if is_from_behind:
                 earliest = min(threatening_modes, key=lambda m: float(m["time_s"]))
                 earliest["initial_fwd"] = median_initial_fwd
                 rear_warnings.append(earliest)
-                continue  # Do NOT affect front-threat braking decision
+                continue
             receding_gap_m = float(self.config.min_receding_gap_m)
             receding_min_fwd_m = float(self.config.receding_min_initial_fwd_m)
             last_t = max_t_idx - 1
@@ -664,10 +664,10 @@ class GTNetSupervisor:
             median_last_fwd = last_forwards[num_modes // 2]
             is_receding = (
                 median_last_fwd > median_initial_fwd + receding_gap_m
-                and median_initial_fwd >= receding_min_fwd_m  # close-range safety exception
+                and median_initial_fwd >= receding_min_fwd_m
             )
             if is_receding:
-                continue  # Vehicle ahead is pulling away — safe, no threat
+                continue
             if (actor_id in current_fwd_by_id
                     and median_initial_fwd > 5.0
                     and history):
@@ -676,11 +676,11 @@ class GTNetSupervisor:
                 if _actor_rv is not None:
                     _feat_rv = actor_feature_in_anchor_frame(_actor_rv, _anchor_rv.ego)
                     if len(_feat_rv) >= 4:
-                        _rel_fwd_vel = float(_feat_rv[3])  # relative forward velocity
-                        # Stricter at close range: 5-10m needs near-zero closing
+                        _rel_fwd_vel = float(_feat_rv[3])
+
                         _rv_safe = -0.3 if median_initial_fwd <= 10.0 else -0.5
                         if _rel_fwd_vel >= _rv_safe:
-                            continue  # Vehicle ahead at stable/growing gap — safe
+                            continue
             first_threat = min(threatening_modes, key=lambda m: float(m["time_s"]))
             already_close = (
                 float(first_threat["forward_m"]) < 3.0
@@ -697,9 +697,9 @@ class GTNetSupervisor:
                     for m in threatening_modes
                 )
                 if not any_approaching:
-                    continue  # All modes show parallel motion — not a real threat
+                    continue
 
-            # Phase 4: Pick the earliest violation across agreeing modes.
+
             for candidate in threatening_modes:
                 if best is None:
                     best = candidate
@@ -714,11 +714,11 @@ class GTNetSupervisor:
         if has_rear_threat:
             closest_rear = min(rear_warnings, key=lambda w: float(w["time_s"]))
             rear_ttc = float(closest_rear["time_s"])
-            # Gentle throttle floor: faster approaching → higher floor
+
             if rear_ttc < 1.0:
-                throttle_floor = 0.10  # Very close — maintain speed firmly
+                throttle_floor = 0.10
             elif rear_ttc < 2.0:
-                throttle_floor = 0.05  # Nearby — light speed maintenance
+                throttle_floor = 0.05
             rear_info = {
                 "rear_threat": True,
                 "rear_actor_id": int(closest_rear["actor_id"]),
@@ -750,7 +750,7 @@ class GTNetSupervisor:
             "ready": True,
             "threat": True,
             "brake": brake,
-            "throttle_floor": 0.0,  # Front threat → brake, no throttle floor
+            "throttle_floor": 0.0,
             "reason": "predicted_path_conflict",
             "num_agents": len(actor_ids),
             "cache_hit": False,
@@ -868,23 +868,23 @@ class GTNetSupervisor:
                         )
                     prev_loc = loc
 
-            # Determine active threat IDs to avoid drawing over them
+
             threat_actor_id = int(result.get("actor_id", -1)) if bool(result.get("threat", False)) else -1
             rear_actor_id = int(result.get("rear_actor_id", -1)) if bool(result.get("rear_threat", False)) else -1
 
-            # 1. Draw neutral trajectory (gray) for all tracked actors (using mode 0 as best guess)
-            # to confirm GTNet model inference is successfully running and predicting.
+
+
             for actor_id in actor_ids:
                 if actor_id == threat_actor_id or actor_id == rear_actor_id:
                     continue
-                # Draw mode 0 in high-visibility Cyan for other tracked agents
+
                 _draw_trajectory(
                     actor_id, 0,
                     carla.Color(r=0, g=240, b=240),
-                    max_steps=25,  # Draw a slightly shorter horizon to keep visual clean
+                    max_steps=25,
                 )
 
-            # 2. Draw front threat trajectory (orange) - HIGHLIGHTED
+
             if threat_actor_id != -1:
                 threat_mode = int(result.get("mode", 0))
                 _draw_trajectory(
@@ -893,7 +893,7 @@ class GTNetSupervisor:
                     max_steps=30,
                 )
 
-            # 3. Draw rear threat trajectory (blue) - HIGHLIGHTED
+
             if rear_actor_id != -1:
                 _draw_trajectory(
                     rear_actor_id, 0,
