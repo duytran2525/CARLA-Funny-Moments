@@ -243,7 +243,7 @@ class TestConstants(unittest.TestCase):
     def test_npc_vehicle_range(self):
         """Test NPC vehicle count range."""
         self.assertEqual(MIN_NPC_VEHICLES, 30)
-        self.assertEqual(MAX_NPC_VEHICLES, 50)
+        self.assertEqual(MAX_NPC_VEHICLES, 100)
         
     def test_collection_fps(self):
         """Test collection FPS is 10."""
