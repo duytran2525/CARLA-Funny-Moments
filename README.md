@@ -23,35 +23,67 @@ Hệ thống hỗ trợ 5 chế độ tác nhân điều khiển chính thông q
 
 ---
 
-## 📂 Sơ đồ Cấu trúc Repo
+## 📂 Cấu trúc Repo Đầy đủ & Tác dụng của từng File
 
-```text
-├── configs/
-│   ├── carla_env.yaml          # File cấu hình môi trường CARLA và tham số GTNet Supervisor
-│   └── data.yaml               # Cấu hình dataset huấn luyện YOLO
-├── core_control/
-│   ├── gtnet_supervisor.py     # Bộ giám sát an toàn chủ động dựa trên quỹ đạo dự báo
-│   ├── traffic_supervisor.py   # Bộ giám sát an toàn phản động (YOLO, đèn đỏ, vật cản)
-│   ├── supervisor.py           # Quản lý supervisor cơ sở và arbitration
-│   └── pid_controller.py       # Bộ điều khiển PID dọc và ngang
-├── core_perception/
-│   ├── multi_agent_model.py    # Định nghĩa kiến trúc mạng GTNet (GAT + GRU + WTA Loss)
-│   ├── multi_agent_trajectory.py # Quản lý cửa sổ quỹ đạo và xây dựng đồ thị thích ứng
-│   ├── multi_agent_dataset.py  # Bộ nạp dataset PyTorch dạng đồ thị
-│   ├── dataset.py              # Bộ nạp dữ liệu cho mô hình CIL/Waypoint
-│   └── yolo_detector.py        # Wrapper YOLOv8 phục vụ tracking và nhận dạng
-├── scripts/
-│   ├── build_multi_agent_dataset.py # Tiền xử lý dữ liệu raw CSV thành tensor mẫu đồ thị .pt
-│   ├── fix_manifest_paths.py   # Chuẩn hóa đường dẫn manifest Windows/Linux
-│   ├── test_dataset_loading.py # Kiểm tra tính toàn vẹn của dataset mẫu đồ thị
-│   ├── kaggle_train_gtnet.py   # Script training tối ưu hóa cho Kaggle và Local
-│   ├── validate_target_metrics.py # Script kiểm định metrics tiêu chuẩn của mô hình
-│   ├── train_cnn.py            # Huấn luyện mô hình bám làn CIL
-│   ├── train_yolo.py           # Huấn luyện mô hình YOLO
-│   └── convert_yolo_to_engine.py # Biên dịch model YOLO sang TensorRT engine
-├── tests/                      # Bộ unit tests kiểm thử độ ổn định
-└── run_agents.py               # Script chạy chính của toàn bộ repo
-```
+Dưới đây là mô tả chi tiết công dụng của toàn bộ các thư mục và tập tin mã nguồn trong repository:
+
+### 1. File chạy chính và Script Thu thập dữ liệu (Thư mục gốc)
+*   **`run_agents.py`**: File thực thi chính của dự án. Chịu trách nhiệm khởi tạo kết nối CARLA, nạp tệp cấu hình, chạy vòng lặp điều khiển tác nhân (Agent Loop), hiển thị giao diện OpenCV HUD và ghi nhận kết quả mô phỏng.
+*   **`collect_multi_agent_data.py`**: Script thu thập dữ liệu thô đa tác nhân từ CARLA. Ghi lại vị trí ($x,y,z$), vận tốc ($v_x, v_y$), góc hướng (yaw) của Ego và toàn bộ các xe giao thông xung quanh trong bán kính 100m phục vụ cho mô hình GTNet.
+*   **`collect_recovery_data.py`**: Script chuyên dụng thu thập dữ liệu phục hồi (recovery data). Tự động điều khiển xe lệch làn ngẫu nhiên rồi thu thập thao tác đánh lái của con người/autopilot để huấn luyện mô hình bám làn chống chệch hướng.
+*   **`requirements.txt`**: Khai báo danh sách các thư viện Python bắt buộc của đồ án (PyTorch, OpenCV, NumPy, Pandas, PyYAML, Ultralytics,...).
+*   **`build_all_datasets.ps1`**: Script PowerShell tự động duyệt qua tất cả các file dữ liệu thô thu thập được từ các Town để chạy tiền xử lý hàng loạt.
+*   **`collect_all_towns.ps1`**: Script PowerShell tự động nạp tuần tự 7 thị trấn (Town01 -> Town07) trong CARLA để thu thập dữ liệu giao thông một cách hệ thống.
+*   **`collect_all_towns_adaptive.ps1`**: Script PowerShell thu thập dữ liệu giao thông đồng thời tự động tính toán bán kính liên kết thích ứng.
+*   **`collect_data.ps1`**: Script chạy thu thập dữ liệu lái xe cơ bản.
+*   **`collect_recovery.ps1`**: Script chạy thu thập dữ liệu lái xe phục hồi chệch làn.
+*   **`run_cil.ps1`**: Script PowerShell khởi động nhanh tác nhân CIL với cấu hình chuẩn.
+*   **`gtnet_report.tex`**: File mã nguồn LaTeX chứa nội dung báo cáo Chương 3 và 4 của đồ án GTNet để biên dịch học thuật.
+
+### 2. Module Điều khiển và Giám sát (`core_control/`)
+*   [carla_manager.py](file:///d:/AI/CARLA-Funny-Moments/core_control/carla_manager.py): Thiết lập kết nối CARLA client, khởi tạo thế giới (world), thiết lập chế độ đồng bộ (sync mode), điều tiết thời tiết, spawn xe Hero và phân bổ lưu lượng NPC (xe cộ, người đi bộ), cũng như thu dọn tài nguyên khi dừng hệ thống.
+*   [cil_route_planner.py](file:///d:/AI/CARLA-Funny-Moments/core_control/cil_route_planner.py): Bộ lập kế hoạch lộ trình cho CIL. Phân tích lộ trình toàn cục của CARLA để đưa ra lệnh điều hướng cục bộ (rẽ trái, rẽ phải, đi thẳng) khớp với vị trí hiện tại của xe.
+*   [collect_data.py](file:///d:/AI/CARLA-Funny-Moments/core_control/collect_data.py): Chứa logic cốt lõi thu thập ảnh camera và trạng thái điều khiển (steering, throttle, brake) phục vụ huấn luyện CIL.
+*   [gtnet_supervisor.py](file:///d:/AI/CARLA-Funny-Moments/core_control/gtnet_supervisor.py): Bộ giám sát an toàn chủ động GTNet. Lấy lịch sử chuyển động của các tác nhân, gọi mô hình GTNet dự báo tương lai 3.0s, thực hiện thuật toán Đồng thuận chế độ (Mode Consensus) và tính toán khoảng cách phanh khẩn cấp để ra lệnh can thiệp.
+*   [navigation_command.py](file:///d:/AI/CARLA-Funny-Moments/core_control/navigation_command.py): Quản lý và xử lý các sự kiện thay đổi lệnh điều hướng cục bộ tại các giao lộ ngã tư.
+*   [pid_manager.py](file:///d:/AI/CARLA-Funny-Moments/core_control/pid_manager.py): Quản lý bộ điều khiển PID kép dọc (duy trì tốc độ mong muốn) và ngang (điều khiển bám tâm waypoint).
+*   [pure_pursuit.py](file:///d:/AI/CARLA-Funny-Moments/core_control/pure_pursuit.py): Hiện thực giải thuật hình học Pure Pursuit để tính toán góc đánh lái dựa trên điểm nhìn trước (lookahead point) dọc theo chuỗi waypoint dự đoán.
+*   [sync_data.py](file:///d:/AI/CARLA-Funny-Moments/core_control/sync_data.py): Đảm bảo sự đồng bộ thời gian hoàn hảo giữa khung hình ảnh thu từ cảm biến camera và dữ liệu trạng thái điều khiển tương ứng.
+*   [traffic_supervisor.py](file:///d:/AI/CARLA-Funny-Moments/core_control/traffic_supervisor.py): Bộ giám sát luật lệ giao thông phản động (YOLO). Phát hiện xe chắn phía trước, người đi bộ cắt ngang, đèn giao thông màu đỏ để can thiệp phanh khẩn cấp lập tức.
+
+### 3. Module Nhận thức và Học sâu (`core_perception/`)
+*   [cnn_model.py](file:///d:/AI/CARLA-Funny-Moments/core_perception/cnn_model.py): Định nghĩa kiến trúc mạng mạng nơ-ron tích chập (như PilotNet, CILNet) nhận ảnh camera đầu vào và dự đoán góc lái/waypoint điều khiển.
+*   [dataset.py](file:///d:/AI/CARLA-Funny-Moments/core_perception/dataset.py): Quản lý việc nạp dữ liệu hình ảnh từ CSV, xử lý tăng cường ảnh (augmentations) cho việc train mô hình bám làn/CIL.
+*   [multi_agent_dataset.py](file:///d:/AI/CARLA-Funny-Moments/core_perception/multi_agent_dataset.py): Định nghĩa dataloader PyTorch cho tập dữ liệu đồ thị quỹ đạo đa tác nhân của GTNet.
+*   [multi_agent_model.py](file:///d:/AI/CARLA-Funny-Moments/core_perception/multi_agent_model.py): File chứa toàn bộ định nghĩa kiến trúc mô hình **GTNet** (Mã hóa GRU, Tương tác GAT đa đầu, Giải mã Multimodal shared-GRU Decoder và Winner-Takes-All loss).
+*   [multi_agent_trajectory.py](file:///d:/AI/CARLA-Funny-Moments/core_perception/multi_agent_trajectory.py): Chịu trách nhiệm trích xuất cửa sổ thời gian (40 history, 60 future), biến đổi hệ tọa độ Ego-centric và tính toán ma trận đồ thị liên kết thích ứng dựa trên vận tốc.
+*   [spatial_math.py](file:///d:/AI/CARLA-Funny-Moments/core_perception/spatial_math.py): Hiện thực các thuật toán hình học không gian, phép chiếu ma trận camera nội/ngoại tham số và ma trận chiếu điểm IPM (Inverse Perspective Mapping) để chuyển tọa độ pixel ảnh sang tọa độ 3D thế giới thực.
+*   [yolo_detector.py](file:///d:/AI/CARLA-Funny-Moments/core_perception/yolo_detector.py): Bộ Wrapper tích hợp mô hình nhận diện YOLOv8 và các bộ theo dõi bám vết BoT-SORT / ByteTrack để duy trì ID liên tục cho các vật thể.
+
+### 4. Thư mục Scripts Huấn luyện & Tiện ích (`scripts/`)
+*   **`build_multi_agent_dataset.py`**: Chuyển đổi các tệp tin log CSV thô thu thập từ CARLA thành các file tensor đồ thị `.pt` để nạp trực tiếp vào PyTorch train GTNet.
+*   **`fix_manifest_paths.py`**: Chuẩn hóa dấu gạch chéo ngược (`\`) trong file manifest sinh ra từ Windows thành dấu gạch chéo xuôi (`/`) để dataset có thể nạp chính xác trên Kaggle Docker/Linux.
+*   **`test_dataset_loading.py`**: Bộ script kiểm tra tính toàn vẹn và nạp thử dataset đồ thị quỹ đạo trước khi tiến hành train.
+*   **`kaggle_train_gtnet.py`**: Script chính phục vụ huấn luyện GTNet trên Kaggle/GPU local. Hỗ trợ đầy đủ các chế độ huấn luyện: baseline, full, ablation (8 biến thể), per-town, tích hợp Warmup Cosine và Diversity Loss.
+*   **`validate_target_metrics.py`**: Script đánh giá mô hình sau huấn luyện trên tập validation kiểm tra các ngưỡng an toàn: minADE, minFDE, Miss Rate, và Latency.
+*   **`train_cnn.py`**: Script huấn luyện mạng PilotNet/CILNet bám làn đường từ tập dữ liệu hình ảnh.
+*   **`train_yolo.py`**: Script huấn luyện YOLOv8 phát hiện vật thể trên tập dữ liệu tùy chỉnh.
+*   **`convert_yolo_to_engine.py`**: Export YOLOv8 từ định dạng PyTorch `.pt` sang ONNX và TensorRT `.engine` để chạy inference tốc độ cao.
+*   **`collect_multi_agent_raw.py`**: Script chạy độc lập thu thập dữ liệu thô phục vụ kiểm định quỹ đạo.
+*   **`compare_tracking_metrics.py`** & **`evaluate_tracking_metrics.py`**: Script so sánh và đánh giá các metrics bám vết đa mục tiêu (MOTA, MOTP, IDS).
+*   **`evaluate_detection_models.py`** & **`evaluate_cnn_metrics.py`**: Đánh giá độ chính xác của các mạng nhận dạng vật thể và mạng góc lái CNN.
+*   **`visualize_cbam_attention.py`** & **`visualize_cil_modules.py`**: Trực quan hóa bản đồ chú ý không gian và kênh CBAM của các mạng CNN.
+*   **`visualize_gtnet_modes.py`**: Script vẽ đồ thị phân nhánh các chế độ dự báo (5 modes) tương lai của mô hình GTNet.
+*   **`tune_adaptive_radius.py`**: Tự động hóa quá trình tìm kiếm không gian siêu tham số để tối ưu hóa $R_{\text{base}}$ và $\alpha$ cho thuật toán bán kính thích ứng động.
+*   **`generate_professional_figures.py`** & **`generate_adaptive_and_ablation.py`**: Sinh ra các hình vẽ, đồ thị và bảng số liệu so sánh chất lượng của đồ án.
+
+### 5. Thư mục Tiện ích bổ trợ (`utils/`)
+*   **`logger.py`**: Thiết lập luồng in log hệ thống chuẩn hóa ra terminal và lưu file log.
+*   **`mathh_tools.py`**: Cung cấp các hàm toán học phụ trợ cho xử lý tọa độ, góc hướng xe và khoảng cách.
+*   **`visualizer.py`**: Các hàm đồ họa OpenCV hỗ trợ vẽ bản đồ mini-map, vẽ thông tin telemetry của xe Ego, và vẽ quỹ đạo dự đoán trực tiếp lên giao diện.
+
+### 6. Thư mục Kiểm thử Hồi quy (`tests/`)
+*   Bộ 18 file kiểm thử độc lập (ví dụ: `test_gat_layer.py`, `test_traffic_supervisor.py`, `test_multi_agent_trajectory.py`,...) dùng để kiểm thử tự động (Unit Test) cho mọi module, đảm bảo tính ổn định hồi quy của hệ thống trước khi triển khai.
 
 ---
 
@@ -79,7 +111,7 @@ pip install -r requirements.txt
 
 ## 🚀 Hướng dẫn Chạy Runtime
 
-Cấu hình chi tiết nằm trong `configs/carla_env.yaml`. Bạn có thể khởi chạy tác nhân bằng CLI:
+Mọi cấu hình mặc định được nạp từ file `configs/carla_env.yaml`. Bạn có thể khởi chạy tác nhân bằng CLI:
 
 ### 1. Khởi động CARLA Server
 ```powershell
